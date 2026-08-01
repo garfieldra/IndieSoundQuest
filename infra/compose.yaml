@@ -1,0 +1,142 @@
+name: indie-sound-quest
+
+services:
+  web:
+    build:
+      context: ../web
+    ports:
+      - "5173:5173"
+    depends_on:
+      java-service:
+        condition: service_healthy
+    environment:
+      VITE_API_BASE_URL: /api
+    networks:
+      - public
+      - internal
+
+  java-service:
+    build:
+      context: ../java-service
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${MYSQL_DATABASE}
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD}
+      SPRING_DATA_REDIS_URL: redis://redis:6379/0
+      AGENT_INTERNAL_BASE_URL: http://agent-service:8000
+      AGENT_INTERNAL_SERVICE_TOKEN: ${AGENT_INTERNAL_SERVICE_TOKEN}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8080/actuator/health | grep -q '\"status\":\"UP\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - public
+      - internal
+
+  agent-service:
+    build:
+      context: ../agent-service
+    environment:
+      JAVA_INTERNAL_BASE_URL: http://java-service:8080
+      AGENT_INTERNAL_SERVICE_TOKEN: ${AGENT_INTERNAL_SERVICE_TOKEN}
+      LLM_PROVIDER: ${LLM_PROVIDER}
+      LLM_MODEL: ${LLM_MODEL}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      MILVUS_URI: ${MILVUS_URI}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+    depends_on:
+      java-service:
+        condition: service_healthy
+      milvus:
+        condition: service_started
+    networks:
+      - internal
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - internal
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - redis-data:/data
+    networks:
+      - internal
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    command: >-
+      etcd -advertise-client-urls=http://127.0.0.1:2379
+      -listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    volumes:
+      - etcd-data:/etcd
+    networks:
+      - internal
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    command: minio server /minio_data
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - minio-data:/minio_data
+    networks:
+      - internal
+
+  milvus:
+    image: milvusdb/milvus:v2.4.23
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    depends_on:
+      - etcd
+      - minio
+    volumes:
+      - milvus-data:/var/lib/milvus
+    networks:
+      - internal
+
+networks:
+  public:
+  internal:
+    internal: true
+
+volumes:
+  mysql-data:
+  redis-data:
+  etcd-data:
+  minio-data:
+  milvus-data:

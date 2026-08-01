@@ -1,0 +1,31 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Frontend
+web/node_modules/
+web/dist/
+web/.vite/
+
+# Java
+java-service/target/
+java-service/.mvn/wrapper/maven-wrapper.jar
+*.class
+
+# Python
+agent-service/.venv/
+agent-service/__pycache__/
+agent-service/.pytest_cache/
+agent-service/.mypy_cache/
+agent-service/*.egg-info/
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
+*.iml
+
+# Local Docker data and logs
+infra/volumes/
+logs/
