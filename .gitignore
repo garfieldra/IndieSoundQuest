@@ -7,6 +7,9 @@
 web/node_modules/
 web/dist/
 web/.vite/
+web/*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
 
 # Java
 java-service/target/
@@ -16,6 +19,7 @@ java-service/.mvn/wrapper/maven-wrapper.jar
 # Python
 agent-service/.venv/
 agent-service/__pycache__/
+agent-service/**/__pycache__/
 agent-service/.pytest_cache/
 agent-service/.mypy_cache/
 agent-service/*.egg-info/

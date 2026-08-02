@@ -26,3 +26,7 @@ management:
     health:
       probes:
         enabled: true
+
+agent:
+  internal:
+    service-token: ${AGENT_INTERNAL_SERVICE_TOKEN:change-me}
