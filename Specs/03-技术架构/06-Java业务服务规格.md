@@ -19,10 +19,13 @@ Java 业务服务是系统的业务事实源，负责账号/访客身份、音�
 | 框架 | Spring Boot 3 |
 | 持久化 | MySQL 8 |
 | 缓存/短状态 | Redis |
-| ORM | MyBatis-Plus 或 JPA，具体实现阶段确定 |
+| ORM | Spring Data JPA | 
+| 数据库迁移 | Flyway |
 | 鉴权 | Spring Security；访客身份 + 后续账户登录 |
 | 服务调用 | HTTP + JSON；向前端转发 SSE |
-| API 风格 | REST 为主，统一错误响应 |
+| API 风格 | RESTful、`/api/v1` 前缀、UUID、驼峰 JSON、统一错误响应 |
+| API 文档 | springdoc-openapi；开发环境提供 Swagger UI |
+| 测试 | JUnit 5 + Testcontainers MySQL |
 
 ## 3. 领域边界与所有权
 
@@ -68,10 +71,11 @@ Tournament
 | --- | --- |
 | `id` | 内部 UUID |
 | `owner_id` / `guest_session_id` | 私有赛事归属，二者至少有一项 |
-| `artist_id` | 规范目标艺人 |
-| `mode` | `CLASSIC` / `EXPLORATION` |
+| `artist_id` | 可空的起点艺人；跨艺人赛事不强制绑定 |
 | `size` | 仅 `16` / `32` |
 | `candidate_source` | `POPULAR` / `RANDOM` / `CUSTOM` / `AGENT_CURATED` |
+| `exploration_brief` | 可空；用户提交给 Agent 的偏好、喜欢的歌曲/艺人、场景或探索目标 |
+| `agent_guidance_requested` | 是否在赛后请求 Agent 生成探索引导 |
 | `status` | 见 5.1 |
 | `bracket_seed` | 可复现随机对阵种子 |
 | `winner_entry_id` | 冠军；完成前为空 |
@@ -111,7 +115,7 @@ stateDiagram-v2
   ABANDONED --> DELETED: 用户删除
 ```
 
-- `DRAFT`：可修改候选池；探索模式等待 Agent 草稿时也属于此状态；
+- `DRAFT`：可修改候选池；等待 Agent 策展草稿时也属于此状态；
 - `READY`：候选池已确认、对阵已生成，但尚未投票；
 - `IN_PROGRESS`：至少有一个有效 Vote；
 - `COMPLETED`：最终对局完成，冠军确定；
@@ -128,7 +132,7 @@ stateDiagram-v2
 4. 每个 Recording 对目标艺人的关系符合模式限制；
 5. 不含被实体服务标记为近重复/版本冲突的默认排除项，除非来自用户明确自选并二次确认；
 6. 当前用户拥有该赛事草稿；
-7. 探索模式的 Agent 返回候选仍需重新校验，不能信任 Agent 原始结果。
+7. Agent 返回的跨艺人候选仍需重新校验，不能信任 Agent 原始结果。
 
 ### 5.3 单败淘汰赛生成
 
@@ -142,7 +146,7 @@ stateDiagram-v2
 
 ### 5.4 投票事务
 
-`POST /matches/{matchId}/vote` 必须满足：
+`POST /tournament-matches/{matchId}/votes` 必须满足：
 
 1. 校验调用者拥有赛事；
 2. 校验赛事为 `READY` 或 `IN_PROGRESS`，Match 为 `PENDING`；
@@ -167,19 +171,18 @@ stateDiagram-v2
 | `GET` | `/artists/{artistId}/recordings` | 获取可选择 Recording；支持分页与版本过滤 |
 | `GET` | `/recordings/{recordingId}` | 获取歌曲详情、封面、试听/外链可用性 |
 
-### 6.2 经典世界杯
+### 6.2 歌曲世界杯核心资源
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/tournaments` | 创建经典模式 `DRAFT` |
 | `PUT` | `/tournaments/{id}/entries` | 开赛前替换候选池 |
-| `POST` | `/tournaments/{id}/prepare` | 校验候选、生成赛程，进入 `READY` |
-| `POST` | `/tournaments/{id}/start` | 可选显式开赛；首票也可隐式开始 |
+| `PATCH` | `/tournaments/{id}` | 更新仍处于 `DRAFT` 的赛事；请求 `{ "status": "READY" }` 时校验候选并生成赛程 |
 | `GET` | `/tournaments/{id}` | 获取赛事、对局、Entry 快照和当前进度 |
-| `POST` | `/matches/{matchId}/vote` | 对局投票 |
-| `POST` | `/tournaments/{id}/abandon` | 中止未完成赛事 |
+| `PATCH` | `/tournaments/{id}` | 请求 `{ "status": "ABANDONED" }` 时中止未完成赛事 |
+| `POST` | `/tournament-matches/{matchId}/votes` | 为对局创建一张投票资源 |
 
-### 6.3 探索世界杯与 Agent 协作
+### 6.3 Agent 策展与赛后引导协作
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |

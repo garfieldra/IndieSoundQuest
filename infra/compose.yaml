@@ -18,6 +18,7 @@ services:
   java-service:
     build:
       context: ../java-service
+      target: local-runtime
     ports:
       - "8080:8080"
     environment:

@@ -1,0 +1,1 @@
+package com.indiesoundquest.tournament.repository; import com.indiesoundquest.tournament.domain.GuestSession; import java.util.*; import org.springframework.data.jpa.repository.JpaRepository; public interface GuestSessionRepository extends JpaRepository<GuestSession,UUID>{ Optional<GuestSession> findByTokenHash(String tokenHash); }

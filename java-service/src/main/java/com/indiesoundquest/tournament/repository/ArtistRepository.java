@@ -1,0 +1,1 @@
+package com.indiesoundquest.tournament.repository; import com.indiesoundquest.tournament.domain.Artist; import java.util.*; import org.springframework.data.jpa.repository.JpaRepository; public interface ArtistRepository extends JpaRepository<Artist,UUID>{ List<Artist> findAllByOrderBySortNameAsc(); }

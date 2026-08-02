@@ -1,0 +1,1 @@
+package com.indiesoundquest.tournament.repository; import com.indiesoundquest.tournament.domain.TournamentMatch; import java.util.*; import org.springframework.data.jpa.repository.JpaRepository; public interface TournamentMatchRepository extends JpaRepository<TournamentMatch,UUID>{ List<TournamentMatch> findByTournamentIdOrderByRoundNumberAscMatchIndexAsc(UUID tournamentId); }

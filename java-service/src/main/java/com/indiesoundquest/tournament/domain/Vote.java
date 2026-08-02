@@ -1,0 +1,3 @@
+package com.indiesoundquest.tournament.domain;
+import jakarta.persistence.*; import java.time.Instant; import java.util.UUID;
+@Entity @Table(name="vote") public class Vote { @Id private UUID id; @Column(name="match_id",nullable=false,unique=true) private UUID matchId; @Column(name="selected_entry_id",nullable=false) private UUID selectedEntryId; @Column(name="idempotency_key",nullable=false,unique=true) private String idempotencyKey; @Column(name="created_at",nullable=false) private Instant createdAt; protected Vote(){} public static Vote create(UUID matchId,UUID entryId,String key){var v=new Vote();v.id=UUID.randomUUID();v.matchId=matchId;v.selectedEntryId=entryId;v.idempotencyKey=key;v.createdAt=Instant.now();return v;} public UUID getMatchId(){return matchId;} }

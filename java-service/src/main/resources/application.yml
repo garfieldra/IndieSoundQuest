@@ -1,6 +1,21 @@
 spring:
   application:
     name: indie-sound-quest-java-service
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:mysql://localhost:3306/indie_sound_quest}
+    username: ${SPRING_DATASOURCE_USERNAME:indie_sound_quest}
+    password: ${SPRING_DATASOURCE_PASSWORD:indie_sound_quest}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui
 
 management:
   endpoints:
