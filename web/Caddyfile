@@ -1,13 +1,33 @@
+www.{$SITE_ADDRESS} {
+	redir https://{$SITE_ADDRESS}{uri} permanent
+}
+
 {$SITE_ADDRESS} {
-    encode zstd gzip
+	# Agent runs hold a POST SSE connection open. Do not compress or buffer this
+	# route: some mobile WebViews otherwise terminate a healthy stream as "Load failed".
+	@agent_stream {
+		path /api/v1/agent-runs/* /api/v1/tournaments/*/preference-report:stream
+	}
+	@non_agent_stream {
+		not path /api/v1/agent-runs/* /api/v1/tournaments/*/preference-report:stream
+	}
+	encode @non_agent_stream zstd gzip
 
-    handle /api/* {
-        reverse_proxy java-service:8080
-    }
+	handle @agent_stream {
+		reverse_proxy java-service:8080 {
+			flush_interval -1
+			header_down Cache-Control "no-cache, no-transform"
+			header_down X-Accel-Buffering "no"
+		}
+	}
 
-    handle {
-        root * /srv
-        try_files {path} /index.html
-        file_server
-    }
+	handle /api/* {
+		reverse_proxy java-service:8080
+	}
+
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
 }

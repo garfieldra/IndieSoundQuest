@@ -1,0 +1,5 @@
+.agent-plan { margin: 20px 0 0; border: 1px solid #ded4c8; border-radius: 12px; background: #fffdfa; overflow: hidden; }
+.agent-plan-toggle { width: 100%; display: grid; grid-template-columns: 1fr auto auto; gap: 14px; align-items: center; padding: 14px 16px; border: 0; background: transparent; text-align: left; color: #4d4037; }
+.agent-plan-toggle small, .agent-plan-summary { color: #7b6c62; }.agent-plan-toggle span:last-child { color: #9c493a; font-size: .85rem; }
+.agent-plan > p { margin: 0; padding: 0 16px 4px; font-family: "Songti SC", serif; color: #40352e; }.agent-plan-summary { display: block; padding: 0 16px 10px; }
+.agent-plan ol { list-style: none; padding: 0 16px 14px; margin: 0; }.agent-plan li { display: grid; grid-template-columns: 12px 1fr; gap: 9px; padding: 9px 0; color: #655a52; border-top: 1px solid #eee4da; }.agent-plan li i { width: 8px; height: 8px; border: 1px solid #c8b9ad; border-radius: 50%; margin-top: .38rem; }.agent-plan li.running i { background: #9c493a; border-color: #9c493a; }.agent-plan li.completed i { background: #536b59; border-color: #536b59; }.agent-plan li small { grid-column: 2; color: #918278; font-size: .82rem; }

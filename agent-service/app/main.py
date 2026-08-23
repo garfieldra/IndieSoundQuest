@@ -39,6 +39,36 @@ def _progress(request_id, action: str, elapsed_ms: int, metrics: dict | None = N
     payload = {"runId": str(request_id), "phase": phase, "status": "started", "message": message, "elapsedMs": elapsed_ms, "metrics": metrics or {}}
     return f"event: progress\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
+def _plan_event(request_id, state: dict, workflow: str) -> str:
+    """Public plan projection: action facts only, never model reasoning or prompts."""
+    action = state.get("decision").action if state.get("decision") else None
+    history = [item.get("action") for item in state.get("action_history", [])]
+    count = len(state.get("recordings", []))
+    def status(key: str, actions: set[str]) -> str:
+        if action in actions: return "running"
+        if any(item in actions for item in history): return "completed"
+        return "pending"
+    if workflow == "candidate":
+        target = state.get("request").size * 2 if state.get("request") else 0
+        items = [
+            {"id":"understand","title":"理解本次音乐偏好","status":status("understand", {"understand_preference", "resolve_named_entities"}),"detail":"已识别输入中的音乐方向"},
+            {"id":"artist-catalog","title":"核验明确艺人的作品","status":status("artist", {"expand_artist_catalog", "search_catalog"}),"detail":f"已获得 {count} 首可核验歌曲"},
+            {"id":"adjacent","title":"探索相近音乐方向","status":status("adjacent", {"search_web", "search_knowledge"}),"detail":"从公开音乐资料补充待核验线索"},
+            {"id":"verify","title":"核验新发现歌曲","status":status("verify", {"resolve_musicbrainz"}),"detail":"将外部线索转为规范歌曲身份"},
+            {"id":"review","title":"去重并检查候补数量","status":status("review", {"rerank_candidates", "submit_candidates"}),"detail":"确保赛事与候补队列都满足数量要求"},
+        ]
+        goal, summary = f"为 {target // 2} 首赛事准备 {target} 首可核验候选", f"已核验 {count} / {target} 首；当前正由 Agent 决定下一步。"
+    else:
+        items = [
+            {"id":"facts","title":"分析本场关键选择","status":status("facts", {"analyze_tournament"}),"detail":"归纳胜出、淘汰与关键对局"},
+            {"id":"research","title":"补充探索资料","status":status("research", {"search_web", "search_knowledge"}),"detail":"按需查找公开音乐资料"},
+            {"id":"draft","title":"生成偏好报告与推荐","status":status("draft", {"draft_report"}),"detail":"基于本场赛事事实组织结论"},
+            {"id":"review","title":"审查推荐与事实边界","status":status("review", {"critique_report", "submit_report"}),"detail":"检查来源、对局依据与表达边界"},
+        ]
+        goal, summary = "基于本场歌曲世界杯生成偏好报告", "正在根据已完成的对局事实推进报告。"
+    payload = {"runId": str(request_id), "revision": len(history), "goal": goal, "summary": summary, "items": items}
+    return f"event: plan_updated\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
 async def verify_caller(authorization: str = Header(default="")):
     if authorization != f"Bearer {settings.agent_internal_service_token}": raise HTTPException(401, "invalid internal credential")
 
@@ -58,13 +88,16 @@ async def candidate_pool(request: CandidatePoolRequest, x_request_id: str = Head
             # framework default (25) can interrupt a legitimate guarded run before
             # the graph's own tool/deadline/stagnation guards have a chance to stop.
             started = __import__("time").monotonic()
-            last_action = None
+            last_action = None; last_plan = None
             result = None
             async for state in graph.astream({"request": request}, {"recursion_limit": 128}, stream_mode="values"):
                 action = state.get("decision").action if state.get("decision") else None
                 if action and action != last_action:
                     last_action = action
                     yield _progress(request.request_id, action, int((__import__("time").monotonic() - started) * 1000))
+                plan = _plan_event(request.request_id, state, "candidate")
+                if plan != last_plan:
+                    last_plan = plan; yield plan
                 if state.get("result"):
                     result = state["result"]
             if result is None: raise RuntimeError("candidate result missing")
@@ -91,12 +124,15 @@ async def tournament_report(request: TournamentReportRequest, x_request_id: str 
     async def events():
         yield _progress(request.request_id, "analyze_tournament", 0)
         try:
-            started = __import__("time").monotonic(); last_action = None; result = None; state = {}
+            started = __import__("time").monotonic(); last_action = None; last_plan = None; result = None; state = {}
             async for state in report_graph.astream({"request": request}, {"recursion_limit": 80}, stream_mode="values"):
                 action = state.get("decision").action if state.get("decision") else None
                 if action and action != last_action:
                     last_action = action
                     yield _progress(request.request_id, action, int((__import__("time").monotonic() - started) * 1000))
+                plan = _plan_event(request.request_id, state, "report")
+                if plan != last_plan:
+                    last_plan = plan; yield plan
                 if state.get("result"): result = state["result"]
             logger.info(
                 "report ReAct completed request_id=%s actions=%s",

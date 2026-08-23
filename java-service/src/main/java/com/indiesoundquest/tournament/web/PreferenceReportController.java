@@ -60,7 +60,7 @@ public class PreferenceReportController {
     var report=reports.save(TournamentPreferenceReport.pending(UUID.randomUUID(),tournament,version));
     return output -> {
       try {
-        service.generateStreaming(report.getId(), tournamentId, guest.getId(), version, progress -> safeWriteSse(output, "progress", progress));
+        service.generateStreaming(report.getId(), tournamentId, guest.getId(), version, event -> safeWriteSse(output, event.event(), event.data()));
         var completed=reports.findById(report.getId()).orElseThrow();
         if (completed.getStatus()==PreferenceReportStatus.READY) writeSse(output, "result", objectMapper.writeValueAsString(view(completed)));
         else writeSse(output, "error", "{\"code\":\"REPORT_WORKFLOW_FAILED\",\"message\":\"报告暂时无法生成，请稍后重试\"}");

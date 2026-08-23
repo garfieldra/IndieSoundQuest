@@ -1,4 +1,4 @@
-import { type RefObject, useEffect, useMemo, useRef, useState } from 'react'
+import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react'
 import { toPng } from 'html-to-image'
 import { deriveCandidateSelection, intentModeLabel, type ArtistChoice, type CandidateItem, type CandidatePoolResponse } from './candidatePool'
 import { playbackLabel, type PlaybackState, useListeningPreview } from './listening'
@@ -9,6 +9,7 @@ import './export.css'
 import './listening.css'
 import './evidence.css'
 import './agentProgress.css'
+import './agentPlan.css'
 
 type Artist = { id: string; name: string }
 type Entry = { id: string; recordingId: string; title: string; artistName: string; albumTitle?: string; coverUrl?: string; coverStatus: string; listeningSearchUrl: string }
@@ -16,6 +17,13 @@ type Match = { id: string; roundNumber: number; matchIndex: number; leftEntryId:
 type Tournament = { id: string; status: string; size: number; completedVoteCount: number; completedAt?: string | null; entries: Entry[]; matches: Match[]; currentMatch: Match | null }
 type Report = { reportId: string; tournamentId: string; version: number; status: 'PENDING' | 'RUNNING' | 'READY' | 'FAILED'; report?: { summary: string; dimensions: { name: string; confidence: string; explanation: string }[]; choiceTrajectory?: { matchId: string; roundNumber: number; matchIndex: number; winnerTitle: string; winnerArtistName: string; loserTitle: string; loserArtistName: string; signalRole: 'stable_anchor' | 'preference_boundary' | 'near_finalist'; derivedNote: string }[]; songRecommendations: { recordingId?: string; title?: string; artistName?: string; reason: string; searchUrl?: string; sourceStatus?: 'catalog_verified' | 'web_discovered'; sourceUrl?: string; sourceTitle?: string }[]; artistRecommendations: { artistId?: string; artistName?: string; reason: string; searchUrl?: string; sourceStatus?: 'catalog_verified' | 'web_discovered'; sourceUrl?: string; sourceTitle?: string }[]; explorationTags?: string[]; personalityEasterEgg: string; disclaimer: string; warnings?: string[] }; failureMessage?: string }
 type AgentProgress = { phase: string; status?: string; message: string; elapsedMs?: number }
+type AgentPlan = { revision: number; goal: string; summary: string; items: { id: string; title: string; status: 'pending' | 'running' | 'completed' | 'skipped' | 'blocked'; detail: string }[] }
+
+function agentErrorMessage(error: unknown, fallback: string) {
+  const message = error instanceof Error ? error.message.trim() : ''
+  if (/^(load failed|failed to fetch|networkerror)$/i.test(message)) return '探索连接意外中断了，请检查网络后重试。已完成的赛事不会受影响。'
+  return message || fallback
+}
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api/v1${path}`, { credentials: 'include', ...options })
@@ -23,7 +31,7 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>
 }
 
-async function streamAgent<T>(path: string, options: RequestInit, onProgress: (progress: AgentProgress) => void): Promise<T> {
+async function streamAgent<T>(path: string, options: RequestInit, onProgress: (progress: AgentProgress) => void, onPlan: (plan: AgentPlan) => void): Promise<T> {
   const response = await fetch(`/api/v1${path}`, { credentials: 'include', ...options })
   if (!response.ok || !response.body) throw new Error(`请求失败（${response.status}）`)
   const reader = response.body.getReader(); const decoder = new TextDecoder(); let pending = ''; let result: T | undefined
@@ -32,6 +40,7 @@ async function streamAgent<T>(path: string, options: RequestInit, onProgress: (p
     const data = block.match(/^data:\s*(.+)$/m)?.[1]?.trim()
     if (!event || !data) return
     if (event === 'progress') onProgress(JSON.parse(data) as AgentProgress)
+    else if (event === 'plan_updated') onPlan(JSON.parse(data) as AgentPlan)
     else if (event === 'result') result = JSON.parse(data) as T
     else if (event === 'error') { const issue = JSON.parse(data) as { message?: string }; throw new Error(issue.message || 'Agent 服务暂时不可用') }
   }
@@ -60,7 +69,9 @@ export function App() {
   const [report, setReport] = useState<Report | null>(null)
   const [reportLoading, setReportLoading] = useState(false)
   const [agentProgress, setAgentProgress] = useState<AgentProgress[]>([])
+  const [agentPlan, setAgentPlan] = useState<AgentPlan | null>(null)
   const [progressCollapsed, setProgressCollapsed] = useState(false)
+  const [agentRunActive, setAgentRunActive] = useState(false)
   const listening = useListeningPreview()
   const creationAttempt = useRef<{ signature: string; key: string } | null>(null)
 
@@ -96,14 +107,14 @@ export function App() {
   }
   async function generateCandidates(nextConfirmedArtists = confirmedArtists) {
     if (preferenceText.trim().length < 3) { setMessage('请用一句话描述你想探索的音乐。'); return }
-    setLoading(true); setMessage(''); setAgentProgress([]); setProgressCollapsed(false)
+    setLoading(true); setAgentRunActive(true); setMessage(''); setAgentProgress([]); setAgentPlan(null); setProgressCollapsed(false)
     try {
       const requestId = crypto.randomUUID()
-      const data = await streamAgent<CandidatePoolResponse>('/agent-runs/candidate-pool:stream', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': requestId }, body: JSON.stringify({ size, preferenceText, seedArtistIds: seedArtistId ? [seedArtistId] : [], confirmedArtists: nextConfirmedArtists }) }, item => setAgentProgress(current => [...current, item]))
+      const data = await streamAgent<CandidatePoolResponse>('/agent-runs/candidate-pool:stream', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': requestId }, body: JSON.stringify({ size, preferenceText, seedArtistIds: seedArtistId ? [seedArtistId] : [], confirmedArtists: nextConfirmedArtists }) }, item => setAgentProgress(current => [...current, item]), setAgentPlan)
       setCandidateResult(data); setExcludedIds([]); setPreparingTournamentId(null); creationAttempt.current = null
       if (data.status === 'insufficient_candidates') setMessage(data.candidatePool?.warnings[0]?.message || '可验证歌曲不足，请调整兴趣方向。')
     }
-    catch (error) { setMessage(error instanceof Error ? error.message : '候选歌曲暂时无法生成') } finally { setLoading(false); setProgressCollapsed(true) }
+    catch (error) { setMessage(agentErrorMessage(error, '候选歌曲暂时无法生成')) } finally { setLoading(false); setAgentRunActive(false); setProgressCollapsed(true) }
   }
   function changeSize(nextSize: 16 | 32) {
     if (nextSize === size) return
@@ -151,12 +162,12 @@ export function App() {
   }
   async function generateReport(force = false) {
     if (!tournament) return
-    setReportLoading(true); setMessage(''); setAgentProgress([]); setProgressCollapsed(false)
+    setReportLoading(true); setAgentRunActive(true); setMessage(''); setAgentProgress([]); setAgentPlan(null); setProgressCollapsed(false)
     try {
-      const created = await streamAgent<Report>(`/tournaments/${tournament.id}/preference-report:stream`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force }) }, item => setAgentProgress(current => [...current, item]))
+      const created = await streamAgent<Report>(`/tournaments/${tournament.id}/preference-report:stream`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force }) }, item => setAgentProgress(current => [...current, item]), setAgentPlan)
       setReport(created)
-    } catch (error) { setMessage(error instanceof Error ? error.message : '报告暂时无法生成') }
-    finally { setReportLoading(false); setProgressCollapsed(true) }
+    } catch (error) { setMessage(agentErrorMessage(error, '报告暂时无法生成')) }
+    finally { setReportLoading(false); setAgentRunActive(false); setProgressCollapsed(true) }
   }
 
   const entryById = useMemo(() => new Map(tournament?.entries.map(entry => [entry.id, entry])), [tournament])
@@ -168,10 +179,12 @@ export function App() {
   const current = tournament?.currentMatch
   const left = current?.leftEntryId ? entryById.get(current.leftEntryId) : undefined
   const right = current?.rightEntryId ? entryById.get(current.rightEntryId) : undefined
+  const agentFeedback = agentRunActive && (agentPlan || agentProgress.length > 0)
+    ? <AgentRunFeedback plan={agentPlan} items={agentProgress} collapsed={progressCollapsed} onToggle={() => setProgressCollapsed(value => !value)} />
+    : null
   return <main className="app-shell">
     <header><p className="eyebrow">IndieSoundQuest</p><h1>把喜欢，投进一场歌的世界杯。</h1><p className="subtitle">一对一选择，最后留下真正属于你的冠军歌曲。</p></header>
     {message && <p className="notice">{message}</p>}
-    {agentProgress.length > 0 && <AgentProgressPanel items={agentProgress} collapsed={progressCollapsed} onToggle={() => setProgressCollapsed(value => !value)} />}
     {!tournament && <section className="panel setup">
       <div className="mode-tabs">
         <button className={mode === 'explore' ? 'selected' : ''} onClick={() => setMode('explore')}>按偏好探索</button>
@@ -188,12 +201,13 @@ export function App() {
         <label>起点艺人（可选）<select value={seedArtistId} onChange={event => setSeedArtistId(event.target.value)}><option value="">不限定，从文字偏好开始</option>{artists.map(artist => <option key={artist.id} value={artist.id}>{artist.name}</option>)}</select></label>
         <fieldset><legend>赛事规模</legend><button className={size === 16 ? 'selected' : ''} onClick={() => changeSize(16)}>16 首</button><button className={size === 32 ? 'selected' : ''} onClick={() => changeSize(32)}>32 首</button></fieldset>
         <button className="primary" disabled={loading} onClick={() => void generateCandidates()}>{loading ? '正在寻找适合这场比赛的歌曲…' : '生成候选歌曲'}</button>
-      </> : candidateResult.status === 'needs_clarification' ? <ArtistClarificationView clarifications={candidateResult.clarifications ?? []} loading={loading} onConfirm={(choices) => { setConfirmedArtists(choices); void generateCandidates(choices) }} onRestart={() => { setCandidateResult(null); setConfirmedArtists([]); setMessage('') }} /> : candidateResult.status === 'insufficient_candidates' ? <section className="candidate-state" aria-live="polite">
+        {agentFeedback}
+      </> : candidateResult.status === 'needs_clarification' ? <ArtistClarificationView clarifications={candidateResult.clarifications ?? []} loading={loading} feedback={agentFeedback} onConfirm={(choices) => { setConfirmedArtists(choices); void generateCandidates(choices) }} onRestart={() => { setCandidateResult(null); setConfirmedArtists([]); setMessage('') }} /> : candidateResult.status === 'insufficient_candidates' ? <section className="candidate-state" aria-live="polite">
         <p className="eyebrow">候选数量不足</p>
         <h2>这次还不足以组成一场比赛</h2>
         <p className="subtitle">{candidatePool?.candidateSummary}</p>
         {candidatePool?.warnings.map(warning => <p className="candidate-warning" key={warning.code}>{warning.message}</p>)}
-        <div className="candidate-actions"><button className="secondary" onClick={() => { setCandidateResult(null); setMessage('') }}>修改兴趣方向</button><button className="primary" disabled={loading} onClick={() => void generateCandidates()}>重新生成</button></div>
+        <div className="candidate-actions"><button className="secondary" onClick={() => { setCandidateResult(null); setMessage('') }}>修改兴趣方向</button><button className="primary" disabled={loading} onClick={() => void generateCandidates()}>重新生成</button></div>{agentFeedback}
       </section> : <section className="candidate-shelf">
         <p className="eyebrow">候选唱片架</p>
         <h2>从这一组声音开始</h2>
@@ -212,11 +226,15 @@ export function App() {
         />)}</div>
         {!candidateSelection.canRemove && <p className="candidate-warning" aria-live="polite">候补已用完；你仍可恢复歌曲或重新生成。</p>}
         {candidateSelection.removedItems.length > 0 && <details className="removed"><summary>已移除 {candidateSelection.removedItems.length} 首</summary>{candidateSelection.removedItems.map(item => <div key={item.recordingId}><span><strong>{item.title}</strong><small>{item.artistName}</small></span><button onClick={() => restoreCandidate(item.recordingId)}>恢复</button></div>)}</details>}
-        <div className="candidate-actions"><button className="secondary" disabled={loading || Boolean(preparingTournamentId)} onClick={() => void generateCandidates()}>重新生成</button><button className="primary" disabled={loading || candidateSelection.activeItems.length !== size} onClick={startExploration}>{preparingTournamentId ? '重试进入赛事' : '以这组歌曲开赛'}</button></div>
+        <div className="candidate-actions"><button className="secondary" disabled={loading || Boolean(preparingTournamentId)} onClick={() => void generateCandidates()}>重新生成</button><button className="primary" disabled={loading || candidateSelection.activeItems.length !== size} onClick={startExploration}>{preparingTournamentId ? '重试进入赛事' : '以这组歌曲开赛'}</button></div>{agentFeedback}
       </section>}
     </section>}
-    {tournament && <section className="panel arena">{tournament.status === 'COMPLETED' ? <TournamentResultView tournament={tournament} playbackFor={listening.stateFor} onPreview={id => void listening.toggle(id)} onPrefetch={id => void listening.prefetch(id)} onGenerateReport={() => void generateReport()} reportLoading={reportLoading} hasReadyReport={report?.status === 'READY'} onNewTournament={() => { listening.stop(); setTournament(null); setReport(null) }}>{report && <ReportView report={report} tournament={tournament} onRetry={() => void generateReport(true)} loading={reportLoading}/>}</TournamentResultView> : <><div className="progress"><span>{`第 ${tournament.completedVoteCount + 1} 场选择`}</span><span>{tournament.completedVoteCount} / {tournament.size - 1}</span></div>{current && left && right && <><h2>这一轮，你更想留下谁？</h2><p className="matchup-hint">点击唱片试听，确定后再选择留下这首。</p><div className="matchup"><SongCard entry={left} playback={listening.stateFor(left.recordingId)} onPreview={() => void listening.toggle(left.recordingId)} onPrefetch={() => void listening.prefetch(left.recordingId)} onVote={() => void vote(left.id)} disabled={loading}/><div className="versus">VS</div><SongCard entry={right} playback={listening.stateFor(right.recordingId)} onPreview={() => void listening.toggle(right.recordingId)} onPrefetch={() => void listening.prefetch(right.recordingId)} onVote={() => void vote(right.id)} disabled={loading}/></div></>}</>}</section>}
+    {tournament && <section className="panel arena">{tournament.status === 'COMPLETED' ? <TournamentResultView tournament={tournament} playbackFor={listening.stateFor} onPreview={id => void listening.toggle(id)} onPrefetch={id => void listening.prefetch(id)} onGenerateReport={() => void generateReport()} reportLoading={reportLoading} hasReadyReport={report?.status === 'READY'} agentFeedback={agentFeedback} onNewTournament={() => { listening.stop(); setTournament(null); setReport(null) }}>{report && <ReportView report={report} tournament={tournament} onRetry={() => void generateReport(true)} loading={reportLoading}/>}</TournamentResultView> : <><div className="progress"><span>{`第 ${tournament.completedVoteCount + 1} 场选择`}</span><span>{tournament.completedVoteCount} / {tournament.size - 1}</span></div>{current && left && right && <><h2>这一轮，你更想留下谁？</h2><p className="matchup-hint">点击唱片试听，确定后再选择留下这首。</p><div className="matchup"><SongCard entry={left} playback={listening.stateFor(left.recordingId)} onPreview={() => void listening.toggle(left.recordingId)} onPrefetch={() => void listening.prefetch(left.recordingId)} onVote={() => void vote(left.id)} disabled={loading}/><div className="versus">VS</div><SongCard entry={right} playback={listening.stateFor(right.recordingId)} onPreview={() => void listening.toggle(right.recordingId)} onPrefetch={() => void listening.prefetch(right.recordingId)} onVote={() => void vote(right.id)} disabled={loading}/></div></>}</>}</section>}
   </main>
+}
+
+function AgentRunFeedback({ plan, items, collapsed, onToggle }: { plan: AgentPlan | null; items: AgentProgress[]; collapsed: boolean; onToggle: () => void }) {
+  return <section className="agent-run-feedback" aria-label="Agent 执行过程">{plan && <AgentPlanPanel plan={plan} collapsed={collapsed} onToggle={onToggle} />}{items.length > 0 && <AgentProgressPanel items={items} collapsed={collapsed} onToggle={onToggle} />}</section>
 }
 
 function AgentProgressPanel({ items, collapsed, onToggle }: { items: AgentProgress[]; collapsed: boolean; onToggle: () => void }) {
@@ -226,6 +244,14 @@ function AgentProgressPanel({ items, collapsed, onToggle }: { items: AgentProgre
       <span>{collapsed ? '已完成本次音乐探索' : '正在梳理这次音乐探索'}</span><small>{latest?.message}</small><span>{collapsed ? '展开' : '收起'}</span>
     </button>
     {!collapsed && <ol>{items.map((item, index) => <li key={`${item.phase}-${index}`}><span>{item.message}</span>{item.elapsedMs != null && <small>{Math.max(1, Math.round(item.elapsedMs / 1000))} 秒</small>}</li>)}</ol>}
+  </aside>
+}
+
+function AgentPlanPanel({ plan, collapsed, onToggle }: { plan: AgentPlan; collapsed: boolean; onToggle: () => void }) {
+  const completed = plan.items.filter(item => item.status === 'completed').length
+  return <aside className={`agent-plan ${collapsed ? 'collapsed' : ''}`} aria-live="polite">
+    <button className="agent-plan-toggle" onClick={onToggle} aria-expanded={!collapsed}><span>探索计划</span><small>{completed} / {plan.items.length} 已完成</small><span>{collapsed ? '展开' : '收起'}</span></button>
+    {!collapsed && <><p>{plan.goal}</p><small className="agent-plan-summary">{plan.summary}</small><ol>{plan.items.map(item => <li key={item.id} className={item.status}><i aria-hidden="true"/>{item.title}<small>{item.detail}</small></li>)}</ol></>}
   </aside>
 }
 
@@ -245,14 +271,14 @@ function CandidateCard({ item, playback, onPreview, onPrefetch, onRemove, remove
   </article>
 }
 
-function ArtistClarificationView({ clarifications, loading, onConfirm, onRestart }: { clarifications: NonNullable<CandidatePoolResponse['clarifications']>; loading: boolean; onConfirm: (choices: { mention: string; mbid: string; name: string }[]) => void; onRestart: () => void }) {
+function ArtistClarificationView({ clarifications, loading, feedback, onConfirm, onRestart }: { clarifications: NonNullable<CandidatePoolResponse['clarifications']>; loading: boolean; feedback?: ReactNode; onConfirm: (choices: { mention: string; mbid: string; name: string }[]) => void; onRestart: () => void }) {
   const [selected, setSelected] = useState<Record<string, ArtistChoice>>({})
   const complete = clarifications.length > 0 && clarifications.every(item => selected[item.mention])
   return <section className="candidate-state clarification-state" aria-live="polite">
     <p className="eyebrow">需要确认艺人</p><h2>先确认这些名字，再开始找歌</h2>
     <p className="subtitle">系统检测到可能对应多个音乐人的名称。为避免把错误的作品放进候选池，请选择你指的对象。</p>
     {clarifications.map(item => <fieldset key={item.mention} className="artist-clarification"><legend>{item.mention}</legend>{item.candidates.length ? item.candidates.map(candidate => <label key={candidate.mbid} className={selected[item.mention]?.mbid === candidate.mbid ? 'selected' : ''}><input type="radio" name={`artist-${item.mention}`} checked={selected[item.mention]?.mbid === candidate.mbid} onChange={() => setSelected(current => ({ ...current, [item.mention]: candidate }))}/><span><strong>{candidate.name}</strong><small>{[candidate.type, candidate.country, candidate.disambiguation, candidate.begin && `始于 ${candidate.begin}`].filter(Boolean).join(' · ') || 'MusicBrainz 艺人条目'}</small></span></label>) : <p className="candidate-warning">没有找到可安全确认的条目，请修正该艺人的拼写或补充更多信息。</p>}</fieldset>)}
-    <div className="candidate-actions"><button className="secondary" onClick={onRestart}>以上都不是，修改输入</button><button className="primary" disabled={loading || !complete} onClick={() => onConfirm(clarifications.map(item => ({ mention: item.mention, mbid: selected[item.mention].mbid, name: selected[item.mention].name })))}>{loading ? '正在继续寻找…' : '确认并继续生成'}</button></div>
+    <div className="candidate-actions"><button className="secondary" onClick={onRestart}>以上都不是，修改输入</button><button className="primary" disabled={loading || !complete} onClick={() => onConfirm(clarifications.map(item => ({ mention: item.mention, mbid: selected[item.mention].mbid, name: selected[item.mention].name })))}>{loading ? '正在继续寻找…' : '确认并继续生成'}</button></div>{feedback}
   </section>
 }
 
@@ -297,7 +323,7 @@ function ReportView({ report, tournament, onRetry, loading }: { report: Report; 
 
 function ReportExport({ report, champion, tournament, exportRef }: { report: Report; champion?: Entry; tournament: Tournament; exportRef: RefObject<HTMLElement> }) {
   if (!report.report) return null
-  return <article className="report-export" ref={exportRef}><p className="eyebrow">本场冠军 · {tournament.size} 首歌曲世界杯</p><section className="export-champion">{champion?.coverUrl ? <img src={champion.coverUrl} alt=""/> : <div className="export-disc">ISQ</div>}<div><h1>{champion?.title || '本场冠军'}</h1><p>{champion?.artistName || 'IndieSoundQuest'}</p></div></section><p className="eyebrow">偏好报告 · 第 {report.version} 版</p><p className="export-summary">{report.report.summary}</p>{report.report.explorationTags?.length ? <p className="export-tags">探索依据 · {report.report.explorationTags.join(' · ')}</p> : null}<div className="export-dimensions">{report.report.dimensions.map(item => <section key={item.name}><strong>{item.name}</strong><p>{item.explanation}</p></section>)}</div>{report.report.choiceTrajectory?.length ? <><h2>你的选择轨迹</h2>{report.report.choiceTrajectory.map(item => <p className="export-item" key={item.matchId}><strong>《{item.winnerTitle}》</strong> · {item.winnerArtistName}<br/><small>胜出于《{item.loserTitle}》· {item.loserArtistName}｜{item.derivedNote}</small></p>)}</> : null}<h2>继续听听</h2>{report.report.songRecommendations.map((item, index) => <p className="export-item" key={item.recordingId || index}><strong>{item.title}</strong> {item.artistName && `· ${item.artistName}`}<br/><small>{item.reason}{item.sourceStatus === 'web_discovered' ? `｜网络发现 · 待核验｜${item.sourceTitle || '来源资料'}｜请以音乐平台搜索结果为准` : ''}</small></p>)}<blockquote>{report.report.personalityEasterEgg}</blockquote><p className="export-disclaimer">{report.report.disclaimer}</p><footer>IndieSoundQuest</footer></article>
+  return <article className="report-export" ref={exportRef} aria-hidden="true"><p className="eyebrow">本场冠军 · {tournament.size} 首歌曲世界杯</p><section className="export-champion">{champion?.coverUrl ? <img src={champion.coverUrl} alt=""/> : <div className="export-disc">ISQ</div>}<div><h1>{champion?.title || '本场冠军'}</h1><p>{champion?.artistName || 'IndieSoundQuest'}</p></div></section><p className="eyebrow">偏好报告 · 第 {report.version} 版</p><p className="export-summary">{report.report.summary}</p>{report.report.explorationTags?.length ? <p className="export-tags">探索依据 · {report.report.explorationTags.join(' · ')}</p> : null}<div className="export-dimensions">{report.report.dimensions.map(item => <section key={item.name}><strong>{item.name}</strong><p>{item.explanation}</p></section>)}</div>{report.report.choiceTrajectory?.length ? <><h2>你的选择轨迹</h2>{report.report.choiceTrajectory.map(item => <p className="export-item" key={item.matchId}><strong>《{item.winnerTitle}》</strong> · {item.winnerArtistName}<br/><small>胜出于《{item.loserTitle}》· {item.loserArtistName}｜{item.derivedNote}</small></p>)}</> : null}<h2>继续听听</h2>{report.report.songRecommendations.map((item, index) => <p className="export-item" key={item.recordingId || index}><strong>{item.title}</strong> {item.artistName && `· ${item.artistName}`}<br/><small>{item.reason}{item.sourceStatus === 'web_discovered' ? `｜网络发现 · 待核验｜${item.sourceTitle || '来源资料'}｜请以音乐平台搜索结果为准` : ''}</small></p>)}<blockquote>{report.report.personalityEasterEgg}</blockquote><p className="export-disclaimer">{report.report.disclaimer}</p><footer>IndieSoundQuest</footer></article>
 }
 
 function RecommendationCard({ title, subtitle, item }: { title: string; subtitle?: string; item: { reason: string; searchUrl?: string; sourceStatus?: string; sourceUrl?: string; sourceTitle?: string } }) {

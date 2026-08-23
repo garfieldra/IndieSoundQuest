@@ -54,7 +54,7 @@ public class PreferenceReportApplicationService {
   }
 
   /** Runs the existing report workflow while forwarding only Agent-approved public progress events. */
-  public void generateStreaming(UUID reportId, UUID tournamentId, UUID guestSessionId, int version, Consumer<String> onProgress) {
+  public void generateStreaming(UUID reportId, UUID tournamentId, UUID guestSessionId, int version, Consumer<StreamEvent> onProgress) {
     try {
       markRunning(reportId);
       var requestId = UUID.randomUUID();
@@ -72,14 +72,14 @@ public class PreferenceReportApplicationService {
     }
   }
 
-  private String parseResult(java.io.InputStream input, Consumer<String> onProgress) throws Exception {
+    private String parseResult(java.io.InputStream input, Consumer<StreamEvent> onProgress) throws Exception {
     try (var lines = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
       String event = null, data = null, line;
       while ((line = lines.readLine()) != null) {
         if (line.startsWith("event: ")) event = line.substring(7).trim();
         else if (line.startsWith("data: ")) data = line.substring(6).trim();
         else if (line.isEmpty()) {
-          if ("progress".equals(event) && data != null) { objectMapper.readTree(data); onProgress.accept(data); }
+          if (("progress".equals(event) || "plan_updated".equals(event)) && data != null) { objectMapper.readTree(data); onProgress.accept(new StreamEvent(event, data)); }
           if ("result".equals(event) && data != null) { objectMapper.readTree(data); return data; }
           if ("error".equals(event)) throw new IllegalStateException("AGENT_WORKFLOW_ERROR");
           event = null; data = null;
@@ -88,4 +88,5 @@ public class PreferenceReportApplicationService {
     }
     return null;
   }
+  public record StreamEvent(String event, String data) {}
 }
