@@ -45,6 +45,18 @@ class MusicCatalogTool:
             response.raise_for_status()
             return response.json()["items"]
 
+    async def discover_artist_recordings(self, artists: list[dict], per_artist_limit: int = 32) -> list[dict]:
+        if not artists:
+            return []
+        async with httpx.AsyncClient(timeout=150) as client:
+            response = await client.post(
+                f"{self.base_url}/internal/v1/music-catalog/musicbrainz/discover-artists-and-import",
+                json={"artists": artists[:8], "perArtistLimit": per_artist_limit},
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            response.raise_for_status()
+            return response.json()["items"]
+
 
 class WebSearchTool:
     MAX_EXCERPT_CHARS = 2_000

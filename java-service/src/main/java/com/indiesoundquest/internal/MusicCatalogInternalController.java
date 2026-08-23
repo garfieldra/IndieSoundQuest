@@ -21,8 +21,15 @@ public class MusicCatalogInternalController {
     var hints=Optional.ofNullable(request.hints()).orElseGet(List::of).stream().limit(20).map(hint->new MusicBrainzCatalogService.Hint(hint.title(),hint.artistName(),hint.sourceUrl())).toList();
     return Map.of("items",musicBrainz.resolveAndImport(hints));
   }
+  @PostMapping("/music-catalog/musicbrainz/discover-artists-and-import") Map<String,Object> discoverArtistsAndImport(@RequestHeader("Authorization") String authorization,@RequestBody ArtistDiscoveryRequest request){
+    authorize(authorization);
+    var seeds=Optional.ofNullable(request.artists()).orElseGet(List::of).stream().limit(8).map(item -> new MusicBrainzCatalogService.ArtistSeed(item.mbid(), item.name())).toList();
+    return Map.of("items", musicBrainz.discoverArtistRecordings(seeds, request.perArtistLimit()==null?32:request.perArtistLimit()));
+  }
   record ResolveRequest(List<RecordingHint> hints){}
   record RecordingHint(String title,String artistName,String sourceUrl){}
+  record ArtistDiscoveryRequest(List<ArtistSeedHint> artists,Integer perArtistLimit){}
+  record ArtistSeedHint(String mbid,String name){}
   @PostMapping("/music-catalog/musicbrainz/resolve-artists") Map<String,Object> resolveArtists(@RequestHeader("Authorization") String authorization,@RequestBody ArtistResolveRequest request){
     authorize(authorization);
     return Map.of("items", musicBrainz.resolveArtistCandidates(Optional.ofNullable(request.names()).orElseGet(List::of)));

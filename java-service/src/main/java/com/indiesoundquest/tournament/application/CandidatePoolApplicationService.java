@@ -60,6 +60,15 @@ public class CandidatePoolApplicationService {
       throw new CandidatePoolUnavailableException("候选歌曲服务暂时不可用，请稍后重试");
     }
 
+    return fromAgentResult(requestId, size, agentResult, seedArtistIds);
+  }
+
+  /**
+   * Converts the Agent's internal response into the stable public API shape.  This is also used
+   * by the SSE controller so a streamed run and the legacy synchronous endpoint behave alike.
+   */
+  public CandidatePoolResponse fromAgentResult(
+      UUID requestId, int size, JsonNode agentResult, List<UUID> seedArtistIds) {
     validateEnvelope(agentResult, requestId, size);
     var status = agentResult.path("status").asText();
     if (CLARIFICATION.equals(status)) return clarification(requestId, size, agentResult);

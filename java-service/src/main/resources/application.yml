@@ -12,6 +12,9 @@ spring:
   flyway:
     enabled: true
     locations: classpath:db/migration
+  mvc:
+    async:
+      request-timeout: 15m
 
 springdoc:
   swagger-ui:

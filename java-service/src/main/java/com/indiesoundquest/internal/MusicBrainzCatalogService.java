@@ -122,6 +122,54 @@ public class MusicBrainzCatalogService {
     return results;
   }
 
+  /**
+   * Retrieves canonical recordings directly from MusicBrainz for already-resolved artists.
+   * This avoids turning a 32-song pool into dozens of sequential title lookups while keeping
+   * MusicBrainz as the sole identity authority.
+   */
+  @Transactional
+  public List<Resolution> discoverArtistRecordings(List<ArtistSeed> seeds, int perArtistLimit) {
+    var results = new ArrayList<Resolution>();
+    var seen = new HashSet<String>();
+    var nextSeedRank = recordings.findMaxSeedRank() + 1;
+    for (var seed : seeds.stream().filter(Objects::nonNull).limit(8).toList()) {
+      try {
+        var uri = URI.create(baseUrl + "/recording?fmt=json&limit=" + Math.min(Math.max(perArtistLimit, 1), 100)
+            + "&query=" + URLEncoder.encode("arid:" + seed.mbid(), StandardCharsets.UTF_8));
+        var response = send(uri);
+        if (response.statusCode() != 200) continue;
+        for (var node : objectMapper.readTree(response.body()).path("recordings")) {
+          var candidate = parseCandidate(node);
+          if (candidate == null || !seed.mbid().equals(candidate.artistMbid()) || !seen.add(candidate.recordingMbid())) continue;
+          var hint = new Hint(candidate.title(), candidate.artistName(), "https://musicbrainz.org/artist/" + seed.mbid());
+          var existing = recordings.findByMusicbrainzMbid(candidate.recordingMbid());
+          if (existing.isPresent()) {
+            existing.get().attachExternalDiscovery(hint.sourceUrl());
+            results.add(Resolution.resolved(hint, existing.get(), candidate.score(), false));
+            continue;
+          }
+          var artist = artists.findByMusicbrainzMbid(candidate.artistMbid())
+              .or(() -> artists.findFirstByNameIgnoreCase(candidate.artistName()))
+              .orElseGet(() -> artists.save(Artist.imported(candidate.artistName(), candidate.artistSortName(), candidate.artistMbid())));
+          artist.attachMusicbrainzIdentity(candidate.artistMbid());
+          var sameTitle = recordings.findFirstByArtistIdAndTitleIgnoreCase(artist.getId(), candidate.title());
+          if (sameTitle.isPresent()) {
+            var recording = sameTitle.get();
+            recording.attachMusicbrainzIdentity(candidate.recordingMbid(), candidate.releaseMbid(), candidate.albumTitle());
+            recording.attachExternalDiscovery(hint.sourceUrl());
+            results.add(Resolution.resolved(hint, recording, candidate.score(), false));
+            continue;
+          }
+          var saved = recordings.save(Recording.imported(artist, candidate.title(), candidate.albumTitle(), nextSeedRank++, candidate.recordingMbid(), candidate.releaseMbid(), hint.sourceUrl()));
+          results.add(Resolution.resolved(hint, saved, candidate.score(), true));
+        }
+      } catch (Exception ignored) {
+        // The agent receives partial verified results and can decide whether further web discovery is useful.
+      }
+    }
+    return results;
+  }
+
   private SearchOutcome search(Hint hint) throws Exception {
     if (hint.title() == null || hint.title().isBlank() || hint.artistName() == null || hint.artistName().isBlank()) {
       return SearchOutcome.unresolved("INVALID_HINT");
@@ -203,11 +251,13 @@ public class MusicBrainzCatalogService {
 
   private synchronized HttpResponse<String> send(URI uri) throws Exception {
     HttpResponse<String> response = null;
-    for (var attempt = 0; attempt < 3; attempt++) {
+    // A discovery run contains other recovery paths (web search and subsequent ReAct turns).
+    // Do not let one unresponsive upstream request consume a whole user-facing run.
+    for (var attempt = 0; attempt < 2; attempt++) {
       var wait = MIN_INTERVAL_MILLIS - (System.currentTimeMillis() - lastRequestAt);
       if (wait > 0) Thread.sleep(wait);
       var request = HttpRequest.newBuilder(uri)
-          .timeout(Duration.ofSeconds(15))
+          .timeout(Duration.ofSeconds(8))
           .header("Accept", "application/json")
           .header("User-Agent", userAgent)
           .GET()
@@ -216,7 +266,7 @@ public class MusicBrainzCatalogService {
         response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
       } catch (java.io.IOException exception) {
         lastRequestAt = System.currentTimeMillis();
-        if (attempt == 2) throw exception;
+        if (attempt == 1) throw exception;
         Thread.sleep((attempt + 1L) * 1_000);
         continue;
       } finally {
@@ -247,6 +297,7 @@ public class MusicBrainzCatalogService {
   }
 
   public record Hint(String title, String artistName, String sourceUrl) {}
+  public record ArtistSeed(String mbid, String name) {}
   public record ArtistCandidate(String mbid, String name, String sortName, String country, String type, String disambiguation, String begin, String end, int score) {}
   public record ArtistResolution(String mention, List<ArtistCandidate> candidates, String reason) {}
   private record Candidate(String recordingMbid, String title, String artistMbid, String artistName,

@@ -1,0 +1,18 @@
+.agent-progress {
+  margin: 20px 0 0;
+  border: 1px solid #ded4c8;
+  border-radius: 12px;
+  background: #fffaf4;
+  overflow: hidden;
+}
+.agent-progress-toggle {
+  width: 100%; display: grid; grid-template-columns: 1fr auto auto; gap: 14px;
+  align-items: center; padding: 14px 16px; border: 0; background: transparent;
+  text-align: left; color: #4d4037;
+}
+.agent-progress-toggle small { color: #7b6c62; max-width: 440px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-progress-toggle span:last-child { color: #9c493a; font-size: .85rem; }
+.agent-progress ol { list-style: none; margin: 0; padding: 2px 16px 14px; }
+.agent-progress li { display: flex; justify-content: space-between; gap: 20px; padding: 10px 0 0; color: #655a52; font-size: .92rem; border-top: 1px solid #eee4da; }
+.agent-progress li small { color: #9b8f85; white-space: nowrap; }
+@media (max-width: 760px) { .agent-progress-toggle { grid-template-columns: 1fr auto; } .agent-progress-toggle small { grid-column: 1 / -1; } }

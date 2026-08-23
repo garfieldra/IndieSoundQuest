@@ -20,7 +20,7 @@ class Selection(BaseModel):
 
 class CandidateDecision(BaseModel):
     action: Literal[
-        "understand_preference", "resolve_named_entities", "request_clarification", "search_catalog", "search_knowledge", "search_web",
+        "understand_preference", "resolve_named_entities", "request_clarification", "search_catalog", "expand_artist_catalog", "search_knowledge", "search_web",
         "resolve_musicbrainz", "rerank_candidates",
         "submit_candidates", "finish_insufficient",
     ]
@@ -167,9 +167,9 @@ class DeepSeekCandidateSelector:
 用户兴趣：{preference}
 当前规范候选数：{active_count}
 黑板摘要：{json.dumps(state_summary, ensure_ascii=False)}
-动作白名单：understand_preference, resolve_named_entities, request_clarification, search_catalog, search_knowledge, search_web, resolve_musicbrainz, rerank_candidates, submit_candidates, finish_insufficient。
+动作白名单：understand_preference, resolve_named_entities, request_clarification, search_catalog, expand_artist_catalog, search_knowledge, search_web, resolve_musicbrainz, rerank_candidates, submit_candidates, finish_insufficient。
 reasonCode 白名单：intent_policy_missing, locked_artist_identity_unresolved, verified_candidates_below_active_size, verified_candidates_below_target, local_scope_exhausted, cross_artist_expansion_allowed, external_hints_require_resolution, candidate_pool_requires_rerank, candidate_pool_ready_for_validation, budget_or_stagnation_limit_reached。
-规则：没有 intentPolicy 时先理解偏好；命名艺人尚未解析时优先 resolve_named_entities；存在未确认歧义时必须 request_clarification；最终歌曲必须有内部 recording ID；网络发现是主链路且必须先经 MusicBrainz 解析；本地目录只是缓存补充；ARTIST_LOCKED 不能扩展到允许集合外；未达到等量 reserve 时不得提交 ready_for_confirmation；不要重复无收益动作。
+规则：没有 intentPolicy 时先理解偏好；命名艺人尚未解析时优先 resolve_named_entities；存在未确认歧义时必须 request_clarification；对已解析的明确艺人，可自主选择 expand_artist_catalog 从 MusicBrainz 批量发现规范曲目；非锁定模式下应把明确艺人作为起点，并通过 search_web 主动寻找相近艺人、专辑或歌曲，再经 MusicBrainz 核验；最终歌曲必须有内部 recording ID；本地目录只是缓存补充；ARTIST_LOCKED 不能扩展到允许集合外；未达到等量 reserve 时不得提交 ready_for_confirmation；不要重复无收益动作。
 仅输出 JSON：{{"action":"...","reason_code":"...","decision_summary":"不含思维链的简短理由","query":"可选检索词"}}"""
         response = await self.model.ainvoke(prompt)
         try:
@@ -207,7 +207,7 @@ reasonCode 白名单：intent_policy_missing, locked_artist_identity_unresolved,
 Supervisor 建议查询：{suggested_query or '无'}
 可检验偏好假设：{json.dumps(hypotheses or [], ensure_ascii=False)}
 已使用检索：{json.dumps(prior_queries or [], ensure_ascii=False)}
-ARTIST_LOCKED 只能检索允许艺人的作品；其他模式可寻找相近艺人或具体作品。查询目的只能是 find_curated_song_lists、find_adjacent_artists、find_specific_works。
+ARTIST_LOCKED 只能检索允许艺人的作品；其他模式必须在明确艺人检索之外，额外提出 1–2 条“相近艺人/专辑/歌曲”假设检索词。这些仅是待公开资料验证的探索方向，不能直接当作音乐事实。查询目的只能是 find_curated_song_lists、find_adjacent_artists、find_specific_works。
 只输出 JSON：{{"queries":[{{"purpose":"...","query":"..."}}]}}"""
         try:
             structured = self.model.with_structured_output(ExternalQueryPlan)

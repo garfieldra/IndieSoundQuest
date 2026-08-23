@@ -20,6 +20,25 @@ web_search = WebSearchTool(tavily_api_key=settings.tavily_api_key, bocha_api_key
 graph = build_candidate_pool_graph(MusicCatalogTool(settings.java_internal_base_url, settings.agent_internal_service_token), web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), DeepSeekCandidateSelector())
 report_graph = build_report_graph(TournamentFactsTool(settings.java_internal_base_url, settings.agent_internal_service_token), ReportGenerator(), web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection))
 
+_ACTION_PROGRESS = {
+    "understand_preference": ("understand_preference", "正在理解你的音乐偏好"),
+    "resolve_named_entities": ("resolve_artist", "正在核验你提到的艺人"),
+    "search_web": ("discover_web", "正在从公开音乐资料中寻找线索"),
+    "resolve_musicbrainz": ("verify_musicbrainz", "正在通过 MusicBrainz 核验歌曲身份"),
+    "search_catalog": ("search_catalog", "正在整理已核验的本地目录"),
+    "expand_artist_catalog": ("expand_artist_catalog", "正在批量核验已提及艺人的作品"),
+    "search_knowledge": ("knowledge_context", "正在补充歌曲主题与文化语境"),
+    "analyze_tournament": ("analyze_matches", "正在归纳本场的关键选择轨迹"),
+    "draft_report": ("draft_report", "正在生成你的音乐偏好报告"),
+    "critique_report": ("review_report", "正在核验报告事实与推荐来源"),
+    "rerank_candidates": ("organize_candidates", "正在整理候选歌曲与候补队列"),
+}
+
+def _progress(request_id, action: str, elapsed_ms: int, metrics: dict | None = None) -> str:
+    phase, message = _ACTION_PROGRESS.get(action, ("working", "正在继续整理本次音乐探索"))
+    payload = {"runId": str(request_id), "phase": phase, "status": "started", "message": message, "elapsedMs": elapsed_ms, "metrics": metrics or {}}
+    return f"event: progress\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
 async def verify_caller(authorization: str = Header(default="")):
     if authorization != f"Bearer {settings.agent_internal_service_token}": raise HTTPException(401, "invalid internal credential")
 
@@ -33,13 +52,22 @@ async def ready(): return {"status":"UP", "catalog":"configured", "modelProvider
 async def candidate_pool(request: CandidatePoolRequest, x_request_id: str = Header()):
     if str(request.request_id) != x_request_id: raise HTTPException(400, "X-Request-Id must match requestId")
     async def events():
-        yield f"event: stage_started\ndata: {json.dumps({'requestId': str(request.request_id), 'stage': 'collect_recordings', 'message': '正在整理可用曲目'}, ensure_ascii=False)}\n\n"
+        yield _progress(request.request_id, "understand_preference", 0)
         try:
             # A ReAct turn traverses both Supervisor and executor nodes.  The
             # framework default (25) can interrupt a legitimate guarded run before
             # the graph's own tool/deadline/stagnation guards have a chance to stop.
-            state = await graph.ainvoke({"request": request}, {"recursion_limit": 128})
-            result = state["result"]
+            started = __import__("time").monotonic()
+            last_action = None
+            result = None
+            async for state in graph.astream({"request": request}, {"recursion_limit": 128}, stream_mode="values"):
+                action = state.get("decision").action if state.get("decision") else None
+                if action and action != last_action:
+                    last_action = action
+                    yield _progress(request.request_id, action, int((__import__("time").monotonic() - started) * 1000))
+                if state.get("result"):
+                    result = state["result"]
+            if result is None: raise RuntimeError("candidate result missing")
             logger.info(
                 "candidate ReAct completed request_id=%s intent_mode=%s termination_reason=%s trace=%s observations=%s",
                 request.request_id,
@@ -61,9 +89,15 @@ async def tournament_report(request: TournamentReportRequest, x_request_id: str 
         raise HTTPException(400, "X-Request-Id must match requestId")
 
     async def events():
-        yield f"event: stage_started\ndata: {json.dumps({'requestId': str(request.request_id), 'stage': 'read_tournament_facts', 'message': '正在读取本场赛事选择记录'}, ensure_ascii=False)}\n\n"
+        yield _progress(request.request_id, "analyze_tournament", 0)
         try:
-            state = await report_graph.ainvoke({"request": request}, {"recursion_limit": 80})
+            started = __import__("time").monotonic(); last_action = None; result = None; state = {}
+            async for state in report_graph.astream({"request": request}, {"recursion_limit": 80}, stream_mode="values"):
+                action = state.get("decision").action if state.get("decision") else None
+                if action and action != last_action:
+                    last_action = action
+                    yield _progress(request.request_id, action, int((__import__("time").monotonic() - started) * 1000))
+                if state.get("result"): result = state["result"]
             logger.info(
                 "report ReAct completed request_id=%s actions=%s",
                 request.request_id,
@@ -72,8 +106,8 @@ async def tournament_report(request: TournamentReportRequest, x_request_id: str 
             if state.get("error_code"):
                 yield f"event: error\ndata: {json.dumps({'requestId': str(request.request_id), 'code': state['error_code'], 'message': '报告审查未通过，请稍后重试'}, ensure_ascii=False)}\n\n"
                 return
-            yield f"event: stage_started\ndata: {json.dumps({'requestId': str(request.request_id), 'stage': 'generate_report', 'message': '正在分析你的音乐选择'}, ensure_ascii=False)}\n\n"
-            yield f"event: result\ndata: {state['result'].model_dump_json(by_alias=True)}\n\n"
+            if result is None: raise RuntimeError("report result missing")
+            yield f"event: result\ndata: {result.model_dump_json(by_alias=True)}\n\n"
         except Exception:
             logger.exception("tournament report workflow failed", extra={"request_id": str(request.request_id)})
             yield f"event: error\ndata: {json.dumps({'requestId': str(request.request_id), 'code': 'REPORT_WORKFLOW_FAILED', 'message': '暂时无法生成报告，请稍后重试'}, ensure_ascii=False)}\n\n"

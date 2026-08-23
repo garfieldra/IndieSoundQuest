@@ -37,6 +37,8 @@ class State(TypedDict, total=False):
     discovery_rounds: int
     musicbrainz_rounds: int
     preference_hypotheses: list[dict]
+    artist_seeds: list[dict]
+    artist_catalog_expanded: bool
     result: CandidatePoolResult
 
 
@@ -59,7 +61,7 @@ def build_candidate_pool_graph(
             "iteration": 0, "musicbrainz_called": False, "observations": [],
             "stagnation_count": 0,
             "entity_resolution_complete": False, "clarifications": [],
-            "discovery_rounds": 0, "musicbrainz_rounds": 0, "preference_hypotheses": [],
+            "discovery_rounds": 0, "musicbrainz_rounds": 0, "preference_hypotheses": [], "artist_seeds": [], "artist_catalog_expanded": False,
         }
 
     async def supervisor(state: State):
@@ -94,6 +96,8 @@ def build_candidate_pool_graph(
             "discoveryRounds": state.get("discovery_rounds", 0),
             "musicbrainzRounds": state.get("musicbrainz_rounds", 0),
             "preferenceHypotheses": state.get("preference_hypotheses", []),
+            "resolvedArtistSeeds": state.get("artist_seeds", []),
+            "artistCatalogExpanded": state.get("artist_catalog_expanded", False),
         }
         try:
             decision = await selector.decide(request.preference_text, target, len(state["recordings"]), summary)
@@ -111,6 +115,8 @@ def build_candidate_pool_graph(
             decision = CandidateDecision(action="request_clarification", reason_code="locked_artist_identity_unresolved", decision_summary="艺人名称存在必要歧义，等待用户确认")
         elif decision.action == "resolve_named_entities" and state.get("entity_resolution_complete"):
             decision = CandidateDecision(action="search_catalog" if not summary["catalogSearched"] else "search_web", reason_code="verified_candidates_below_target", decision_summary="艺人实体已解析，继续收集可核验歌曲")
+        elif state.get("artist_seeds") and not state.get("artist_catalog_expanded") and len(state["recordings"]) < target:
+            decision = CandidateDecision(action="expand_artist_catalog", reason_code="verified_candidates_below_target", decision_summary="已解析艺人作品不足，批量从 MusicBrainz 补充规范曲目")
         elif state["discovery_hints"] and decision.action in {"search_web", "search_catalog", "rerank_candidates"}:
             # This is an evidence-consumption guard: a ReAct search decision cannot
             # discard already observed, unverified song evidence by searching again.
@@ -175,7 +181,7 @@ def build_candidate_pool_graph(
                 decision_summary="已达到运行预算，进入最终校验",
             )
         recent = [item["action"] for item in state["action_history"][-2:]]
-        if len(recent) == 2 and all(action == decision.action for action in recent):
+        if len(recent) == 2 and all(action == decision.action for action in recent) and not (decision.action == "resolve_musicbrainz" and state["discovery_hints"]):
             decision = CandidateDecision(action="rerank_candidates", reason_code="candidate_pool_requires_rerank", decision_summary="阻止无收益重复调用")
         if runtime_termination:
             decision = CandidateDecision(
@@ -236,10 +242,15 @@ def build_candidate_pool_graph(
                 return {"entity_resolution_complete": True, "tool_history": history,
                         "observations": state["observations"] + [{"action": action, "status": "failed", "error": type(exc).__name__}]}
             clarifications = [item for item in resolutions if _artist_clarification_required(item)]
+            artist_seeds = [{"mbid": item["candidates"][0]["mbid"], "name": item["candidates"][0]["name"]} for item in resolutions if item.get("candidates") and item not in clarifications]
+            artist_seeds.extend({"mbid": str(item.mbid), "name": item.name} for item in request.confirmed_artists)
+            artist_seeds = list({item["mbid"]: item for item in artist_seeds}.values())
             policy = state.get("intent_policy")
             if policy and policy.intent_mode == "ARTIST_LOCKED" and request.confirmed_artists:
                 policy = policy.model_copy(update={"allowed_artist_names": [item.name for item in request.confirmed_artists]})
-            return {"entity_resolution_complete": True, "clarifications": clarifications, "intent_policy": policy, "tool_history": history,
+            if policy and policy.intent_mode == "ARTIST_LOCKED" and artist_seeds:
+                policy = policy.model_copy(update={"allowed_artist_names": [item["name"] for item in artist_seeds]})
+            return {"entity_resolution_complete": True, "clarifications": clarifications, "artist_seeds": artist_seeds, "intent_policy": policy, "tool_history": history,
                     "observations": state["observations"] + [{"action": action, "status": "success", "mentionCount": len(mentions), "clarificationCount": len(clarifications)}]}
 
         if action == "request_clarification":
@@ -263,6 +274,22 @@ def build_candidate_pool_graph(
             ]
             merged = _merge_recordings(state["recordings"], accepted)
             return {"recordings": merged, "tool_history": history, "observations": state["observations"] + [{"action": action, "status": "success", "inputCount": len(items), "outputCount": len(accepted), "verifiedCount": len(merged)}]}
+
+        if action == "expand_artist_catalog":
+            try:
+                resolved = await invoke_with_budget(
+                    lambda: catalog.discover_artist_recordings(state.get("artist_seeds", []), 40),
+                    name="expand_artist_catalog", kind="tool", context=context, budget=budget, history=history,
+                )
+            except Exception as exc:
+                return {"artist_catalog_expanded": True, "tool_history": history, "observations": state["observations"] + [{"action": action, "status": "failed", "error": type(exc).__name__}]}
+            imported = [{
+                "id": str(item["recordingId"]), "title": item["title"], "artistName": item["artistName"],
+                "artistId": str(item.get("artistId") or ""), "albumTitle": item.get("albumTitle") or "", "coverStatus": item.get("coverStatus") or "PENDING",
+                "sourceUrl": item.get("sourceUrl"), "musicbrainzMbid": item.get("recordingMbid"), "catalogSource": item.get("catalogSource") or "EXTERNAL_VERIFIED", "trustState": "CATALOG_IMPORTED",
+            } for item in resolved if item.get("status") == "RESOLVED" and item.get("recordingId") and item.get("recordingMbid") and _candidate_allowed(item, state.get("intent_policy"))]
+            merged = _merge_recordings(state["recordings"], imported)
+            return {"recordings": merged, "artist_catalog_expanded": True, "tool_history": history, "observations": state["observations"] + [{"action": action, "status": "success", "inputCount": len(resolved), "outputCount": len(imported), "verifiedCount": len(merged)}]}
 
         if action == "search_knowledge":
             try:
@@ -450,6 +477,7 @@ def _normalize_decision_reason(decision: CandidateDecision) -> CandidateDecision
         "resolve_named_entities": {"locked_artist_identity_unresolved"},
         "request_clarification": {"locked_artist_identity_unresolved"},
         "search_catalog": {"locked_artist_identity_unresolved", "verified_candidates_below_active_size", "verified_candidates_below_target"},
+        "expand_artist_catalog": {"verified_candidates_below_active_size", "verified_candidates_below_target"},
         "search_knowledge": {"local_scope_exhausted", "cross_artist_expansion_allowed", "verified_candidates_below_target"},
         "search_web": {"local_scope_exhausted", "cross_artist_expansion_allowed", "verified_candidates_below_active_size", "verified_candidates_below_target"},
         "resolve_musicbrainz": {"external_hints_require_resolution"},
@@ -464,6 +492,7 @@ def _normalize_decision_reason(decision: CandidateDecision) -> CandidateDecision
         "resolve_named_entities": "locked_artist_identity_unresolved",
         "request_clarification": "locked_artist_identity_unresolved",
         "search_catalog": "verified_candidates_below_active_size",
+        "expand_artist_catalog": "verified_candidates_below_target",
         "search_knowledge": "local_scope_exhausted",
         "search_web": "cross_artist_expansion_allowed",
         "resolve_musicbrainz": "external_hints_require_resolution",
@@ -484,6 +513,8 @@ def _fallback_decision(request: CandidatePoolRequest, state: State) -> Candidate
     actions = {item["action"] for item in state["action_history"]}
     if "search_catalog" not in actions:
         return CandidateDecision(action="search_catalog", reason_code="verified_candidates_below_active_size", decision_summary="模型暂不可用，先读取规范目录")
+    if state.get("artist_seeds") and not state.get("artist_catalog_expanded"):
+        return CandidateDecision(action="expand_artist_catalog", reason_code="verified_candidates_below_target", decision_summary="批量核验明确艺人的作品")
     if state["discovery_hints"] and not state["musicbrainz_called"]:
         return CandidateDecision(action="resolve_musicbrainz", reason_code="external_hints_require_resolution", decision_summary="处理已发现的外部歌曲")
     if not state["ranked"]:

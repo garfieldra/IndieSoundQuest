@@ -8,6 +8,10 @@ import java.net.http.*;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.function.Consumer;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -46,15 +50,20 @@ public class PreferenceReportApplicationService {
   }
 
   private void generate(UUID reportId, UUID tournamentId, UUID guestSessionId, int version) {
+    generateStreaming(reportId, tournamentId, guestSessionId, version, ignored -> {});
+  }
+
+  /** Runs the existing report workflow while forwarding only Agent-approved public progress events. */
+  public void generateStreaming(UUID reportId, UUID tournamentId, UUID guestSessionId, int version, Consumer<String> onProgress) {
     try {
       markRunning(reportId);
       var requestId = UUID.randomUUID();
       var body = objectMapper.writeValueAsString(java.util.Map.of("requestId",requestId,"reportId",reportId,"tournamentId",tournamentId,"guestId",guestSessionId.toString(),"tournamentVersion",version,"includePersonalityEasterEgg",true));
       var request = HttpRequest.newBuilder(URI.create(agentBaseUrl + "/internal/v1/workflows/tournament-report:stream"))
           .timeout(Duration.ofSeconds(320)).header("Authorization", "Bearer " + agentToken).header("X-Request-Id", requestId.toString()).header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(body)).build();
-      var response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+      var response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
       if (response.statusCode() < 200 || response.statusCode() >= 300) throw new IllegalStateException("AGENT_HTTP_" + response.statusCode());
-      var reportJson = parseResult(response.body());
+      var reportJson = parseResult(response.body(), onProgress);
       if (reportJson == null) throw new IllegalStateException("AGENT_RESULT_MISSING");
       markReady(reportId, reportJson);
     } catch (Exception ex) {
@@ -63,12 +72,19 @@ public class PreferenceReportApplicationService {
     }
   }
 
-  private String parseResult(String sse) throws Exception {
-    for (String block : sse.split("\\n\\n")) {
-      String event = null, data = null;
-      for (String line : block.split("\\n")) { if (line.startsWith("event: ")) event=line.substring(7).trim(); if (line.startsWith("data: ")) data=line.substring(6).trim(); }
-      if ("result".equals(event) && data != null) { objectMapper.readTree(data); return data; }
-      if ("error".equals(event)) throw new IllegalStateException("AGENT_WORKFLOW_ERROR");
+  private String parseResult(java.io.InputStream input, Consumer<String> onProgress) throws Exception {
+    try (var lines = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
+      String event = null, data = null, line;
+      while ((line = lines.readLine()) != null) {
+        if (line.startsWith("event: ")) event = line.substring(7).trim();
+        else if (line.startsWith("data: ")) data = line.substring(6).trim();
+        else if (line.isEmpty()) {
+          if ("progress".equals(event) && data != null) { objectMapper.readTree(data); onProgress.accept(data); }
+          if ("result".equals(event) && data != null) { objectMapper.readTree(data); return data; }
+          if ("error".equals(event)) throw new IllegalStateException("AGENT_WORKFLOW_ERROR");
+          event = null; data = null;
+        }
+      }
     }
     return null;
   }

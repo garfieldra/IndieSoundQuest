@@ -8,17 +8,39 @@ import './discovery.css'
 import './export.css'
 import './listening.css'
 import './evidence.css'
+import './agentProgress.css'
 
 type Artist = { id: string; name: string }
 type Entry = { id: string; recordingId: string; title: string; artistName: string; albumTitle?: string; coverUrl?: string; coverStatus: string; listeningSearchUrl: string }
 type Match = { id: string; roundNumber: number; matchIndex: number; leftEntryId: string | null; rightEntryId: string | null; winnerEntryId: string | null; status: string }
 type Tournament = { id: string; status: string; size: number; completedVoteCount: number; completedAt?: string | null; entries: Entry[]; matches: Match[]; currentMatch: Match | null }
 type Report = { reportId: string; tournamentId: string; version: number; status: 'PENDING' | 'RUNNING' | 'READY' | 'FAILED'; report?: { summary: string; dimensions: { name: string; confidence: string; explanation: string }[]; choiceTrajectory?: { matchId: string; roundNumber: number; matchIndex: number; winnerTitle: string; winnerArtistName: string; loserTitle: string; loserArtistName: string; signalRole: 'stable_anchor' | 'preference_boundary' | 'near_finalist'; derivedNote: string }[]; songRecommendations: { recordingId?: string; title?: string; artistName?: string; reason: string; searchUrl?: string; sourceStatus?: 'catalog_verified' | 'web_discovered'; sourceUrl?: string; sourceTitle?: string }[]; artistRecommendations: { artistId?: string; artistName?: string; reason: string; searchUrl?: string; sourceStatus?: 'catalog_verified' | 'web_discovered'; sourceUrl?: string; sourceTitle?: string }[]; explorationTags?: string[]; personalityEasterEgg: string; disclaimer: string; warnings?: string[] }; failureMessage?: string }
+type AgentProgress = { phase: string; status?: string; message: string; elapsedMs?: number }
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api/v1${path}`, { credentials: 'include', ...options })
   if (!response.ok) throw new Error(`请求失败（${response.status}）`)
   return response.json() as Promise<T>
+}
+
+async function streamAgent<T>(path: string, options: RequestInit, onProgress: (progress: AgentProgress) => void): Promise<T> {
+  const response = await fetch(`/api/v1${path}`, { credentials: 'include', ...options })
+  if (!response.ok || !response.body) throw new Error(`请求失败（${response.status}）`)
+  const reader = response.body.getReader(); const decoder = new TextDecoder(); let pending = ''; let result: T | undefined
+  const consume = (block: string) => {
+    const event = block.match(/^event:\s*(.+)$/m)?.[1]?.trim()
+    const data = block.match(/^data:\s*(.+)$/m)?.[1]?.trim()
+    if (!event || !data) return
+    if (event === 'progress') onProgress(JSON.parse(data) as AgentProgress)
+    else if (event === 'result') result = JSON.parse(data) as T
+    else if (event === 'error') { const issue = JSON.parse(data) as { message?: string }; throw new Error(issue.message || 'Agent 服务暂时不可用') }
+  }
+  while (true) { const { value, done } = await reader.read(); pending += decoder.decode(value ?? new Uint8Array(), { stream: !done }); let boundary: number
+    while ((boundary = pending.indexOf('\n\n')) >= 0) { consume(pending.slice(0, boundary)); pending = pending.slice(boundary + 2) }
+    if (done) break
+  }
+  if (!result) throw new Error('Agent 未返回最终结果')
+  return result
 }
 
 export function App() {
@@ -37,6 +59,8 @@ export function App() {
   const [preparingTournamentId, setPreparingTournamentId] = useState<string | null>(null)
   const [report, setReport] = useState<Report | null>(null)
   const [reportLoading, setReportLoading] = useState(false)
+  const [agentProgress, setAgentProgress] = useState<AgentProgress[]>([])
+  const [progressCollapsed, setProgressCollapsed] = useState(false)
   const listening = useListeningPreview()
   const creationAttempt = useRef<{ signature: string; key: string } | null>(null)
 
@@ -72,14 +96,14 @@ export function App() {
   }
   async function generateCandidates(nextConfirmedArtists = confirmedArtists) {
     if (preferenceText.trim().length < 3) { setMessage('请用一句话描述你想探索的音乐。'); return }
-    setLoading(true); setMessage('')
+    setLoading(true); setMessage(''); setAgentProgress([]); setProgressCollapsed(false)
     try {
       const requestId = crypto.randomUUID()
-      const data = await api<CandidatePoolResponse>('/candidate-pools', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': requestId }, body: JSON.stringify({ size, preferenceText, seedArtistIds: seedArtistId ? [seedArtistId] : [], confirmedArtists: nextConfirmedArtists }) })
+      const data = await streamAgent<CandidatePoolResponse>('/agent-runs/candidate-pool:stream', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': requestId }, body: JSON.stringify({ size, preferenceText, seedArtistIds: seedArtistId ? [seedArtistId] : [], confirmedArtists: nextConfirmedArtists }) }, item => setAgentProgress(current => [...current, item]))
       setCandidateResult(data); setExcludedIds([]); setPreparingTournamentId(null); creationAttempt.current = null
       if (data.status === 'insufficient_candidates') setMessage(data.candidatePool?.warnings[0]?.message || '可验证歌曲不足，请调整兴趣方向。')
     }
-    catch (error) { setMessage(error instanceof Error ? error.message : '候选歌曲暂时无法生成') } finally { setLoading(false) }
+    catch (error) { setMessage(error instanceof Error ? error.message : '候选歌曲暂时无法生成') } finally { setLoading(false); setProgressCollapsed(true) }
   }
   function changeSize(nextSize: 16 | 32) {
     if (nextSize === size) return
@@ -127,25 +151,12 @@ export function App() {
   }
   async function generateReport(force = false) {
     if (!tournament) return
-    setReportLoading(true); setMessage('')
+    setReportLoading(true); setMessage(''); setAgentProgress([]); setProgressCollapsed(false)
     try {
-      const created = await api<Report>(`/tournaments/${tournament.id}/preference-report`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force }) })
+      const created = await streamAgent<Report>(`/tournaments/${tournament.id}/preference-report:stream`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force }) }, item => setAgentProgress(current => [...current, item]))
       setReport(created)
-      if (created.status === 'PENDING' || created.status === 'RUNNING') void pollReport(tournament.id)
     } catch (error) { setMessage(error instanceof Error ? error.message : '报告暂时无法生成') }
-    finally { setReportLoading(false) }
-  }
-  async function pollReport(tournamentId: string) {
-    setReportLoading(true)
-    for (let attempt = 0; attempt < 60; attempt += 1) {
-      await new Promise(resolve => setTimeout(resolve, 1500))
-      try {
-        const current = await api<Report>(`/tournaments/${tournamentId}/preference-report`)
-        setReport(current)
-        if (current.status === 'READY' || current.status === 'FAILED') break
-      } catch { break }
-    }
-    setReportLoading(false)
+    finally { setReportLoading(false); setProgressCollapsed(true) }
   }
 
   const entryById = useMemo(() => new Map(tournament?.entries.map(entry => [entry.id, entry])), [tournament])
@@ -160,6 +171,7 @@ export function App() {
   return <main className="app-shell">
     <header><p className="eyebrow">IndieSoundQuest</p><h1>把喜欢，投进一场歌的世界杯。</h1><p className="subtitle">一对一选择，最后留下真正属于你的冠军歌曲。</p></header>
     {message && <p className="notice">{message}</p>}
+    {agentProgress.length > 0 && <AgentProgressPanel items={agentProgress} collapsed={progressCollapsed} onToggle={() => setProgressCollapsed(value => !value)} />}
     {!tournament && <section className="panel setup">
       <div className="mode-tabs">
         <button className={mode === 'explore' ? 'selected' : ''} onClick={() => setMode('explore')}>按偏好探索</button>
@@ -205,6 +217,16 @@ export function App() {
     </section>}
     {tournament && <section className="panel arena">{tournament.status === 'COMPLETED' ? <TournamentResultView tournament={tournament} playbackFor={listening.stateFor} onPreview={id => void listening.toggle(id)} onPrefetch={id => void listening.prefetch(id)} onGenerateReport={() => void generateReport()} reportLoading={reportLoading} hasReadyReport={report?.status === 'READY'} onNewTournament={() => { listening.stop(); setTournament(null); setReport(null) }}>{report && <ReportView report={report} tournament={tournament} onRetry={() => void generateReport(true)} loading={reportLoading}/>}</TournamentResultView> : <><div className="progress"><span>{`第 ${tournament.completedVoteCount + 1} 场选择`}</span><span>{tournament.completedVoteCount} / {tournament.size - 1}</span></div>{current && left && right && <><h2>这一轮，你更想留下谁？</h2><p className="matchup-hint">点击唱片试听，确定后再选择留下这首。</p><div className="matchup"><SongCard entry={left} playback={listening.stateFor(left.recordingId)} onPreview={() => void listening.toggle(left.recordingId)} onPrefetch={() => void listening.prefetch(left.recordingId)} onVote={() => void vote(left.id)} disabled={loading}/><div className="versus">VS</div><SongCard entry={right} playback={listening.stateFor(right.recordingId)} onPreview={() => void listening.toggle(right.recordingId)} onPrefetch={() => void listening.prefetch(right.recordingId)} onVote={() => void vote(right.id)} disabled={loading}/></div></>}</>}</section>}
   </main>
+}
+
+function AgentProgressPanel({ items, collapsed, onToggle }: { items: AgentProgress[]; collapsed: boolean; onToggle: () => void }) {
+  const latest = items[items.length - 1]
+  return <aside className={`agent-progress ${collapsed ? 'collapsed' : ''}`} aria-live="polite">
+    <button className="agent-progress-toggle" onClick={onToggle} aria-expanded={!collapsed}>
+      <span>{collapsed ? '已完成本次音乐探索' : '正在梳理这次音乐探索'}</span><small>{latest?.message}</small><span>{collapsed ? '展开' : '收起'}</span>
+    </button>
+    {!collapsed && <ol>{items.map((item, index) => <li key={`${item.phase}-${index}`}><span>{item.message}</span>{item.elapsedMs != null && <small>{Math.max(1, Math.round(item.elapsedMs / 1000))} 秒</small>}</li>)}</ol>}
+  </aside>
 }
 
 function CandidateCard({ item, playback, onPreview, onPrefetch, onRemove, removeDisabled }: { item: CandidateItem; playback: PlaybackState; onPreview: () => void; onPrefetch: () => void; onRemove: () => void; removeDisabled: boolean }) {

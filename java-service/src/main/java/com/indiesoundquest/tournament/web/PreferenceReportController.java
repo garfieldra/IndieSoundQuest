@@ -10,10 +10,12 @@ import com.indiesoundquest.tournament.repository.*;
 import jakarta.servlet.http.HttpServletRequest;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.io.OutputStream;
 import java.util.*;
 import org.springframework.http.*;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
 @RestController
 @RequestMapping("/api/v1")
@@ -41,6 +43,29 @@ public class PreferenceReportController {
     var report=reports.save(TournamentPreferenceReport.pending(UUID.randomUUID(),tournament,version));
     service.startAsync(report.getId(),tournamentId,guest.getId(),version);
     return ResponseEntity.accepted().body(view(report));
+  }
+
+  @PostMapping(value="/tournaments/{tournamentId}/preference-report:stream", produces=MediaType.TEXT_EVENT_STREAM_VALUE)
+  StreamingResponseBody createStream(@PathVariable UUID tournamentId, @RequestBody(required=false) CreateBody body, HttpServletRequest request) {
+    var guest=guest(request); var tournament=ownedCompletedTournament(tournamentId, guest.getId());
+    var latest=reports.findByTournament_IdOrderByVersionNumberDesc(tournamentId).stream().findFirst().orElse(null);
+    boolean force=body!=null && body.force();
+    if (latest!=null && latest.getStatus()==PreferenceReportStatus.READY && !force) {
+      var ready=latest; return output -> {
+        try { writeSse(output, "result", objectMapper.writeValueAsString(view(ready))); }
+        catch (Exception ex) { safeWriteSse(output, "error", "{\"code\":\"REPORT_STREAM_UNAVAILABLE\",\"message\":\"报告暂不可用，请稍后重试\"}"); }
+      };
+    }
+    int version=latest==null?1:latest.getVersionNumber()+1;
+    var report=reports.save(TournamentPreferenceReport.pending(UUID.randomUUID(),tournament,version));
+    return output -> {
+      try {
+        service.generateStreaming(report.getId(), tournamentId, guest.getId(), version, progress -> safeWriteSse(output, "progress", progress));
+        var completed=reports.findById(report.getId()).orElseThrow();
+        if (completed.getStatus()==PreferenceReportStatus.READY) writeSse(output, "result", objectMapper.writeValueAsString(view(completed)));
+        else writeSse(output, "error", "{\"code\":\"REPORT_WORKFLOW_FAILED\",\"message\":\"报告暂时无法生成，请稍后重试\"}");
+      } catch (Exception ignored) { safeWriteSse(output, "error", "{\"code\":\"REPORT_STREAM_UNAVAILABLE\",\"message\":\"报告过程暂不可用，请稍后重试\"}"); }
+    };
   }
 
   @GetMapping("/tournaments/{tournamentId}/preference-report")
@@ -107,5 +132,7 @@ public class PreferenceReportController {
   }
 
   private GuestSession guest(HttpServletRequest request) { return (GuestSession)request.getAttribute(GuestIdentityFilter.ATTRIBUTE); }
+  private void writeSse(OutputStream output, String event, String data) throws java.io.IOException { output.write(("event: "+event+"\ndata: "+data+"\n\n").getBytes(StandardCharsets.UTF_8)); output.flush(); }
+  private void safeWriteSse(OutputStream output, String event, String data) { try { writeSse(output, event, data); } catch (java.io.IOException ignored) { } }
   record CreateBody(boolean force) {}
 }
