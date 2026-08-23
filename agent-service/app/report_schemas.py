@@ -70,6 +70,19 @@ class ArtistRecommendation(ReportApiModel):
         return self
 
 
+class ChoiceTrajectoryItem(ReportApiModel):
+    """A user-visible, snapshot-verifiable choice made during this tournament."""
+    match_id: UUID
+    round_number: int = Field(ge=1)
+    match_index: int = Field(ge=0)
+    winner_title: str = Field(min_length=1, max_length=160)
+    winner_artist_name: str = Field(min_length=1, max_length=120)
+    loser_title: str = Field(min_length=1, max_length=160)
+    loser_artist_name: str = Field(min_length=1, max_length=120)
+    signal_role: Literal["stable_anchor", "preference_boundary", "near_finalist"]
+    derived_note: str = Field(min_length=20, max_length=180)
+
+
 class PreferenceReport(ReportApiModel):
     schema_version: Literal["1.0"]
     tournament_id: UUID
@@ -79,6 +92,11 @@ class PreferenceReport(ReportApiModel):
     song_recommendations: list[SongRecommendation] = Field(min_length=5, max_length=7)
     # 本地目录可能只有单一艺人；推荐验证阶段会尽量补足 2–3 位，数据不足时通过 warnings 明示降级。
     artist_recommendations: list[ArtistRecommendation] = Field(max_length=3)
+    # 3–5 exact match facts make the report explainable without treating a
+    # single vote as evidence about the user's real-world identity.
+    # The graph replaces model-produced cards with snapshot-derived cards
+    # before persistence; an empty draft is therefore valid but never exposed.
+    choice_trajectory: list[ChoiceTrajectoryItem] = Field(default_factory=list, max_length=5)
     # A small, user-visible summary of approved local theme-card context. It is
     # explanatory only: it never authorizes a recommendation by itself.
     exploration_tags: list[str] = Field(default_factory=list, max_length=5)

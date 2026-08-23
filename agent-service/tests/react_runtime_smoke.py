@@ -24,9 +24,15 @@ class FakeCatalog:
     async def resolve_and_import(self, _):
         return []
 
+    async def resolve_artist_candidates(self, _):
+        return []
+
 
 class FakeWeb:
     async def search(self, _):
+        return []
+
+    async def search_many(self, _):
         return []
 
 
@@ -69,7 +75,7 @@ class FakeFacts:
             entries.append({"entryId": str(entry_id), "recordingId": str(uuid4()), "artistId": str(uuid4()),
                             "title": f"Song {index}", "artistName": "Artist", "albumTitle": "Album"})
         matches = [
-            {"matchId": str(uuid4()), "roundNumber": 1, "leftEntryId": entries[index]["entryId"],
+            {"matchId": str(uuid4()), "roundNumber": 1, "matchIndex": index // 2, "leftEntryId": entries[index]["entryId"],
              "rightEntryId": entries[index + 1]["entryId"], "winnerEntryId": entries[index]["entryId"]}
             for index in range(0, 16, 2)
         ]
@@ -80,14 +86,14 @@ async def main():
     selector = CandidateSupervisor()
     candidate_graph = build_candidate_pool_graph(FakeCatalog(32), FakeWeb(), FakeKnowledge(), selector)
     candidate_request = CandidatePoolRequest(
-        requestId=uuid4(), guestId="offline", size=16, preferenceText="offline test preference"
+        requestId=uuid4(), guestId="offline", size=16, preferenceText="Artist"
     )
     candidate_state = await candidate_graph.ainvoke({"request": candidate_request})
     assert candidate_state["result"].status == "ready_for_confirmation"
     assert len(candidate_state["result"].recording_ids) == 32
-    assert [item["action"] for item in candidate_state["action_history"]] == [
-        "understand_preference", "search_catalog", "rerank_candidates", "submit_candidates"
-    ]
+    candidate_actions = [item["action"] for item in candidate_state["action_history"]]
+    assert {"understand_preference", "search_catalog", "rerank_candidates", "submit_candidates"}.issubset(candidate_actions)
+    assert candidate_actions[-1] == "submit_candidates"
 
     generator = ReportGenerator()
     generator.model = None
@@ -99,6 +105,17 @@ async def main():
     report_state = await report_graph.ainvoke({"request": report_request})
     assert "error_code" not in report_state
     assert report_state["result"].schema_version == "1.0"
+    trajectory = report_state["result"].choice_trajectory
+    assert 3 <= len(trajectory) <= 5
+    match_by_id = {item["matchId"]: item for item in report_state["board"]["facts_snapshot"]["matches"]}
+    entry_by_id = {item["entryId"]: item for item in report_state["board"]["facts_snapshot"]["entries"]}
+    for card in trajectory:
+        match = match_by_id[str(card.match_id)]
+        winner = entry_by_id[match["winnerEntryId"]]
+        loser_id = match["rightEntryId"] if match["winnerEntryId"] == match["leftEntryId"] else match["leftEntryId"]
+        loser = entry_by_id[loser_id]
+        assert card.winner_title == winner["title"] and card.loser_title == loser["title"]
+    assert "preference_boundary" in {item.signal_role for item in trajectory}
     actions = [item["action"] for item in report_state["action_history"]]
     assert actions[0] == "analyze_tournament"
     assert "draft_report" in actions and "critique_report" in actions and actions[-1] == "submit_report"

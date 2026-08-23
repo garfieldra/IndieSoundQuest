@@ -75,8 +75,9 @@ class ReportGenerator:
 必须只输出一个合法 JSON 对象，不能输出 Markdown、解释、注释或多余文字。
 禁止推断心理疾病、教育背景、职业、收入或确定性人格类型。人格彩蛋只能是80到120字的娱乐性观察，并明确仅基于本场音乐选择。
 推荐歌曲和艺人只能使用输入 entries 中出现的规范 ID；不得编造 ID。歌曲推荐必须是5到7首；目录只有单一艺人时艺人推荐可只给1位。
-字段必须使用 camelCase：schemaVersion="1.0"、tournamentId、tournamentVersion、summary、dimensions、songRecommendations、artistRecommendations、explorationTags、personalityEasterEgg、disclaimer、warnings。
+字段必须使用 camelCase：schemaVersion="1.0"、tournamentId、tournamentVersion、summary、dimensions、songRecommendations、artistRecommendations、choiceTrajectory、explorationTags、personalityEasterEgg、disclaimer、warnings。
 summary 长度80到420字；dimensions 必须有3到5项，每项有 name、confidence（low/medium/high）、至少20字 explanation、至少1条 evidence；songRecommendations 总数必须是5到7首、每项至少8字 reason；explorationTags 必须是2到5个短标签；personalityEasterEgg 必须是80到120个中文字符；disclaimer 必须包含“仅基于”。
+必须逐一阅读所有 matches，而非只根据冠军写报告。choiceTrajectory 选择3到5条最能说明选择轨迹的真实对局；每项必须逐字使用 matches 中的 matchId、roundNumber、matchIndex、winnerEntryId 及 left/rightEntryId 映射出的 winnerTitle、winnerArtistName、loserTitle、loserArtistName，signalRole 只能是 stable_anchor/preference_boundary/near_finalist，derivedNote 仅描述这一场音乐取舍，不得推断现实身份或人格。至少包含一条冠军晋级路径和一条两首不同作品的直接偏好边界（赛事规模允许时）。
 推荐项有两种来源。catalog_verified 只能使用 entries 中的规范 ID：歌曲需要 recordingId，艺人需要 artistId。web_discovered 仅在网络资料明确提到该歌曲/艺人时才能使用：不可填写 recordingId/artistId，必须填写 title（歌曲）、artistName、sourceUrl、sourceTitle、searchQuery；sourceUrl 必须逐字取自网络资料。网络发现项必须在 reason 中说明“网络发现，待核验”，不可写成已入库或已验证。
 若网络资料非空，且其中明确出现了本地 entries 之外的歌手或歌曲，推荐中必须优先包含 2 到 5 个 web_discovered 项，优先选择资料摘要中可逐字确认名称的对象；否则全部使用 catalog_verified。不要把网页本身的标题误当作歌曲名。
 主题知识库资料只可用于 explanation、reason 和 2 到 5 个 explorationTags（短主题标签）；它不是新推荐的实体来源，不能把其中的歌手/歌曲当成网络发现，也不得输出相似度、内部 ID、原始摘要或歌词。
@@ -138,12 +139,10 @@ evidence 每项有 evidenceId、sourceType（match/vote/catalog/knowledge/web）
                     artists.append(ArtistRecommendation.model_validate(item))
             if songs or artists:
                 return songs, artists
-            # 当模型谨慎地返回空结果时，使用网页摘要中“艺人 - 歌曲”的显式文本作保守降级；仍保留原始来源与待核验状态。
-            for source in sources:
-                match = re.search(r"([\u4e00-\u9fff]{2,12})\s*[-－—]\s*([\u4e00-\u9fff]{2,16})", source.get("summary", ""))
-                if match and match.group(1) not in {"张悬", "安溥"}:
-                    artist, title = match.groups()
-                    return [SongRecommendation.model_validate({"sourceStatus":"web_discovered","title":title,"artistName":artist,"sourceUrl":source["sourceUrl"],"sourceTitle":source["sourceTitle"],"searchQuery":f"{artist} {title}","reason":"网络发现，待核验：该组合直接出现在本次检索资料中，可作为跨艺人探索入口。"})], []
+            # Regex-only extraction from a general search snippet can turn an
+            # unrelated phrase into an apparently valid "artist - song" pair.
+            # With no model-confirmed entity, return nothing and keep catalog
+            # recommendations rather than presenting a false music link.
             return [], []
         except (json.JSONDecodeError, ValidationError, TypeError) as exc:
             logger.warning("web discovery response rejected: %s", self._error_summary(exc))

@@ -187,7 +187,7 @@ async def test_open_discovery_attempts_expansion_when_catalog_is_single_artist()
     web = FakeWeb()
     selector = DeepSeekCandidateSelector()
     selector.model = None
-    graph = build_candidate_pool_graph(FakeCatalog(recordings(artist, "Only", 32)), web, FakeKnowledge(), selector)
+    graph = build_candidate_pool_graph(FakeCatalog(recordings(artist, "中文独立音乐", 32)), web, FakeKnowledge(), selector)
     request = CandidatePoolRequest(
         requestId=uuid4(), guestId="fixture", size=16,
         preferenceText="克制温柔、适合夜晚散步的中文独立音乐",
@@ -196,7 +196,9 @@ async def test_open_discovery_attempts_expansion_when_catalog_is_single_artist()
     state = await graph.ainvoke({"request": request})
 
     assert state["intent_policy"].intent_mode == "OPEN_DISCOVERY"
-    assert web.calls == 1
+    # A ReAct search turn may fan out into several independently chosen
+    # queries; the contract is that online expansion is attempted at least once.
+    assert web.calls >= 1
     assert state["result"].status == "ready_for_confirmation"
 
 

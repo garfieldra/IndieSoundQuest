@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import logging
 from typing import TypedDict
 from uuid import uuid4
 
 from langgraph.graph import END, StateGraph
 
 from .report_llm import ReportDecision, ReportGenerator
-from .report_schemas import CritiqueResult, PreferenceReport, TournamentReportRequest
+from .report_schemas import ChoiceTrajectoryItem, CritiqueResult, PreferenceReport, TournamentReportRequest
 from .runtime import AgentBlackboard, RuntimeBudget, invoke_with_budget
 from .subagents import CriticSubagent, EvidenceRegistry, NetworkResearchSubagent, PreferenceAnalysisSubagent, RecommendationValidationSubagent
 from .tools import KnowledgeSearchTool, TournamentFactsTool, WebSearchTool
+
+logger = logging.getLogger(__name__)
 
 
 class ReportState(TypedDict, total=False):
@@ -32,7 +35,7 @@ def _extract_signals(facts: dict) -> list[dict]:
         artist_counts[item["artistName"]] = artist_counts.get(item["artistName"], 0) + 1
     evidence = [
         {"evidenceId": str(match["matchId"]), "sourceType": "match", "sourceId": str(match["matchId"])}
-        for match in matches[:5]
+        for match in matches
     ]
     signals = [{"name": "晋级选择轨迹", "confidence": "medium", "description": "你在多轮一对一选择中反复让这些作品进入下一轮，说明它们构成了本场最稳定的偏好线索。", "evidence": evidence}]
     if len(artist_counts) == 1 and artist_counts:
@@ -41,6 +44,69 @@ def _extract_signals(facts: dict) -> list[dict]:
         signals.append({"name": "跨艺人探索倾向", "confidence": "low", "description": "晋级路径没有完全集中于单一艺人，说明你可能愿意沿着相近气质跨艺人继续探索，而不只停留在熟悉的名字里。", "evidence": evidence[:2]})
     signals.append({"name": "选择的辨识度", "confidence": "low", "description": "冠军与完整晋级路径共同构成了本场最有辨识度的选择轨迹，可以作为下一轮探索时回看的参照坐标。", "evidence": evidence[:2]})
     return signals
+
+
+def _choice_trajectory_from_facts(facts: dict) -> list[ChoiceTrajectoryItem]:
+    """Select explanatory match facts without inventing causal claims.
+
+    The Agent sees *all* matches and may use every one for its analysis.  This
+    helper only makes the user-facing 3–5 cards deterministic, grounded and
+    safe if an LLM omits them or returns an invalid reference.
+    """
+    entries = {str(item.get("entryId")): item for item in facts.get("entries", [])}
+    matches = sorted(
+        [item for item in facts.get("matches", []) if item.get("winnerEntryId")],
+        key=lambda item: (int(item.get("roundNumber", 0)), int(item.get("matchIndex", 0))),
+    )
+    if not matches:
+        return []
+    champion = str(matches[-1].get("winnerEntryId"))
+    champion_path = [item for item in matches if str(item.get("winnerEntryId")) == champion]
+    highest_round = max(int(item.get("roundNumber", 0)) for item in matches)
+    selected: list[dict] = []
+
+    # Retain the championship decision and an earlier advancement; then add
+    # decisive non-champion comparisons so the trajectory is not a final-only
+    # summary.  This is a presentation safeguard, not an Agent tool sequence.
+    non_champion = [item for item in matches if str(item.get("winnerEntryId")) != champion]
+    # A short championship path establishes the anchor; a non-champion win
+    # provides an actual preference boundary rather than making the section a
+    # redundant list of the champion's victories.
+    anchor_path = list(reversed(champion_path))[:2]
+    for item in [*anchor_path, *reversed(non_champion), *reversed(champion_path), *reversed(matches)]:
+        if item not in selected:
+            selected.append(item)
+        if len(selected) == 5:
+            break
+    if len(selected) < 3:
+        for item in reversed(matches):
+            if item not in selected:
+                selected.append(item)
+            if len(selected) == min(3, len(matches)):
+                break
+
+    cards: list[ChoiceTrajectoryItem] = []
+    for item in selected[:5]:
+        winner = entries.get(str(item.get("winnerEntryId")), {})
+        left = str(item.get("leftEntryId"))
+        right = str(item.get("rightEntryId"))
+        loser_id = right if str(item.get("winnerEntryId")) == left else left
+        loser = entries.get(loser_id, {})
+        round_number = int(item.get("roundNumber", 1))
+        if str(item.get("winnerEntryId")) == champion:
+            role, note = "stable_anchor", "这首歌在关键对局中持续被你留下，并最终构成了本场最稳定的选择锚点。"
+        else:
+            role, note = "preference_boundary", "这一次直接取舍记录了你在两种相近但不同的音乐表达之间，更愿意保留的一侧。"
+        if not winner or not loser:
+            continue
+        cards.append(ChoiceTrajectoryItem.model_validate({
+            "matchId": str(item["matchId"]), "roundNumber": round_number,
+            "matchIndex": int(item.get("matchIndex", 0)),
+            "winnerTitle": winner.get("title"), "winnerArtistName": winner.get("artistName"),
+            "loserTitle": loser.get("title"), "loserArtistName": loser.get("artistName"),
+            "signalRole": role, "derivedNote": note,
+        }))
+    return cards
 
 
 def _fallback_report(facts: dict, signals: list[dict], request: TournamentReportRequest) -> PreferenceReport:
@@ -67,6 +133,7 @@ def _fallback_report(facts: dict, signals: list[dict], request: TournamentReport
         ],
         "songRecommendations": [{"recordingId": str(item["recordingId"]), "reason": "这首歌来自本场已验证的候选目录，可作为继续比较和探索的入口。", "evidence": evidence[:1]} for item in song_items],
         "artistRecommendations": [{"artistId": artist_id, "reason": f"你在本场赛事中多次接触到{artist_names[index]}的作品，可以从这位艺人的其他作品继续探索。", "evidence": evidence[:1]} for index, artist_id in enumerate(artist_ids[:2])],
+        "choiceTrajectory": [item.model_dump(by_alias=True, mode="json") for item in _choice_trajectory_from_facts(facts)],
         "personalityEasterEgg": "你在这场比赛里更像一位会反复比较细节、也愿意让一首歌慢慢证明自己的听众：先保留微妙的差异，再在关键轮次相信真正留下来的感觉。这只是基于本场音乐选择的娱乐性观察，不代表稳定的人格或现实身份结论。",
         "disclaimer": "仅基于本场歌曲世界杯的音乐选择，用于娱乐和音乐探索，不代表心理、教育、职业或现实身份结论。",
         "warnings": ["MODEL_UNAVAILABLE_FALLBACK"]
@@ -133,7 +200,10 @@ def build_report_graph(facts_tool: TournamentFactsTool, generator: ReportGenerat
 
     async def initialize(state: ReportState):
         request = state["request"]
-        budget = RuntimeBudget(max_tool_calls=8, max_subagent_calls=8, deadline_seconds=120)
+        # A real report may legitimately spend time on network research,
+        # Milvus context and a long structured LLM response.  Keep one shared
+        # bounded deadline, but do not let it expire before the draft phase.
+        budget = RuntimeBudget(max_tool_calls=10, max_subagent_calls=10, deadline_seconds=300)
         context = budget.context(request.request_id, uuid4(), "tournament_report")
         history = []
         facts = await invoke_with_budget(
@@ -255,11 +325,21 @@ def build_report_graph(facts_tool: TournamentFactsTool, generator: ReportGenerat
                 report = await invoke_with_budget(
                     lambda: generator.generate(board["facts_snapshot"], signals, request.tournament_id, request.tournament_version, board.get("network_sources", []), board.get("knowledge_context", [])),
                     name="draft_report", kind="subagent", context=context, budget=budget, history=history,
+                    # A long, source-grounded Chinese report is intentionally
+                    # slower than a one-line ReAct decision.  The generic
+                    # eight-second subagent guard is for short decisions only.
+                    timeout_seconds=90,
                 )
             except Exception:
+                logger.exception("report draft generation failed; using factual fallback")
                 report = None
             if report is None:
                 report = _fallback_report(board["facts_snapshot"], signals, request)
+            # Match cards are factual presentation evidence.  Keeping them
+            # server-derived ensures a hallucinated LLM reference can never
+            # survive to the persisted report while analysis itself remains
+            # ReAct-driven and sees the complete match history.
+            report.choice_trajectory = _choice_trajectory_from_facts(board["facts_snapshot"])
             try:
                 web_songs, web_artists = await invoke_with_budget(
                     lambda: generator.discover_from_web(board.get("network_sources", [])),

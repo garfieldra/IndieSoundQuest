@@ -93,6 +93,23 @@ class CriticSubagent:
             issues.append("WEB_RECOMMENDATION_SOURCE_NOT_IN_RESEARCH")
         if any(not dimension.evidence for dimension in report.dimensions):
             issues.append("DIMENSION_EVIDENCE_MISSING")
+        entries = {str(item.get("entryId")): item for item in facts.get("entries", [])}
+        match_index = {str(item.get("matchId")): item for item in facts.get("matches", [])}
+        if len(report.choice_trajectory) < 3:
+            issues.append("CHOICE_TRAJECTORY_TOO_SHORT")
+        for card in report.choice_trajectory:
+            match = match_index.get(str(card.match_id))
+            if match is None:
+                issues.append("CHOICE_TRAJECTORY_MATCH_NOT_IN_FACTS")
+                break
+            winner = entries.get(str(match.get("winnerEntryId")), {})
+            left, right = str(match.get("leftEntryId")), str(match.get("rightEntryId"))
+            loser = entries.get(right if str(match.get("winnerEntryId")) == left else left, {})
+            if (card.round_number != int(match.get("roundNumber", -1)) or card.match_index != int(match.get("matchIndex", 0))
+                    or card.winner_title != winner.get("title") or card.winner_artist_name != winner.get("artistName")
+                    or card.loser_title != loser.get("title") or card.loser_artist_name != loser.get("artistName")):
+                issues.append("CHOICE_TRAJECTORY_FACT_MISMATCH")
+                break
         if "仅基于" not in report.disclaimer:
             issues.append("DISCLAIMER_MISSING")
         return CritiqueResult(passed=not issues, issues=issues, risk_level="high" if issues else "low")

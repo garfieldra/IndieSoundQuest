@@ -177,6 +177,12 @@ def build_candidate_pool_graph(
         recent = [item["action"] for item in state["action_history"][-2:]]
         if len(recent) == 2 and all(action == decision.action for action in recent):
             decision = CandidateDecision(action="rerank_candidates", reason_code="candidate_pool_requires_rerank", decision_summary="阻止无收益重复调用")
+        if runtime_termination:
+            decision = CandidateDecision(
+                action="submit_candidates" if len(state["recordings"]) >= request.size else "finish_insufficient",
+                reason_code="budget_or_stagnation_limit_reached",
+                decision_summary="已达到运行预算，进入最终校验",
+            )
         return {
             "decision": decision,
             "iteration": state["iteration"] + 1,
@@ -426,7 +432,10 @@ def build_candidate_pool_graph(
     graph.add_edge("initialize", "supervisor")
     graph.add_edge("supervisor", "execute_action")
     graph.add_conditional_edges("execute_action", after_execute, {"supervisor": "supervisor", "end": END})
-    return graph.compile()
+    # The Supervisor runtime permits up to 48 decisions.  LangGraph defaults
+    # to 25 graph steps when callers do not supply a config, which can cut off
+    # a valid online-discovery run before its own budget is reached.
+    return graph.compile().with_config({"recursion_limit": 128})
 
 
 def _merge_recordings(existing: list[dict], new_items: list[dict]) -> list[dict]:
@@ -593,6 +602,11 @@ def _candidate_allowed(item: dict, policy: IntentPolicy | None) -> bool:
 
 
 def _catalog_relevant(item: dict, request: CandidatePoolRequest, policy: IntentPolicy | None) -> bool:
+    # A seeded request explicitly permits moving beyond the named artist.  The
+    # catalog acts as a verified cache here, so filtering every non-seed work
+    # by literal prompt tokens defeats the permitted discovery scope.
+    if policy and policy.intent_mode == "ARTIST_SEEDED":
+        return True
     if policy and str(item.get("artistId")) in {str(value) for value in policy.seed_artist_ids}:
         return True
     text = _normalize_identity(request.preference_text)

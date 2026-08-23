@@ -38,7 +38,7 @@ async def candidate_pool(request: CandidatePoolRequest, x_request_id: str = Head
             # A ReAct turn traverses both Supervisor and executor nodes.  The
             # framework default (25) can interrupt a legitimate guarded run before
             # the graph's own tool/deadline/stagnation guards have a chance to stop.
-            state = await graph.ainvoke({"request": request}, {"recursion_limit": 80})
+            state = await graph.ainvoke({"request": request}, {"recursion_limit": 128})
             result = state["result"]
             logger.info(
                 "candidate ReAct completed request_id=%s intent_mode=%s termination_reason=%s trace=%s observations=%s",

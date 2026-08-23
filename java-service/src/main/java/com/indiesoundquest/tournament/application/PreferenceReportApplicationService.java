@@ -51,7 +51,7 @@ public class PreferenceReportApplicationService {
       var requestId = UUID.randomUUID();
       var body = objectMapper.writeValueAsString(java.util.Map.of("requestId",requestId,"reportId",reportId,"tournamentId",tournamentId,"guestId",guestSessionId.toString(),"tournamentVersion",version,"includePersonalityEasterEgg",true));
       var request = HttpRequest.newBuilder(URI.create(agentBaseUrl + "/internal/v1/workflows/tournament-report:stream"))
-          .timeout(Duration.ofSeconds(95)).header("Authorization", "Bearer " + agentToken).header("X-Request-Id", requestId.toString()).header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(body)).build();
+          .timeout(Duration.ofSeconds(320)).header("Authorization", "Bearer " + agentToken).header("X-Request-Id", requestId.toString()).header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(body)).build();
       var response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
       if (response.statusCode() < 200 || response.statusCode() >= 300) throw new IllegalStateException("AGENT_HTTP_" + response.statusCode());
       var reportJson = parseResult(response.body());
