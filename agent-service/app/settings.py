@@ -9,7 +9,10 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-chat"
     deepseek_api_key: str | None = None
     tavily_api_key: str | None = None
+    bocha_api_key: str | None = None
     milvus_uri: str = "http://milvus:19530"
+    embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    knowledge_collection: str = "isq_song_theme_cards_v1"
     agent_max_tool_rounds: int = 6
 
 

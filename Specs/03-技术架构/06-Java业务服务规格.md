@@ -73,7 +73,7 @@ Tournament
 | `owner_id` / `guest_session_id` | 私有赛事归属，二者至少有一项 |
 | `artist_id` | 可空的起点艺人；跨艺人赛事不强制绑定 |
 | `size` | 仅 `16` / `32` |
-| `candidate_source` | `POPULAR` / `RANDOM` / `CUSTOM` / `AGENT_CURATED` |
+| `candidate_source` | `POPULAR` / `RANDOM` / `CUSTOM` / `AGENT_GENERATED` |
 | `exploration_brief` | 可空；用户提交给 Agent 的偏好、喜欢的歌曲/艺人、场景或探索目标 |
 | `agent_guidance_requested` | 是否在赛后请求 Agent 生成探索引导 |
 | `status` | 见 5.1 |

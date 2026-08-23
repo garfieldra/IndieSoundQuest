@@ -1,9 +1,11 @@
 # Python Agent 服务规格
 
-**状态：** 草案 v0.1  
+**状态：** 基础服务规格；报告 Agent 以 `09-Python报告Agent技术规格.md` 为准
 **最后更新：** 2026-08-01  
 **上级规格：** `00-系统总体设计与规格路线图.md`  
 **依赖规格：** `05-Agent工作流规格.md`、`06-Java业务服务规格.md`
+
+> 说明：本文保留 Python Agent 服务的通用运行时、鉴权和接口约定。赛后报告 Agent 的 ReAct 架构、工具白名单、子 Agent、输出契约和重试策略以 `09-Python报告Agent技术规格.md` 为准；本文中的旧工作流名称不应作为新接口实现依据。
 
 ## 1. 服务定位
 
@@ -82,7 +84,7 @@ Java 以 `POST` 发起请求，并接收 `text/event-stream` 响应；Java 再�
 
 | 方法 | 路径 | 工作流 |
 | --- | --- | --- |
-| `POST` | `/internal/v1/workflows/exploration-tournament:stream` | 赛前探索策展 |
+| `POST` | `/internal/v1/workflows/exploration-tournament:stream` | 赛前按偏好生成候选池 |
 | `POST` | `/internal/v1/workflows/tournament-insight:stream` | 赛后洞察与推荐 |
 | `POST` | `/internal/v1/workflows/taste-profile:stream` | 整体偏好报告 |
 
@@ -163,7 +165,7 @@ class ExplorationTournamentResult(AgentResultBase):
     artist_id: UUID
     size: Literal[16, 32]
     recording_ids: list[UUID]
-    curation_summary: str
+    candidate_summary: str
     coverage: list[dict]
 ```
 
@@ -215,7 +217,7 @@ class TasteProfileResult(AgentResultBase):
 | 实体/赛事读取节点 | 调用 Java 内部只读 API | 写 MySQL、修改赛事 |
 | 知识检索节点 | 查询 Milvus 返回 Claim | 写入未审核网页全文 |
 | 网络研究节点 | 查询允许来源、提取受限摘要 | 爬歌词、下载媒体、绕过限制 |
-| LLM 节点 | 使用已授权上下文策展/总结 | 生成未验证实体 ID |
+| LLM 节点 | 使用已授权上下文生成候选池/总结 | 生成未验证实体 ID |
 | 验证节点 | Schema、实体、引用、安全检查 | 静默修正用户投票或事实 |
 
 ### 6.3 重试

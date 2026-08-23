@@ -10,6 +10,14 @@ dependencies = [
   "langchain-core>=0.3,<1",
   "langchain-openai>=0.2,<1",
   "langgraph>=0.2,<1",
+  "pymilvus>=2.5,<3",
+  "fastembed>=0.4,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<1",
 ]
 
 [tool.pytest.ini_options]

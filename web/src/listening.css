@@ -1,0 +1,108 @@
+.candidate-preview,
+.song-preview {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  text-align: left;
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  font: inherit;
+  cursor: pointer;
+}
+
+.candidate-card .candidate-preview {
+  justify-self: stretch;
+  color: inherit;
+  text-decoration: none;
+}
+
+.candidate-preview:focus-visible,
+.song-preview:focus-visible {
+  outline: 2px solid #9c493a;
+  outline-offset: 5px;
+  border-radius: 5px;
+}
+
+.candidate-preview img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+}
+
+.candidate-card .remove-candidate { margin-top: 2px; }
+
+.playback-state {
+  font-size: .76rem !important;
+  line-height: 1.4;
+  color: #8c4035 !important;
+  font-weight: 700 !important;
+  letter-spacing: .02em;
+}
+
+.playback-state.playing { color: #6d332b !important; }
+.playback-state.unavailable,
+.playback-state.error { color: #83756c !important; }
+
+.listening-links {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  font-size: .72rem;
+  line-height: 1.45;
+}
+
+.listening-links a {
+  color: #77665d;
+  text-underline-offset: 3px;
+}
+
+.matchup-hint {
+  color: #776b63;
+  margin: -12px 0 24px;
+  font-size: .88rem;
+}
+
+.song-card { overflow: hidden; }
+.song-card .song-preview { padding: 12px 12px 4px; }
+
+.song-card .song-preview img,
+.song-card .song-preview .cover-placeholder {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 6px;
+}
+
+.song-card .song-preview > span:not(.playback-state) {
+  font-weight: 800;
+  font-size: 1.1rem;
+}
+
+.song-card .song-preview small { color: #766976; }
+.song-card .listening-links { padding: 5px 12px 10px; }
+
+.song-card .vote-song {
+  margin: 0 12px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: #9c493a;
+  color: #fff;
+  padding: 11px 14px;
+  font-weight: 700;
+}
+
+.song-card .vote-song:disabled {
+  opacity: .55;
+  cursor: wait;
+}
+
+@media(max-width:760px) {
+  .listening-links { display: grid; }
+  .song-card .vote-song { margin: 0 9px 9px; }
+  .song-card .song-preview { padding: 9px 9px 4px; }
+}
+

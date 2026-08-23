@@ -1,17 +1,18 @@
 # Agent 工作流规格
 
-**状态：** 草案 v0.1  
-**最后更新：** 2026-08-01  
+**状态：** v0.2
+**最后更新：** 2026-08-10
 **上级规格：** `00-系统总体设计与规格路线图.md`  
 **依赖规格：** `03-MVP产品规格：歌曲世界杯与音乐探索.md`、`04-音乐实体模型与跨平台匹配.md`
 
 ## 1. 目标与边界
 
-Agent 服务负责把受控音乐数据、可追溯资料和用户赛事选择转化为：
+Agent 服务只承载两个业务 Agent：
 
-1. 探索世界杯的候选池及其策展说明；
-2. 单场赛事的偏好总结和下一步推荐；
-3. 多场赛事的整体音乐偏好报告。
+1. 候选池生成 Agent：根据用户输入生成世界杯候选池及补位队列；
+2. 赛后报告 Agent：根据单场赛事事实生成详细偏好报告和下一步推荐。
+
+长期音乐偏好档案是 Java 管理的辅助记忆，可作为弱背景输入，但不构成第三个 Agent，也不能取代当前赛事事实。
 
 Agent 不负责账号、权限、赛程生成、投票落库、赛事状态迁移或外部资源映射。这些均由 Java 业务服务负责。
 
@@ -20,7 +21,7 @@ Agent 不负责账号、权限、赛程生成、投票落库、赛事状态迁�
 ```mermaid
 flowchart LR
   J["Java 业务服务"] --> A["FastAPI Agent API"]
-  A --> G["LangGraph 工作流"]
+  A --> G["LangGraph Supervisor ReAct Runtime"]
   G --> T1["音乐实体工具"]
   G --> T2["Milvus 知识库工具"]
   G --> T3["网络资料查询工具"]
@@ -29,17 +30,25 @@ flowchart LR
   T2 --> M[("Milvus")]
   T3 --> W["可信网页来源"]
   T4 --> J
-  G --> V["证据与输出校验"]
+  G --> V["不可绕过的运行时护栏"]
   V --> J
 ```
 
-## 3. Agent 工作流清单
+### 2.1 全局编排硬约束
 
-| 工作流 | 触发时机 | 输入 | 输出  | 是否改变业务数据 |
+- 所有业务 Agent 必须采用 Supervisor ReAct 或能力等价的“决策—行动—观察—再决策”循环；
+- 每轮由模型基于目标、黑板、工具结果和剩余预算输出结构化 `action`，运行时负责校验并执行；
+- 禁止使用固定顺序的工具调用链或 LangGraph 线性节点来冒充 Agent；
+- 事实快照读取、最终 Schema 校验、权限、安全与预算检查可以固定，但它们是运行时护栏，不是 Agent 主编排；
+- 不记录或展示隐含思维链，只保留短决策摘要、动作、参数摘要、观察与错误；
+- 可使用专用工具执行器或子 Agent，但对产品只存在本规格定义的两个业务 Agent。
+
+## 3. Agent 清单
+
+| Agent | 触发时机 | 输入 | 输出  | 是否改变业务数据 |
 | --- | --- | --- | --- | --- |
-| `exploration_tournament_planner` | 用户创建探索世界杯 | 艺人、赛事规模、用户目标、候选限制 | 候选池草稿、策展说明、证据    | 否 |
-| `tournament_insight_generator` | 用户完成赛事 | 已完成赛事快照、用户投票、已有偏好摘要 | 本场总结、3–5 条推荐 | 否 |
-| `taste_profile_generator` | 用户查看整体报告且达到门槛 | 多场有效赛事、历史偏好快照 | 整体偏好报告、下一步探索主题 | 否 |
+| `candidate_pool_generator` | 用户请求 AI 生成候选池 | 用户兴趣描述、赛事规模、排除项、可选长期偏好 | 32/64 首候选（含等量补位）、说明、来源 | 否 |
+| `tournament_report_generator` | 单场赛事完成后 | 不可变赛事事实快照、可选长期偏好 | 详细报告、5–7 首歌曲和 2–3 位艺人推荐、娱乐性彩蛋 | 否 |
 
 Java 服务负责保存 Agent 返回的版本化结果；Agent 只能返回建议，不能直接写入 MySQL。
 
@@ -64,6 +73,11 @@ class AgentState(TypedDict):
     validation_errors: list[dict]
     warnings: list[str]
     trace_id: str
+    current_action: str | None
+    action_history: list[dict]
+    observations: list[dict]
+    remaining_budget: dict
+    termination_reason: str | None
 ```
 
 状态设计要求：
@@ -72,13 +86,14 @@ class AgentState(TypedDict):
 - 每个节点只追加或替换自己拥有的状态字段；
 - `evidence` 必须可追溯到实体 ID、知识库 Claim ID 或 URL；
 - 不向前端暴露模型内部推理链，仅暴露结构化阶段事件和用户可读摘要；
+- `action_history` 只记录结构化决策摘要，不保存 chain-of-thought；
 - 状态持久化策略由实现决定，但可恢复状态只能保留必要业务上下文与来源引用。
 
 ## 5. 受控工具契约
 
 ### 5.1 音乐实体工具
 
-数据来自 Java 的实体/Provider 层，Agent 不直接访问 MusicBrainz、Apple 或未来商业 Provider。
+规范实体写入与外部资源映射必须经过 Java 的实体/Provider 层。Agent 可以决定调用“MusicBrainz 解析并导入”工具，但实际网络访问、限流、消歧、幂等落库仍由 Java 执行。
 
 | 工具 | 输入 | 输出 | 限制 |
 | --- | --- | --- | --- |
@@ -86,6 +101,7 @@ class AgentState(TypedDict):
 | `list_artist_recordings` | `artist_id`、`limit`、筛选条件 | 可用 Recording 列表 | 只返回符合版本规则的规范实体 |
 | `get_recording_context` | `recording_ids` | 专辑、发行、试听可用性、外链 | 不返回音频内容或完整歌词 |
 | `get_entity_relations` | `entity_id`、关系类型 | 已验证关系 | 知识图谱上线前返回空或结构化降级 |
+| `resolve_and_import_recordings` | 歌名、艺人名、来源 URL | 已解析的内部 Recording UUID、MBID、置信度 | Java 统一执行 MusicBrainz 查询、1 req/s 限流、消歧与幂等导入 |
 
 ### 5.2 Milvus 知识库工具
 
@@ -125,16 +141,15 @@ fetch_source_summary(url)
 
 这些工具为只读。创建赛事、确认候选、写入投票、删除历史和保存报告均通过 Java API 完成。
 
-## 6. 工作流一：探索世界杯赛前策展
+## 6. Agent 一：世界杯候选池生成
 
 ### 6.1 输入
 
 ```json
 {
   "requestId": "uuid",
-  "artistId": "uuid",
+  "interest": "我喜欢张悬，也想听温柔但不甜腻的华语独立音乐",
   "size": 16,
-  "goal": "discover_entry_direction",
   "constraints": {
     "excludeRecordingIds": [],
     "preferUnheard": false,
@@ -143,41 +158,45 @@ fetch_source_summary(url)
 }
 ```
 
-`size` 在 MVP 只能为 `16` 或 `32`。
+`size` 在 MVP 只能为 `16` 或 `32`。Agent 的目标候选量固定为 `size * 2`：前一半用于首屏确认，后一半作为用户移除歌曲后的低成本补位队列。
 
-### 6.2 LangGraph 节点
+### 6.2 Supervisor ReAct 循环
 
 ```mermaid
 flowchart LR
-  A["校验请求"] --> B["读取规范艺人与可用录音"]
-  B --> C["版本去重与候选预筛"]
-  C --> D["检索 Milvus 已验证资料"]
-  D --> E["按需网络补充资料"]
-  E --> F["Agent 策展与覆盖度规划"]
-  F --> G["规则校验候选池"]
-  G --> H["生成用户可读说明"]
-  H --> I["返回候选草稿"]
+  A["初始化目标、黑板与预算"] --> S["Supervisor 决定下一动作"]
+  S -->|search_catalog| C["检索本地目录"]
+  S -->|search_knowledge| K["检索 Milvus"]
+  S -->|search_web| W["Tavily 网络发现"]
+  S -->|resolve_musicbrainz| M["Java MusicBrainz 解析并导入"]
+  S -->|rerank| R["候选重排与去重"]
+  S -->|submit| V["最终护栏校验"]
+  C --> O["写入观察"]
+  K --> O
+  W --> O
+  M --> O
+  R --> O
+  O --> S
+  V -->|不通过且有预算| S
+  V -->|通过或预算耗尽| E["返回候选草稿/结构化不足"]
 ```
 
-| 节点 | 输入 | 行为 | 输出 |
-| --- | --- | --- | --- |
-| 校验请求 | 请求参数 | 校验赛事规模、目标艺人、用户权限 | 有效请求或结构化错误 |
-| 读取录音 | 艺人 ID | 调用实体工具获取可用 Recording | 规范候选集合 |
-| 预筛 | Recording 集合 | 去近重复、排除不可用版本、应用用户限制 | 候选集合 |
-| 检索资料 | 候选与艺人 | 查询已验证创作阶段、专辑、风格事实 | Claim 与来源 |
-| 网络补充 | 知识缺口 | 有限次数查询可信资料 | 临时来源或警告 |
-| 策展规划 | 候选、事实、目标 | 选出 16/32 首，最大化时期/作品面向的区分度 | 有序候选草案 |
-| 规则校验 | 草案 | 检查数量、录音唯一性、版本冲突、证据完整性 | 通过或重试原因 |
-| 说明生成 | 通过草案 | 生成“本场将帮助区分什么” | 策展说明 |
+Supervisor 每轮只能返回动作白名单中的一项，并附带简短 `decision_summary`、结构化参数和预期信息增益。运行时拒绝非法动作、重复无收益调用和超预算调用。具体工具是否调用、调用次序与次数不能预先写死。
 
-### 6.3 候选策展规则
+允许动作：`search_catalog`、`search_knowledge`、`search_web`、`resolve_musicbrainz`、`rerank_candidates`、`submit_candidates`、`finish_insufficient`。
 
-- 不以“模型记忆”直接生成歌曲；所有候选必须来自 `list_artist_recordings`；
+典型但非固定的自主行为包括：本地目录不足时搜索相近艺人/风格；Tavily 发现目录外歌曲后提取“歌名 + 艺人 + 来源”，再要求 Java 经 MusicBrainz 解析为规范实体；发现同名或版本歧义时继续查询而不是直接采用。
+
+### 6.3 候选生成与扩展规则
+
+- 不以“模型记忆”直接生成最终歌曲；最终候选必须具有 Java 返回的内部 `recording_id`；
 - 每个候选必须是唯一的规范 `recording_id`；
-- 16 首赛事至少覆盖两个不同专辑、时期或已验证作品面向；32 首至少覆盖三个；
+- 16 首赛事目标生成 32 首候选；32 首赛事目标生成 64 首候选；
+- 本地目录不足时，应自主扩大到语义相近的歌曲、艺人或风格，再使用 Tavily 与 MusicBrainz 补足；相近范围不要求机械地限定同艺人；
+- Tavily 结果不得直接进入候选池，必须经 MusicBrainz 消歧并由 Java 幂等导入；
 - 若可用且资料充分，候选池应包含代表作与非代表作，避免只按热度排列；
 - 资料不足时，说明中必须降低表述强度，例如“本场主要按发行时期与可用曲目组织”；
-- 不能满足数量时返回 `INSUFFICIENT_CANDIDATES`，由 Java 提示用户改选规模、改为自选，或选择其他艺人；
+- 达到 16/32 首可开赛数量但不足两倍目标时，可返回较短补位队列并明确警告；用尽预算仍不足 16/32 首时才返回 `INSUFFICIENT_CANDIDATES`；
 - 返回的是赛事草稿，用户确认前不创建赛事快照。
 
 ### 6.4 输出契约
@@ -188,8 +207,10 @@ flowchart LR
   "status": "ready_for_confirmation",
   "artistId": "uuid",
   "size": 16,
-  "recordingIds": ["uuid"],
-  "curationSummary": "这场赛事将…",
+  "recordingIds": ["32 个内部 uuid"],
+  "activeRecordingIds": ["前 16 个内部 uuid"],
+  "reserveRecordingIds": ["后 16 个内部 uuid"],
+  "generationSummary": "这场赛事将…",
   "coverage": [
     {"dimension": "release_period", "description": "覆盖早期与后期作品"}
   ],
@@ -200,7 +221,7 @@ flowchart LR
 }
 ```
 
-## 7. 工作流二：赛后洞察与推荐
+## 7. Agent 二：赛后报告与推荐
 
 ### 7.1 触发条件
 
@@ -208,18 +229,34 @@ flowchart LR
 - 用户显式点击“生成探索总结”，或完成探索世界杯后自动触发；
 - 对同一 `tournament_id + tournament_version` 保持幂等，重复请求返回同一版本结果或可重试状态。
 
-### 7.2 LangGraph 节点
+### 7.2 Supervisor ReAct 循环
 
 ```mermaid
 flowchart LR
-  A["读取赛事快照"] --> B["提取可解释选择信号"]
-  B --> C["读取历史偏好（可选）"]
-  C --> D["检索相关音乐实体与事实"]
-  D --> E["生成推荐候选"]
-  E --> F["证据、重复与安全校验"]
-  F --> G["生成本场总结"]
-  G --> H["返回版本化洞察"]
+  A["护栏读取不可变赛事事实"] --> S["Supervisor 决定下一动作"]
+  S -->|analyze_votes| V["分析晋级与对局信号"]
+  S -->|search_catalog| C["检索目录内推荐"]
+  S -->|search_knowledge| K["检索 Milvus 事实"]
+  S -->|search_web| W["Tavily 外部发现"]
+  S -->|resolve_musicbrainz| M["解析目录外歌曲/艺人"]
+  S -->|draft_report| D["生成结构化报告草稿"]
+  S -->|critique_report| Q["独立 Critic 工具"]
+  S -->|submit| G["最终护栏校验"]
+  V --> O["写入观察"]
+  C --> O
+  K --> O
+  W --> O
+  M --> O
+  D --> O
+  Q --> O
+  O --> S
+  G -->|不通过且有预算| S
+  G -->|通过或终止| H["返回版本化报告"]
 ```
+
+允许动作：`analyze_tournament`、`read_long_term_profile`、`search_catalog`、`search_knowledge`、`search_web`、`resolve_musicbrainz`、`draft_report`、`critique_report`、`submit_report`、`finish_degraded`。除事实快照读取和最终护栏外，是否查询长期档案、Milvus、网络或 MusicBrainz 均由 Supervisor 根据当前证据缺口决定。
+
+报告提交前必须已有草稿并至少通过一次 Critic；这是质量门禁，不规定其他工具的调用顺序。Critic 可以作为受限子 Agent/工具执行器存在，但不是第三个产品业务 Agent。
 
 ### 7.3 信号提取
 
@@ -234,12 +271,13 @@ flowchart LR
 
 ### 7.4 推荐策略
 
-输出 3–5 条推荐，按照以下优先级获取候选：
+目标输出 5–7 首歌曲和 2–3 位艺人，允许模型在证据不足时减少数量。候选可来自：
 
 1. 同艺人的未参赛 Recording 或 Release Group；
 2. 与获胜作品共享已验证制作人、流派、时期、厂牌或音乐关系的艺人/作品；
 3. 知识图谱上线后可使用多跳关系，但每一跳须可解释；
-4. 无充分依据时少推荐或只给同艺人下一步，不凑数量。
+4. 网络发现并经 MusicBrainz/Java 规范化后的目录外歌曲或艺人；
+5. 无充分依据时少推荐或只给同艺人下一步，不凑数量。
 
 每项推荐必须具有 `recommendation_type`、`target_entity_id`、`reasoning`、`evidence[]` 和 `confidence`。`reasoning` 必须同时引用用户选择和音乐依据；不能写成“因为你是某种人”。
 
@@ -271,42 +309,16 @@ flowchart LR
 }
 ```
 
-## 8. 工作流三：整体音乐偏好报告
+## 8. 模型与输出控制
 
-### 8.1 触发与门槛
-
-仅当 Java 业务服务确认用户至少完成 3 场赛事且累计不少于 20 次有效投票时执行。未达到门槛时不调用 LLM，直接返回积累进度。
-
-### 8.2 LangGraph 节点
-
-```text
-读取聚合赛事信号
-  → 检查证据量与时间范围
-  → 聚合音乐维度与稳定信号
-  → 检索相关实体/资料
-  → 生成偏好报告与探索主题
-  → 校验敏感推断、证据和措辞
-  → 返回报告
-```
-
-### 8.3 输出规则
-
-- 明示分析覆盖的赛事数、投票数、时间范围和置信度；
-- 只陈述音乐选择中的重复模式，例如“在已完成赛事中更常选择氛围感更强的作品”；
-- 对冲突偏好保持并列描述，不强行归纳为单一风格；
-- 用户删除赛事后，Java 标记报告过期，Agent 在下次请求时重算；
-- 报告不使用心理测评语言，不提供教育、职业、收入、地域、心理状态等推断。
-
-## 9. 模型与输出控制
-
-### 9.1 模型 Provider
+### 8.1 模型 Provider
 
 - 默认 Provider：DeepSeek；
 - Agent 服务通过统一 `ChatModelProvider` 接口调用模型；
 - Provider 配置从环境变量读取，模型名称、超时、最大 Token、重试策略可配置；
 - 模型替换不应改变工具契约和业务输出 JSON Schema。
 
-### 9.2 结构化输出
+### 8.2 结构化输出
 
 所有对 Java 的最终返回均需通过 Pydantic 模型校验。模型输出解析失败时：
 
@@ -314,7 +326,7 @@ flowchart LR
 2. 仍失败则返回结构化 `MODEL_OUTPUT_INVALID`；
 3. 不把原始模型文本直接写入业务数据库或呈现为正式报告。
 
-### 9.3 提示词原则
+### 8.3 提示词原则
 
 - 系统提示词明确区分“已验证事实”“临时网页来源”“用户选择推断”；
 - 不要求模型暴露思维链；
@@ -323,7 +335,7 @@ flowchart LR
 - 所有用户可见音乐结论使用简体中文；
 - 提示词、模型和工具版本写入追踪元数据。
 
-## 10. 流式事件与用户可见状态
+## 9. 流式事件与用户可见状态
 
 Java 调用 Agent 后可通过 SSE 将以下事件转发给 React：
 
@@ -338,12 +350,13 @@ Java 调用 Agent 后可通过 SSE 将以下事件转发给 React：
 
 不向用户推送隐含推理、Prompt、检索评分或供应商密钥信息。
 
-## 11. 失败、降级与安全
+## 10. 失败、降级与安全
 
 | 场景 | Agent 行为 | 用户体验 |
 | --- | --- | --- |
-| MusicBrainz/实体服务无结果 | 停止策展并返回可选艺人候选 | 提示重新选择艺人 |
-| 候选不足 | 不凑足数量，不生成赛事 | 提议改用较小允许规模不可用；建议自选或换艺人 |
+| MusicBrainz 个别实体无结果 | 丢弃该候选并继续自主搜索相近方向 | 不把未解析歌曲放入候选池 |
+| 候选不足两倍但达到开赛数 | 返回可开赛候选和较短补位队列 | 明确补位数量较少 |
+| 候选不足 16/32 | 用尽目录、知识库、Tavily、MusicBrainz 与相近方向预算后停止 | 建议调整兴趣描述或自选补充 |
 | Milvus 无命中 | 跳过知识库，按元数据组织候选 | 降低解释强度 |
 | 网络查询失败 | 使用已验证资料继续 | 显示“部分背景资料暂不可用” |
 | 模型超时/限流 | 返回可重试状态；Java 可保留草稿 | 不影响已开始赛事 |
@@ -353,15 +366,16 @@ Java 调用 Agent 后可通过 SSE 将以下事件转发给 React：
 
 注意：MVP 的合法赛事规模固定为 16 或 32；候选不足时不能擅自生成 8 首赛事。
 
-## 12. 可观测性与评估
+## 11. 可观测性与评估
 
 每次 Agent 调用至少记录：
 
 ```text
-request_id, trace_id, workflow, user_id_hash, tournament_id,
+request_id, trace_id, agent_name, user_id_hash, tournament_id,
 model_provider, model_name, prompt_version, tool_calls,
 latency_ms, input_tokens, output_tokens, estimated_cost,
-validation_result, warning_codes, result_version
+validation_result, warning_codes, result_version,
+iteration_count, termination_reason, remaining_budget
 ```
 
 建议采用 Langfuse 追踪模型、工具调用、Token 和成本；应用日志与指标通过 OpenTelemetry 统一关联 `trace_id`。不得记录完整用户偏好文本、API Key、完整歌词或受限媒体 URL。
@@ -378,21 +392,23 @@ validation_result, warning_codes, result_version
 | 敏感推断拦截率 | 安全校验拦截的不合规输出数量 |
 | 端到端延迟 | 创建草稿、生成赛后总结、生成整体报告的耗时 |
 
-## 13. 验收标准
+## 12. 验收标准
 
-- [ ] 三个工作流都只读取受控工具数据，不能直接访问业务数据库或第三方 Provider；
-- [ ] 探索赛事策展结果只包含 Java 实体服务返回的规范 `recording_id`；
-- [ ] 16/32 首候选池分别满足数量、唯一性和覆盖度规则；
+- [ ] 系统只暴露候选池生成与赛后报告两个业务 Agent；
+- [ ] 两个 Agent 均由结构化 Supervisor ReAct 循环决定工具和顺序，不存在固定线性主工作流；
+- [ ] Agent 只使用白名单工具，不能直接访问业务数据库；MusicBrainz 的落库访问统一经过 Java Provider；
+- [ ] 候选结果只包含 Java 实体服务返回的规范 `recording_id`；
+- [ ] 16/32 首世界杯分别以 32/64 首总候选为目标，并拆分 active/reserve；
 - [ ] 赛事未完成时不能生成正式赛后洞察；
 - [ ] 单场总结明确标注“仅基于本场赛事”；
-- [ ] 未达到 3 场赛事和 20 票门槛时，不调用整体报告 LLM；
-- [ ] 每条推荐都有用户信号和音乐依据，证据不足时可少于 3 条；
+- [ ] 每条推荐都有本场用户信号和音乐依据，长期档案只能作为弱背景；
 - [ ] 输出经过 Pydantic JSON Schema 校验；
 - [ ] 模型、网络、知识库失败均返回用户可理解的结构化降级状态；
 - [ ] Agent 无法写入赛事、投票、用户资料或 Provider Mapping；
 - [ ] Agent 追踪数据可通过 `request_id` 与 Java 请求关联。
+- [ ] 追踪可证明不同输入可以产生不同合法工具序列，并记录预算与终止原因。
 
-## 14. 不在本规格范围内
+## 13. 不在本规格范围内
 
 - Java 领域模型、事务、幂等锁和 SSE 转发实现；
 - Milvus Collection Schema、入库管道、人工审核后台；

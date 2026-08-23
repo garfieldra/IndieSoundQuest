@@ -21,14 +21,20 @@ public class Tournament {
   @Column(name="started_at") private Instant startedAt;
   @Column(name="completed_at") private Instant completedAt;
   @Column(name="deleted_at") private Instant deletedAt;
+  @Column(name="creation_idempotency_key", columnDefinition="CHAR(36)") private String creationIdempotencyKey;
+  @Column(name="creation_request_hash", columnDefinition="CHAR(64)") private String creationRequestHash;
   protected Tournament() {}
-  public static Tournament draft(UUID id, GuestSession guest, Artist artist, int size, long seed) {
+  public static Tournament draft(UUID id, GuestSession guest, Artist artist, int size, long seed, String idempotencyKey, String requestHash) {
     if (size != 16 && size != 32) throw new IllegalArgumentException("size must be 16 or 32");
     var t=new Tournament(); t.id=id; t.guestSession=guest; t.artist=artist; t.size=size; t.bracketSeed=seed;
-    t.candidateSource=CandidateSource.POPULAR; t.status=TournamentStatus.DRAFT; t.createdAt=Instant.now(); return t;
+    t.candidateSource=CandidateSource.POPULAR; t.status=TournamentStatus.DRAFT; t.createdAt=Instant.now(); t.creationIdempotencyKey=idempotencyKey; t.creationRequestHash=requestHash; return t;
+  }
+  public static Tournament agentDraft(UUID id, GuestSession guest, int size, long seed, String explorationBrief, String idempotencyKey, String requestHash) {
+    if (size != 16 && size != 32) throw new IllegalArgumentException("size must be 16 or 32");
+    var t=new Tournament(); t.id=id; t.guestSession=guest; t.size=size; t.bracketSeed=seed; t.candidateSource=CandidateSource.AGENT_GENERATED; t.explorationBrief=explorationBrief; t.agentGuidanceRequested=false; t.status=TournamentStatus.DRAFT; t.createdAt=Instant.now(); t.creationIdempotencyKey=idempotencyKey; t.creationRequestHash=requestHash; return t;
   }
   public void prepare() { if(status!=TournamentStatus.DRAFT) throw new IllegalStateException("tournament is not a draft"); status=TournamentStatus.READY; }
   public void startIfNeeded() { if(status==TournamentStatus.READY){status=TournamentStatus.IN_PROGRESS; startedAt=Instant.now();} }
   public void complete(UUID winner) { status=TournamentStatus.COMPLETED; winnerEntryId=winner; completedAt=Instant.now(); }
-  public UUID getId(){return id;} public int getSize(){return size;} public long getBracketSeed(){return bracketSeed;} public TournamentStatus getStatus(){return status;} public GuestSession getGuestSession(){return guestSession;}
+  public UUID getId(){return id;} public int getSize(){return size;} public long getBracketSeed(){return bracketSeed;} public TournamentStatus getStatus(){return status;} public UUID getWinnerEntryId(){return winnerEntryId;} public Instant getCompletedAt(){return completedAt;} public GuestSession getGuestSession(){return guestSession;} public CandidateSource getCandidateSource(){return candidateSource;} public String getCreationRequestHash(){return creationRequestHash;}
 }

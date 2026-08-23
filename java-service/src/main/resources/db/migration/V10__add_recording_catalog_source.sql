@@ -1,0 +1,2 @@
+ALTER TABLE recording
+    ADD COLUMN catalog_source VARCHAR(32) NOT NULL DEFAULT 'LOCAL_SEED';

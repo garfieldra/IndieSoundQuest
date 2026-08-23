@@ -29,4 +29,17 @@ management:
 
 agent:
   internal:
+    base-url: ${AGENT_INTERNAL_BASE_URL:http://agent-service:8000}
     service-token: ${AGENT_INTERNAL_SERVICE_TOKEN:change-me}
+
+musicbrainz:
+  base-url: ${MUSICBRAINZ_BASE_URL:https://musicbrainz.org/ws/2}
+  user-agent: ${MUSICBRAINZ_USER_AGENT:IndieSoundQuest/0.1 (https://github.com/garfieldra/IndieSoundQuest)}
+
+listening:
+  apple:
+    base-url: ${APPLE_ITUNES_SEARCH_BASE_URL:https://itunes.apple.com/search}
+    storefront: ${APPLE_ITUNES_STOREFRONT:CN}
+    user-agent: ${APPLE_ITUNES_USER_AGENT:IndieSoundQuest/0.1}
+    available-cache-hours: ${APPLE_PREVIEW_AVAILABLE_CACHE_HOURS:168}
+    unavailable-cache-hours: ${APPLE_PREVIEW_UNAVAILABLE_CACHE_HOURS:24}

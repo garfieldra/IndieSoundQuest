@@ -1,4 +1,4 @@
-# Agent 候选池策展实现规格
+# Agent 候选池生成实现规格
 
 **状态：** 草案 v0.1  
 **最后更新：** 2026-08-02  
@@ -9,7 +9,7 @@
 
 用户用自然语言描述喜欢的歌曲、艺人、风格、场景或探索目标后，Agent 生成一份 **16 或 32 首歌曲的候选池草稿**。候选可跨艺人；用户确认草稿后，Java 服务才创建正式歌曲世界杯赛事。
 
-首版只交付“赛前候选池策展”，不生成赛后报告、不做长期偏好画像，也不直接写入 MySQL。
+本篇只负责“赛前候选池生成”，不生成赛后报告。Agent 不直连 MySQL；经 MusicBrainz 验证的新实体由 Java 目录服务幂等写入后，才可进入赛事。
 
 ## 2. 已确定的技术路线
 
@@ -17,9 +17,9 @@
 | --- | --- |
 | 编排架构 | LangGraph 实现 ReAct（Reason + Act）状态机 |
 | 默认模型 | DeepSeek，使用 OpenAI-compatible Provider Adapter；保留多供应商扩展点 |
-| Agent 工具 | MusicBrainz、Milvus、Tavily 网络搜索 |
+| Agent 工具 | Java 音乐目录、MusicBrainz 实体解析、Milvus、Tavily 网络搜索 |
 | 事实与实体边界 | Agent 不可凭记忆创造歌曲；候选必须经 Java/MusicBrainz 规范实体校验 |
-| 结果写入 | Agent 返回草稿；Java 复核 Recording 后创建 `AGENT_CURATED` 赛事 |
+| 结果写入 | Agent 返回草稿；Java 复核 Recording 后创建 `AGENT_GENERATED` 赛事 |
 | 前端可见性 | 显示候选、来源类型、简短策展理由与警告；不暴露内部思维链 |
 
 Google Custom Search JSON API 已不向新客户开放，因此不采用。网络搜索封装为 `WebSearchProvider`，首个实现为 Tavily；未来可替换而不影响 Graph 节点。
@@ -28,11 +28,11 @@ Google Custom Search JSON API 已不向新客户开放，因此不采用。网�
 
 ```mermaid
 flowchart LR
-  A["输入音乐偏好"] --> B["Agent ReAct 策展"]
+  A["输入音乐偏好"] --> B["Agent ReAct 候选生成"]
   B --> C["返回候选池草稿"]
   C --> D["用户删除/确认候选"]
   D --> E["Java 规范实体复核"]
-  E --> F["创建 AGENT_CURATED 世界杯"]
+  E --> F["创建 AGENT_GENERATED 世界杯"]
 ```
 
 输入例子：`我喜欢张悬的《玫瑰色的你》和陈绮贞早期作品，想找适合深夜散步的中文独立音乐。`
@@ -58,7 +58,7 @@ stateDiagram-v2
   result --> [*]
 ```
 
-- `plan_tools` 是唯一可调用工具的 ReAct 节点；最多 6 轮工具调用。
+- `plan_tools` 是 Supervisor ReAct 决策节点；每轮根据黑板选择下一项受控动作，而不是固定执行所有工具。
 - 工具预算：MusicBrainz/目录查询最多 4 次、Milvus 最多 2 次、Tavily 最多 2 次；超限后进入保守策展。
 - `curate` 只能从状态中的 `verified_recordings` 选择 `recordingId`。
 - `validate_output` 在 Python 与 Java 两层执行：数量为 16/32、ID 唯一、实体存在、封面状态可展示；无法满足则返回 `insufficient_candidates`。

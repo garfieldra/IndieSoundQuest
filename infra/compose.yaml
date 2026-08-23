@@ -18,7 +18,9 @@ services:
   java-service:
     build:
       context: ../java-service
-      target: local-runtime
+      # Always package the current source inside Docker. Copying target/*.jar here
+      # can silently run a stale local artifact even after tests compile new code.
+      target: runtime
     ports:
       - "8080:8080"
     environment:
@@ -53,8 +55,12 @@ services:
       LLM_PROVIDER: ${LLM_PROVIDER}
       LLM_MODEL: ${LLM_MODEL}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      BOCHA_API_KEY: ${BOCHA_API_KEY:-}
       MILVUS_URI: ${MILVUS_URI}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+      HF_HOME: /cache/huggingface
+      FASTEMBED_CACHE_PATH: /cache/fastembed
     depends_on:
       java-service:
         condition: service_healthy
@@ -63,6 +69,8 @@ services:
     networks:
       - internal
       - public
+    volumes:
+      - agent-model-cache:/cache
 
   mysql:
     image: mysql:8.4
@@ -142,3 +150,4 @@ volumes:
   etcd-data:
   minio-data:
   milvus-data:
+  agent-model-cache:

@@ -1,5 +1,6 @@
 # Environment and secrets
 .env
+Demos/generated/
 .env.*
 !.env.example
 
@@ -23,6 +24,7 @@ agent-service/**/__pycache__/
 agent-service/.pytest_cache/
 agent-service/.mypy_cache/
 agent-service/*.egg-info/
+agent-service/build/
 Demos/__pycache__/
 
 # Editor and OS
