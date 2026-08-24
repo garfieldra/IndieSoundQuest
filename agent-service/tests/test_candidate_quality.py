@@ -4,7 +4,7 @@ import pytest
 
 from app.graph import _candidate_allowed, _hint_evidence_is_observed, _normalize_decision_reason, _validate_candidate_quality, build_candidate_pool_graph
 from app.evaluation import aggregate_metrics, evaluate_candidate_result
-from app.llm import CandidateDecision, DeepSeekCandidateSelector, DiscoveryHint, classify_intent_locally
+from app.llm import CandidateDecision, DeepSeekCandidateSelector, DiscoveryHint, _literal_artist_mentions, classify_intent_locally
 from app.schemas import CandidatePoolRequest
 from app.tools import _html_to_excerpt, _is_safe_public_url
 
@@ -22,6 +22,9 @@ class FakeCatalog:
         return []
 
     async def resolve_artist_candidates(self, names):
+        return []
+
+    async def discover_artist_recordings(self, _artists, _per_artist_limit=32):
         return []
 
 
@@ -72,6 +75,12 @@ def test_local_intent_policy(text, has_seed, expected):
     assert policy.intent_mode == expected
     assert policy.seed_artist_ids == seeds
     assert bool(policy.allowed_artist_ids == seeds and seeds) is (expected == "ARTIST_LOCKED")
+
+
+def test_literal_artist_extraction_handles_unspaced_chinese_conjunctions():
+    assert _literal_artist_mentions(
+        "我喜欢徐佳莹、艾怡良和郑宜农，想探索适合深夜聆听的华语创作女声。"
+    ) == ["徐佳莹", "艾怡良", "郑宜农"]
 
 
 @pytest.mark.asyncio

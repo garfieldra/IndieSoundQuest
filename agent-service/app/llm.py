@@ -256,7 +256,15 @@ def _literal_artist_mentions(preference: str) -> list[str]:
     match = re.search(r"(?:我喜欢|喜欢|常听|爱听)\s*([^。！？；\n]{1,160})", preference)
     if not match:
         return []
-    raw = re.split(r"[、,，/]|\s+(?:和|与|及)\s+", match.group(1).split("的歌")[0].split("的歌曲")[0])
+    # Stop when the sentence moves from named artists to a request/scene, then
+    # accept Chinese conjunctions without requiring spaces. The former parser
+    # read “艾怡良和郑宜农” as one artist and lost two usable MusicBrainz seeds.
+    artist_clause = re.split(
+        r"[,，](?=(?:想|希望|要|请|可以|适合|用于|并|但|然后|探索|寻找|做|来))",
+        match.group(1), maxsplit=1,
+    )[0]
+    artist_clause = artist_clause.split("的歌曲")[0].split("的歌")[0]
+    raw = re.split(r"[、,，/]|(?:和|与|及)", artist_clause)
     non_artist_terms = {"克制", "温柔", "忧郁", "明亮", "治愈", "孤独", "浪漫", "热烈", "安静", "冷峻", "中文", "华语", "独立音乐", "民谣", "摇滚", "电子", "爵士", "流行", "说唱"}
     return [value.strip() for value in raw if 1 < len(value.strip()) <= 60 and value.strip() not in non_artist_terms]
 

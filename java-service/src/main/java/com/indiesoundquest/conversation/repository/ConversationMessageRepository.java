@@ -1,0 +1,3 @@
+package com.indiesoundquest.conversation.repository;
+import com.indiesoundquest.conversation.domain.*; import java.util.*; import org.springframework.data.jpa.repository.*;
+public interface ConversationMessageRepository extends JpaRepository<ConversationMessage,UUID>{ List<ConversationMessage> findByConversationIdOrderBySequenceNumberAsc(UUID conversationId); Optional<ConversationMessage> findByConversationIdAndClientMessageId(UUID conversationId,UUID clientMessageId); Optional<ConversationMessage> findTopByConversationIdOrderBySequenceNumberDesc(UUID conversationId); Optional<ConversationMessage> findByConversationIdAndAgentRunId(UUID conversationId,UUID agentRunId); }

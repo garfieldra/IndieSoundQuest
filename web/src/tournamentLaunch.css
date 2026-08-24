@@ -1,0 +1,6 @@
+.tournament-launch-card{max-width:680px;border:1px solid #cfbdae;border-radius:14px;padding:22px;background:linear-gradient(135deg,#fffaf4,#f1e5d8)}
+.tournament-launch-card h2{font-size:1.45rem;margin:8px 0}
+.tournament-launch-card p:not(.eyebrow){color:#685d55;line-height:1.65;margin:0}
+.tournament-launch-card div{display:flex;gap:9px;flex-wrap:wrap;margin-top:17px}
+.tournament-launch-card button{border:0;border-radius:7px;background:#9c493a;color:#fff;padding:11px 14px;font-weight:700}
+.tournament-launch-card button+button{background:#4a3b33}

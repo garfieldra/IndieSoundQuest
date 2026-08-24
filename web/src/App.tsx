@@ -53,15 +53,19 @@ async function streamAgent<T>(path: string, options: RequestInit, onProgress: (p
 }
 
 export function App() {
+  const conversationLaunch = sessionStorage.getItem('isq-worldcup-preference')
+  const conversationLaunchSize = sessionStorage.getItem('isq-worldcup-size') === '32' ? 32 : 16
+  const conversationId = sessionStorage.getItem('isq-conversation-id')
+  const existingTournamentId = sessionStorage.getItem('isq-open-tournament-id')
   const [artists, setArtists] = useState<Artist[]>([])
   const [artistId, setArtistId] = useState('')
   const [seedArtistId, setSeedArtistId] = useState('')
-  const [size, setSize] = useState<16 | 32>(16)
+  const [size, setSize] = useState<16 | 32>(conversationLaunchSize)
   const [tournament, setTournament] = useState<Tournament | null>(null)
   const [loading, setLoading] = useState(true)
   const [message, setMessage] = useState('')
   const [mode, setMode] = useState<'popular' | 'explore'>('explore')
-  const [preferenceText, setPreferenceText] = useState('')
+  const [preferenceText, setPreferenceText] = useState(conversationLaunch ?? '')
   const [candidateResult, setCandidateResult] = useState<CandidatePoolResponse | null>(null)
   const [confirmedArtists, setConfirmedArtists] = useState<{ mention: string; mbid: string; name: string }[]>([])
   const [excludedIds, setExcludedIds] = useState<string[]>([])
@@ -74,14 +78,27 @@ export function App() {
   const [agentRunActive, setAgentRunActive] = useState(false)
   const listening = useListeningPreview()
   const creationAttempt = useRef<{ signature: string; key: string } | null>(null)
+  const launchPending = useRef(Boolean(conversationLaunch))
 
   function creationKeyFor(payload: object) {
     const signature = JSON.stringify(payload)
     if (creationAttempt.current?.signature !== signature) creationAttempt.current = { signature, key: crypto.randomUUID() }
     return creationAttempt.current.key
   }
+  async function persistConversationCard(type: 'CANDIDATE_POOL_CARD' | 'TOURNAMENT_CARD' | 'REPORT_CARD', cardType: string, payload: object) {
+    if (!conversationId) return
+    await api(`/conversations/${conversationId}/cards`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ type, cardType, payloadJson: JSON.stringify(payload) }) })
+  }
 
   useEffect(() => { void loadArtists() }, [])
+  useEffect(() => { if (!loading && existingTournamentId) { sessionStorage.removeItem('isq-open-tournament-id'); void refresh(existingTournamentId) } }, [loading])
+  useEffect(() => {
+    if (!loading && launchPending.current && preferenceText.trim().length >= 3) {
+      launchPending.current = false
+      sessionStorage.removeItem('isq-worldcup-preference'); sessionStorage.removeItem('isq-worldcup-size')
+      void generateCandidates()
+    }
+  }, [loading])
   async function loadArtists() {
     try {
       const data = await api<Artist[]>('/artists')
@@ -91,7 +108,12 @@ export function App() {
   }
   async function refresh(id = tournament?.id) {
     if (!id) return
-    setTournament(await api<Tournament>(`/tournaments/${id}`))
+    const detail = await api<Tournament>(`/tournaments/${id}`)
+    setTournament(detail)
+    if (detail.status === 'COMPLETED') {
+      try { setReport(await api<Report>(`/tournaments/${id}/preference-report`)) }
+      catch { setReport(null) }
+    }
   }
   async function createTournament() {
     if (!artistId) return
@@ -112,6 +134,7 @@ export function App() {
       const requestId = crypto.randomUUID()
       const data = await streamAgent<CandidatePoolResponse>('/agent-runs/candidate-pool:stream', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': requestId }, body: JSON.stringify({ size, preferenceText, seedArtistIds: seedArtistId ? [seedArtistId] : [], confirmedArtists: nextConfirmedArtists }) }, item => setAgentProgress(current => [...current, item]), setAgentPlan)
       setCandidateResult(data); setExcludedIds([]); setPreparingTournamentId(null); creationAttempt.current = null
+      if (conversationId) await persistConversationCard('CANDIDATE_POOL_CARD', 'CANDIDATE_POOL', { size, status: data.status, preferenceText, summary: data.candidatePool?.candidateSummary || '', recordingIds: data.candidatePool?.items.map(item => item.recordingId) || [] })
       if (data.status === 'insufficient_candidates') setMessage(data.candidatePool?.warnings[0]?.message || '可验证歌曲不足，请调整兴趣方向。')
     }
     catch (error) { setMessage(agentErrorMessage(error, '候选歌曲暂时无法生成')) } finally { setLoading(false); setAgentRunActive(false); setProgressCollapsed(true) }
@@ -147,6 +170,7 @@ export function App() {
       setPreparingTournamentId(created.id)
       if (created.status === 'DRAFT') await api(`/tournaments/${created.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'READY' }) })
       await refresh(created.id); setPreparingTournamentId(null); creationAttempt.current = null
+      await persistConversationCard('TOURNAMENT_CARD', 'TOURNAMENT', { tournamentId: created.id, size, status: 'READY' })
     } catch { setMessage(preparingTournamentId ? '赛程准备失败，请重试进入赛事。' : '创建结果暂不确定；再次点击会使用同一请求安全重试。') }
     finally { setLoading(false) }
   }
@@ -166,6 +190,7 @@ export function App() {
     try {
       const created = await streamAgent<Report>(`/tournaments/${tournament.id}/preference-report:stream`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force }) }, item => setAgentProgress(current => [...current, item]), setAgentPlan)
       setReport(created)
+      await persistConversationCard('REPORT_CARD', 'PREFERENCE_REPORT', { tournamentId: tournament.id, reportId: created.reportId, version: created.version, status: created.status, championTitle: tournament.entries.find(entry => entry.id === tournament.matches.find(match => match.roundNumber === Math.max(...tournament.matches.map(item => item.roundNumber)) && match.winnerEntryId)?.winnerEntryId)?.title || '' })
     } catch (error) { setMessage(agentErrorMessage(error, '报告暂时无法生成')) }
     finally { setReportLoading(false); setAgentRunActive(false); setProgressCollapsed(true) }
   }
@@ -229,7 +254,7 @@ export function App() {
         <div className="candidate-actions"><button className="secondary" disabled={loading || Boolean(preparingTournamentId)} onClick={() => void generateCandidates()}>重新生成</button><button className="primary" disabled={loading || candidateSelection.activeItems.length !== size} onClick={startExploration}>{preparingTournamentId ? '重试进入赛事' : '以这组歌曲开赛'}</button></div>{agentFeedback}
       </section>}
     </section>}
-    {tournament && <section className="panel arena">{tournament.status === 'COMPLETED' ? <TournamentResultView tournament={tournament} playbackFor={listening.stateFor} onPreview={id => void listening.toggle(id)} onPrefetch={id => void listening.prefetch(id)} onGenerateReport={() => void generateReport()} reportLoading={reportLoading} hasReadyReport={report?.status === 'READY'} agentFeedback={agentFeedback} onNewTournament={() => { listening.stop(); setTournament(null); setReport(null) }}>{report && <ReportView report={report} tournament={tournament} onRetry={() => void generateReport(true)} loading={reportLoading}/>}</TournamentResultView> : <><div className="progress"><span>{`第 ${tournament.completedVoteCount + 1} 场选择`}</span><span>{tournament.completedVoteCount} / {tournament.size - 1}</span></div>{current && left && right && <><h2>这一轮，你更想留下谁？</h2><p className="matchup-hint">点击唱片试听，确定后再选择留下这首。</p><div className="matchup"><SongCard entry={left} playback={listening.stateFor(left.recordingId)} onPreview={() => void listening.toggle(left.recordingId)} onPrefetch={() => void listening.prefetch(left.recordingId)} onVote={() => void vote(left.id)} disabled={loading}/><div className="versus">VS</div><SongCard entry={right} playback={listening.stateFor(right.recordingId)} onPreview={() => void listening.toggle(right.recordingId)} onPrefetch={() => void listening.prefetch(right.recordingId)} onVote={() => void vote(right.id)} disabled={loading}/></div></>}</>}</section>}
+    {tournament && <section className="panel arena">{tournament.status === 'COMPLETED' ? <TournamentResultView tournament={tournament} playbackFor={listening.stateFor} onPreview={id => void listening.toggle(id)} onPrefetch={id => void listening.prefetch(id)} onGenerateReport={() => void generateReport()} reportLoading={reportLoading} hasReadyReport={report?.status === 'READY'} agentFeedback={agentFeedback} onNewTournament={() => { listening.stop(); setTournament(null); setReport(null); if(conversationId) window.location.hash='' }}>{report && <ReportView report={report} tournament={tournament} onRetry={() => void generateReport(true)} loading={reportLoading}/>}</TournamentResultView> : <><div className="progress"><span>{`第 ${tournament.completedVoteCount + 1} 场选择`}</span><span>{tournament.completedVoteCount} / {tournament.size - 1}</span></div>{current && left && right && <><h2>这一轮，你更想留下谁？</h2><p className="matchup-hint">点击唱片试听，确定后再选择留下这首。</p><div className="matchup"><SongCard entry={left} playback={listening.stateFor(left.recordingId)} onPreview={() => void listening.toggle(left.recordingId)} onPrefetch={() => void listening.prefetch(left.recordingId)} onVote={() => void vote(left.id)} disabled={loading}/><div className="versus">VS</div><SongCard entry={right} playback={listening.stateFor(right.recordingId)} onPreview={() => void listening.toggle(right.recordingId)} onPrefetch={() => void listening.prefetch(right.recordingId)} onVote={() => void vote(right.id)} disabled={loading}/></div></>}</>}</section>}
   </main>
 }
 
@@ -263,7 +288,7 @@ function CandidateCard({ item, playback, onPreview, onPrefetch, onRemove, remove
       <small>{item.artistName}{item.albumTitle ? ` · ${item.albumTitle}` : ''}</small>
       {item.catalogSource === 'EXTERNAL_VERIFIED' && <span className="verification-badge">已补充核验歌曲</span>}
       <p>{item.reason}</p>
-      {(item.explorationRationale?.length || item.evidenceSummary?.length) ? <details className="candidate-evidence"><summary>探索依据</summary>{item.explorationRationale?.map((rationale, index) => <p key={`${rationale.kind}-${index}`}>{rationale.text}</p>)}{item.evidenceSummary?.map((evidence, index) => <a key={`${evidence.url}-${index}`} href={evidence.url} target="_blank" rel="noreferrer">参考：{evidence.title || evidence.domain || '公开音乐资料'}</a>)}</details> : null}
+      {(item.explorationRationale?.length || item.evidenceSummary?.length) ? <details className="candidate-evidence"><summary>探索依据 · {item.verificationStatus === 'VERIFIED' ? 'MusicBrainz 已核验' : '目录已核验'}</summary>{item.explorationRationale?.map((rationale, index) => <p key={`${rationale.kind}-${index}`}>{rationale.text}</p>)}{item.evidenceSummary?.map((evidence, index) => <a key={`${evidence.url}-${index}`} href={evidence.url} target="_blank" rel="noreferrer">参考：{evidence.title || evidence.domain || '公开音乐资料'}</a>)}</details> : null}
       <span className={`playback-state ${playback.phase}`}>{playbackLabel(playback.phase)}</span>
     </button>
     <ListeningLinks playback={playback} searchUrl={item.listeningSearchUrl}/>

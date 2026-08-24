@@ -167,9 +167,22 @@ def build_candidate_pool_graph(
                 action="search_web", reason_code="cross_artist_expansion_allowed",
                 decision_summary="开放探索的本地结果过窄，尝试寻找可核验的相近方向",
             )
+        # Quantity is a deterministic completion contract. Once active +
+        # reserve are both satisfied, more discovery cannot improve playability
+        # enough to justify another potentially minute-long verification batch.
+        # The Agent still owns ranking and submission; this guard only prevents
+        # tool overrun after the requested evidence target is already met.
+        if len(state["recordings"]) >= target and not (narrow_open_catalog and not summary["webSearched"]) and decision.action in {
+            "search_catalog", "expand_artist_catalog", "search_web", "resolve_musicbrainz",
+        }:
+            decision = CandidateDecision(
+                action="rerank_candidates" if not state["ranked"] else "submit_candidates",
+                reason_code="candidate_pool_requires_rerank" if not state["ranked"] else "candidate_pool_ready_for_validation",
+                decision_summary="规范候选与补位池已充足，停止额外发现并进入质量校验",
+            )
         # Keep this late so later quantity guards cannot overwrite the obligation
         # to consume already observed evidence.
-        if state["discovery_hints"] and decision.action not in {"resolve_musicbrainz", "request_clarification"}:
+        if len(state["recordings"]) < target and state["discovery_hints"] and decision.action not in {"resolve_musicbrainz", "request_clarification"}:
             decision = CandidateDecision(action="resolve_musicbrainz", reason_code="external_hints_require_resolution", decision_summary="先核验黑板中尚未消费的网页歌曲线索")
         # Runtime guardrails override invalid or endlessly repeated choices without prescribing normal tool order.
         runtime_termination = state.get("termination_reason")
@@ -277,8 +290,11 @@ def build_candidate_pool_graph(
 
         if action == "expand_artist_catalog":
             try:
+                # One resolved artist may be the user's entire scope. Request
+                # enough canonical recordings for active + reserve in one page.
+                per_artist_limit = min(100, max(40, request.size * 2))
                 resolved = await invoke_with_budget(
-                    lambda: catalog.discover_artist_recordings(state.get("artist_seeds", []), 40),
+                    lambda: catalog.discover_artist_recordings(state.get("artist_seeds", []), per_artist_limit),
                     name="expand_artist_catalog", kind="tool", context=context, budget=budget, history=history,
                 )
             except Exception as exc:
@@ -735,7 +751,7 @@ def _build_result(state: State, insufficient: bool) -> CandidatePoolResult:
             request_id=request.request_id, status="insufficient_candidates", size=request.size,
             reserve_size=max(0, len(choices) - request.size),
             recording_ids=[UUID(item["id"]) for item in choices],
-            items=[_candidate_item(item, policy, {item.get("sourceUrl"): item for item in state["web_sources"]}) for item in choices],
+            items=_candidate_items(choices, policy, {item.get("sourceUrl"): item for item in state["web_sources"]}, request.size),
             candidate_summary="已完成多轮在线发现与 MusicBrainz 核验，但可验证曲目仍不足以同时组成赛事与等量补位池。",
             warnings=[{"code": "INSUFFICIENT_CANDIDATES", "message": "可验证曲目不足以组成赛事与等量补位池，请调整兴趣方向后重试。"}],
             intent_policy=policy,
@@ -768,7 +784,7 @@ def _build_result(state: State, insufficient: bool) -> CandidatePoolResult:
         request_id=request.request_id, status="ready_for_confirmation", size=request.size,
         reserve_size=max(0, len(choices) - request.size),
         recording_ids=[UUID(item["id"]) for item in choices],
-        items=[_candidate_item(item, policy, source_by_url) for item in choices],
+        items=_candidate_items(choices, policy, source_by_url, request.size),
         candidate_summary=state["summary"] or "候选池已通过规范实体与去重校验。",
         warnings=warnings,
         intent_policy=policy,
@@ -777,7 +793,7 @@ def _build_result(state: State, insufficient: bool) -> CandidatePoolResult:
     )
 
 
-def _candidate_item(item: dict, policy: IntentPolicy | None, source_by_url: dict) -> CandidateItem:
+def _candidate_item(item: dict, policy: IntentPolicy | None, source_by_url: dict, pool_role: str = "MAIN") -> CandidateItem:
     reason = item.get("reason") or _fallback_reason(item, policy)
     source = source_by_url.get(item.get("sourceUrl"))
     rationale = [{"kind": "preference_match", "text": reason[:160]}]
@@ -803,7 +819,28 @@ def _candidate_item(item: dict, policy: IntentPolicy | None, source_by_url: dict
         recording_id=item["id"], reason=reason,
         evidence=[source] if source else [],
         exploration_rationale=rationale[:2], evidence_summary=evidence_summary,
+        discovery_sources=[{
+            "type": "WEB_SEARCH" if source else "CATALOG",
+            "provider": str(source.get("searchProvider") or "public_web") if source else "java_catalog",
+            "url": str(source.get("sourceUrl") or "") if source else "",
+            "query": str(source.get("searchQuery") or "") if source else "",
+        }],
+        quality_dimensions={
+            "preferenceRelevance": "supported" if reason else "unknown",
+            "identityConfidence": "verified",
+            "sourceConfidence": "medium" if source else "catalog_verified",
+            "constraintMatch": "passed",
+        },
+        pool_role=pool_role,
+        verification_status="VERIFIED" if item.get("musicbrainzMbid") else "CATALOG_VERIFIED",
     )
+
+
+def _candidate_items(choices: list[dict], policy: IntentPolicy | None, source_by_url: dict, active_size: int) -> list[CandidateItem]:
+    return [
+        _candidate_item(item, policy, source_by_url, "MAIN" if index < active_size else "RESERVE")
+        for index, item in enumerate(choices)
+    ]
 
 
 def _insufficient_termination(state: State) -> str:

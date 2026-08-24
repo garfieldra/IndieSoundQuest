@@ -41,7 +41,14 @@ public class CandidatePoolApplicationService {
       int size,
       String preferenceText,
       List<UUID> seedArtistIds) {
-    return generate(requestId, guestId, size, preferenceText, seedArtistIds, List.of());
+    validateRequest(size, seedArtistIds);
+    final JsonNode agentResult;
+    try {
+      agentResult = gateway.generate(requestId, guestId, size, preferenceText, seedArtistIds);
+    } catch (RuntimeException exception) {
+      throw new CandidatePoolUnavailableException("候选歌曲服务暂时不可用，请稍后重试");
+    }
+    return fromAgentResult(requestId, size, agentResult, seedArtistIds);
   }
 
   public CandidatePoolResponse generate(
@@ -144,11 +151,11 @@ public class CandidatePoolApplicationService {
     warnings.putIfAbsent(
         "INSUFFICIENT_CANDIDATES",
         new WarningView("INSUFFICIENT_CANDIDATES", "可验证歌曲不足，请调整兴趣方向或选择更小的赛事规模。"));
-    var orderedIds = parseIds(result.path("recordingIds"));
-    var found = orderedIds.isEmpty() ? List.<Recording>of() : recordings.findByIdInWithArtist(orderedIds);
-    var byId = new HashMap<UUID, Recording>(); found.forEach(recording -> byId.put(recording.getId(), recording));
-    var explanations = explanationsByRecordingId(result.path("items"), orderedIds);
-    var partialItems = orderedIds.stream().filter(byId::containsKey).map(id -> toItem(byId.get(id), explanations.get(id))).toList();
+    // A failed pool is not a playable product artifact.  Do not leak a partial,
+    // potentially misleading list through the public contract; the next run
+    // performs fresh verification and only then publishes candidates.
+    var orderedIds = List.<UUID>of();
+    var partialItems = List.<CandidateItemView>of();
     return new CandidatePoolResponse(
         INSUFFICIENT,
         new CandidatePoolView(
@@ -230,7 +237,7 @@ public class CandidatePoolApplicationService {
       try {
         var id = UUID.fromString(item.path("recordingId").asText());
         var reason = item.path("reason").asText("").trim();
-        if (allowed.contains(id) && !reason.isBlank()) result.putIfAbsent(id, new CandidateExplanation(reason, rationales(item.path("explorationRationale")), evidence(item.path("evidenceSummary"))));
+        if (allowed.contains(id) && !reason.isBlank()) result.putIfAbsent(id, new CandidateExplanation(reason, rationales(item.path("explorationRationale")), evidence(item.path("evidenceSummary")), sources(item.path("discoverySources")), stringMap(item.path("qualityDimensions")), text(item,"poolRole"), text(item,"verificationStatus")));
       } catch (RuntimeException ignored) {
         // 展示理由不是歌曲事实；损坏的理由会被安全默认值替代。
       }
@@ -256,6 +263,20 @@ public class CandidatePoolApplicationService {
       if (url != null && (url.startsWith("https://") || url.startsWith("http://")) && values.size() < 2) values.add(new EvidenceView(text(item, "title"), text(item, "domain"), url, text(item, "trustLevel")));
     }
     return List.copyOf(values);
+  }
+
+  private List<DiscoverySourceView> sources(JsonNode node) {
+    if (!node.isArray()) return List.of();
+    var values = new ArrayList<DiscoverySourceView>();
+    for (var item : node) if (values.size() < 3) values.add(new DiscoverySourceView(text(item,"type"),text(item,"provider"),text(item,"url"),text(item,"query")));
+    return List.copyOf(values);
+  }
+
+  private Map<String,String> stringMap(JsonNode node) {
+    if (!node.isObject()) return Map.of();
+    var values=new LinkedHashMap<String,String>();
+    node.fields().forEachRemaining(item->values.put(item.getKey(),item.getValue().asText("")));
+    return Map.copyOf(values);
   }
 
   private Map<String, WarningView> normalizedWarnings(JsonNode node) {
@@ -288,7 +309,11 @@ public class CandidatePoolApplicationService {
       ListeningLinkFactory.neteaseSongSearch(recording.getTitle(), recording.getArtist().getName()),
       reason == null || reason.isBlank() ? "来自已验证的音乐目录。" : reason,
       explanation == null ? List.of() : explanation.rationales(),
-      explanation == null ? List.of() : explanation.evidence());
+      explanation == null ? List.of() : explanation.evidence(),
+      explanation == null ? List.of() : explanation.sources(),
+      explanation == null ? Map.of() : explanation.quality(),
+      explanation == null || explanation.poolRole()==null ? "MAIN" : explanation.poolRole(),
+      explanation == null || explanation.verificationStatus()==null ? "CATALOG_VERIFIED" : explanation.verificationStatus());
   }
 
   private String summary(JsonNode result, String fallback) {
@@ -327,11 +352,16 @@ public class CandidatePoolApplicationService {
       String listeningSearchUrl,
       String reason,
       List<RationaleView> explorationRationale,
-      List<EvidenceView> evidenceSummary) {}
+      List<EvidenceView> evidenceSummary,
+      List<DiscoverySourceView> discoverySources,
+      Map<String,String> qualityDimensions,
+      String poolRole,
+      String verificationStatus) {}
 
   public record RationaleView(String kind, String text) {}
   public record EvidenceView(String title, String domain, String url, String trustLevel) {}
-  private record CandidateExplanation(String reason, List<RationaleView> rationales, List<EvidenceView> evidence) {}
+  public record DiscoverySourceView(String type,String provider,String url,String query) {}
+  private record CandidateExplanation(String reason, List<RationaleView> rationales, List<EvidenceView> evidence,List<DiscoverySourceView> sources,Map<String,String> quality,String poolRole,String verificationStatus) {}
 
   public record WarningView(String code, String message) {}
 }

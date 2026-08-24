@@ -23,6 +23,29 @@ class CandidatePoolRequest(ApiModel):
     exclude_recording_ids: list[UUID] = Field(default_factory=list)
 
 
+class ConversationAgentRequest(ApiModel):
+    request_id: UUID
+    agent_run_id: UUID
+    conversation_id: UUID
+    user_message: str = Field(min_length=1, max_length=2000)
+    summary: str = Field(default="", max_length=4000)
+    recent_messages: list[dict] = Field(default_factory=list, max_length=12)
+    confirmed_memories: list[str] = Field(default_factory=list, max_length=20)
+
+
+class ConversationCardIntent(ApiModel):
+    message_type: Literal["CLARIFICATION_CARD", "TOURNAMENT_CARD", "RECOMMENDATION_CARD"]
+    card_type: str = Field(min_length=1, max_length=40)
+    payload: dict = Field(default_factory=dict)
+
+
+class ConversationAgentResult(ApiModel):
+    text: str = Field(min_length=1, max_length=2000)
+    card_intent: ConversationCardIntent | None = None
+    action: str = Field(min_length=1, max_length=40)
+    trace_summary: dict = Field(default_factory=dict)
+
+
 class ConfirmedArtist(ApiModel):
     mention: str = Field(min_length=1, max_length=120)
     mbid: UUID
@@ -68,6 +91,10 @@ class CandidateItem(ApiModel):
     evidence: list[dict] = Field(default_factory=list)
     exploration_rationale: list[dict] = Field(default_factory=list, max_length=2)
     evidence_summary: list[dict] = Field(default_factory=list, max_length=2)
+    discovery_sources: list[dict] = Field(default_factory=list, max_length=3)
+    quality_dimensions: dict = Field(default_factory=dict)
+    pool_role: Literal["MAIN", "RESERVE"] = "MAIN"
+    verification_status: Literal["VERIFIED", "CATALOG_VERIFIED"] = "VERIFIED"
 
 
 class CandidatePoolResult(ApiModel):

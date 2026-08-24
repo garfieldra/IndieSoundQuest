@@ -12,6 +12,10 @@ export type CandidateItem = {
   reason: string
   explorationRationale?: { kind: string; text: string }[]
   evidenceSummary?: { title?: string; domain?: string; url: string; trustLevel?: string }[]
+  discoverySources?: { type?: string; provider?: string; url?: string; query?: string }[]
+  qualityDimensions?: Record<string, string>
+  poolRole?: 'MAIN' | 'RESERVE'
+  verificationStatus?: 'VERIFIED' | 'CATALOG_VERIFIED'
 }
 
 export type CandidatePool = {

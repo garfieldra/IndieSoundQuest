@@ -134,12 +134,17 @@ public class MusicBrainzCatalogService {
     var nextSeedRank = recordings.findMaxSeedRank() + 1;
     for (var seed : seeds.stream().filter(Objects::nonNull).limit(8).toList()) {
       try {
+        // Use MusicBrainz' browse API for an already-resolved artist MBID. A
+        // Lucene `arid:` search ranks recording versions and can return many
+        // editions of only a handful of songs. Browse returns the canonical
+        // recording collection in one polite request.
         var uri = URI.create(baseUrl + "/recording?fmt=json&limit=" + Math.min(Math.max(perArtistLimit, 1), 100)
-            + "&query=" + URLEncoder.encode("arid:" + seed.mbid(), StandardCharsets.UTF_8));
+            + "&offset=0&artist=" + URLEncoder.encode(seed.mbid(), StandardCharsets.UTF_8)
+            + "&inc=artist-credits");
         var response = send(uri);
         if (response.statusCode() != 200) continue;
         for (var node : objectMapper.readTree(response.body()).path("recordings")) {
-          var candidate = parseCandidate(node);
+          var candidate = parseCandidate(node, seed);
           if (candidate == null || !seed.mbid().equals(candidate.artistMbid()) || !seen.add(candidate.recordingMbid())) continue;
           var hint = new Hint(candidate.title(), candidate.artistName(), "https://musicbrainz.org/artist/" + seed.mbid());
           var existing = recordings.findByMusicbrainzMbid(candidate.recordingMbid());
@@ -240,6 +245,27 @@ public class MusicBrainzCatalogService {
       albumTitle = text(releases.get(0), "title");
     }
     return new Candidate(recordingMbid, title, artistMbid, artistName, sortName, releaseMbid, albumTitle, node.path("score").asInt(0));
+  }
+
+  private Candidate parseCandidate(JsonNode node, ArtistSeed seed) {
+    var artistCredits = node.path("artist-credit");
+    if (!artistCredits.isArray() || artistCredits.isEmpty()) return null;
+    JsonNode matchingCredit = null;
+    for (var credit : artistCredits) {
+      if (seed.mbid().equals(text(credit.path("artist"), "id"))) {
+        matchingCredit = credit;
+        break;
+      }
+    }
+    if (matchingCredit == null) return null;
+    var recordingMbid = text(node, "id");
+    var title = text(node, "title");
+    if (recordingMbid == null || title == null) return null;
+    var artistNode = matchingCredit.path("artist");
+    var creditedName = Optional.ofNullable(text(matchingCredit, "name"))
+        .orElse(Optional.ofNullable(text(artistNode, "name")).orElse(seed.name()));
+    var sortName = Optional.ofNullable(text(artistNode, "sort-name")).orElse(creditedName);
+    return new Candidate(recordingMbid, title, seed.mbid(), creditedName, sortName, null, null, 100);
   }
 
   private boolean isConfidentMatch(Hint hint, Candidate candidate) {

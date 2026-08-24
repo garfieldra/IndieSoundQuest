@@ -36,7 +36,9 @@ public class Recording {
     recording.releaseMusicbrainzMbid = releaseMusicbrainzMbid;
     recording.coverUrl = releaseMusicbrainzMbid == null ? null
         : "https://coverartarchive.org/release/" + releaseMusicbrainzMbid + "/front-500";
-    recording.coverSource = releaseMusicbrainzMbid == null ? null : "COVER_ART_ARCHIVE";
+    // The database contract is non-null even when a MusicBrainz browse result
+    // has no release attached yet. Cover enrichment can upgrade NONE later.
+    recording.coverSource = releaseMusicbrainzMbid == null ? "NONE" : "COVER_ART_ARCHIVE";
     recording.coverStatus = releaseMusicbrainzMbid == null ? "UNAVAILABLE" : "PENDING";
     recording.catalogSource = "EXTERNAL_VERIFIED";
     recording.externalSourceUrl = externalSourceUrl;

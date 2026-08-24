@@ -1,0 +1,2 @@
+package com.indiesoundquest.conversation.domain;
+public enum ConversationMessageType { USER_TEXT, AGENT_TEXT, AGENT_RUN, SYSTEM_NOTE, CLARIFICATION_CARD, CANDIDATE_POOL_CARD, TOURNAMENT_CARD, REPORT_CARD, RECOMMENDATION_CARD }

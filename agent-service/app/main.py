@@ -3,11 +3,12 @@ import logging
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from .graph import build_candidate_pool_graph
+from .conversation_graph import ConversationReActRuntime
 from .report_graph import build_report_graph
 from .report_llm import ReportGenerator
 from .report_schemas import TournamentReportRequest
 from .llm import DeepSeekCandidateSelector
-from .schemas import CandidatePoolRequest
+from .schemas import CandidatePoolRequest, ConversationAgentRequest
 from .settings import settings
 from .tools import KnowledgeSearchTool, MusicCatalogTool, TournamentFactsTool, WebSearchTool
 
@@ -19,6 +20,7 @@ logger.setLevel(logging.INFO)
 web_search = WebSearchTool(tavily_api_key=settings.tavily_api_key, bocha_api_key=settings.bocha_api_key)
 graph = build_candidate_pool_graph(MusicCatalogTool(settings.java_internal_base_url, settings.agent_internal_service_token), web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), DeepSeekCandidateSelector())
 report_graph = build_report_graph(TournamentFactsTool(settings.java_internal_base_url, settings.agent_internal_service_token), ReportGenerator(), web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection))
+conversation_runtime = ConversationReActRuntime(web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection))
 
 _ACTION_PROGRESS = {
     "understand_preference": ("understand_preference", "正在理解你的音乐偏好"),
@@ -30,6 +32,10 @@ _ACTION_PROGRESS = {
     "search_knowledge": ("knowledge_context", "正在补充歌曲主题与文化语境"),
     "analyze_tournament": ("analyze_matches", "正在归纳本场的关键选择轨迹"),
     "draft_report": ("draft_report", "正在生成你的音乐偏好报告"),
+    "draft_response": ("draft_response", "正在整理这次音乐探索的回应"),
+    "clarify": ("clarify", "正在确认这次探索还需要哪些信息"),
+    "propose_tournament": ("propose_tournament", "正在准备歌曲世界杯入口"),
+    "respond": ("draft_response", "正在整理这次音乐探索的回应"),
     "critique_report": ("review_report", "正在核验报告事实与推荐来源"),
     "rerank_candidates": ("organize_candidates", "正在整理候选歌曲与候补队列"),
 }
@@ -48,7 +54,14 @@ def _plan_event(request_id, state: dict, workflow: str) -> str:
         if action in actions: return "running"
         if any(item in actions for item in history): return "completed"
         return "pending"
-    if workflow == "candidate":
+    if workflow == "conversation":
+        items = [
+            {"id":"understand","title":"理解这次音乐问题","status":status("understand", {"understand_preference"}),"detail":"结合本次提问与已有对话上下文"},
+            {"id":"research","title":"按需查找音乐资料","status":status("research", {"search_web", "search_knowledge"}),"detail":"仅在回答或探索确有需要时调用工具"},
+            {"id":"decide","title":"决定下一步探索方式","status":status("decide", {"clarify", "propose_tournament", "respond"}),"detail":"继续对话、澄清方向或进入歌曲世界杯"},
+        ]
+        goal, summary = "推进这次音乐探索对话", "Agent 正在根据对话状态自主决定下一步。"
+    elif workflow == "candidate":
         target = state.get("request").size * 2 if state.get("request") else 0
         items = [
             {"id":"understand","title":"理解本次音乐偏好","status":status("understand", {"understand_preference", "resolve_named_entities"}),"detail":"已识别输入中的音乐方向"},
@@ -77,6 +90,32 @@ async def live(): return {"status":"UP"}
 
 @app.get("/health/ready")
 async def ready(): return {"status":"UP", "catalog":"configured", "modelProvider": settings.llm_provider, "webSearch": bool(settings.tavily_api_key)}
+
+@app.post("/internal/v1/workflows/conversation:stream", dependencies=[Depends(verify_caller)])
+async def conversation(request: ConversationAgentRequest, x_request_id: str = Header()):
+    if str(request.request_id) != x_request_id: raise HTTPException(400, "X-Request-Id must match requestId")
+    async def events():
+        yield _progress(request.request_id, "understand_preference", 0)
+        try:
+            started = __import__("time").monotonic(); last_action = None; last_plan = None; result = None; state = {}
+            config = {"configurable": {"thread_id": str(request.agent_run_id)}, "recursion_limit": 24}
+            async for state in conversation_runtime.graph.astream({"request": request}, config, stream_mode="values"):
+                action = state.get("decision").action if state.get("decision") else None
+                if action and action != last_action:
+                    last_action = action
+                    yield _progress(request.request_id, action, int((__import__("time").monotonic() - started) * 1000))
+                if state.get("action_history"):
+                    plan = _plan_event(request.request_id, state, "conversation")
+                    if plan != last_plan:
+                        last_plan = plan; yield plan
+                if state.get("result"): result = state["result"]
+            if result is None: raise RuntimeError("conversation result missing")
+            logger.info("conversation ReAct completed request_id=%s trace=%s", request.request_id, result.trace_summary)
+            yield f"event: result\ndata: {result.model_dump_json(by_alias=True)}\n\n"
+        except Exception:
+            logger.exception("conversation workflow failed")
+            yield f"event: error\ndata: {json.dumps({'code':'CONVERSATION_UNAVAILABLE','message':'这次音乐对话暂时无法完成，请稍后重试'},ensure_ascii=False)}\n\n"
+    return StreamingResponse(events(), media_type="text/event-stream")
 
 @app.post("/internal/v1/workflows/candidate-pool:stream", dependencies=[Depends(verify_caller)])
 async def candidate_pool(request: CandidatePoolRequest, x_request_id: str = Header()):
