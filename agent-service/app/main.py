@@ -37,7 +37,7 @@ _ACTION_PROGRESS = {
     "propose_tournament": ("propose_tournament", "正在准备歌曲世界杯入口"),
     "respond": ("draft_response", "正在整理这次音乐探索的回应"),
     "critique_report": ("review_report", "正在核验报告事实与推荐来源"),
-    "rerank_candidates": ("organize_candidates", "正在整理候选歌曲与候补队列"),
+    "rerank_candidates": ("organize_candidates", "正在并行重排候选，并生成入选理由"),
 }
 
 def _progress(request_id, action: str, elapsed_ms: int, metrics: dict | None = None) -> str:
@@ -68,7 +68,7 @@ def _plan_event(request_id, state: dict, workflow: str) -> str:
             {"id":"artist-catalog","title":"核验明确艺人的作品","status":status("artist", {"expand_artist_catalog", "search_catalog"}),"detail":f"已获得 {count} 首可核验歌曲"},
             {"id":"adjacent","title":"探索相近音乐方向","status":status("adjacent", {"search_web", "search_knowledge"}),"detail":"从公开音乐资料补充待核验线索"},
             {"id":"verify","title":"核验新发现歌曲","status":status("verify", {"resolve_musicbrainz"}),"detail":"将外部线索转为规范歌曲身份"},
-            {"id":"review","title":"去重并检查候补数量","status":status("review", {"rerank_candidates", "submit_candidates"}),"detail":"确保赛事与候补队列都满足数量要求"},
+            {"id":"review","title":"语义重排并检查候补数量","status":status("review", {"rerank_candidates", "submit_candidates"}),"detail":"并行生成入选理由，确保赛事与候补队列都满足数量要求"},
         ]
         goal, summary = f"为 {target // 2} 首赛事准备 {target} 首可核验候选", f"已核验 {count} / {target} 首；当前正由 Agent 决定下一步。"
     else:

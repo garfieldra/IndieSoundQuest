@@ -236,8 +236,8 @@ public class CandidatePoolApplicationService {
     for (var item : node) {
       try {
         var id = UUID.fromString(item.path("recordingId").asText());
-        var reason = item.path("reason").asText("").trim();
-        if (allowed.contains(id) && !reason.isBlank()) result.putIfAbsent(id, new CandidateExplanation(reason, rationales(item.path("explorationRationale")), evidence(item.path("evidenceSummary")), sources(item.path("discoverySources")), stringMap(item.path("qualityDimensions")), text(item,"poolRole"), text(item,"verificationStatus")));
+        var reason = item.path("rankingReason").asText(item.path("reason").asText("")).trim();
+        if (allowed.contains(id) && !reason.isBlank()) result.putIfAbsent(id, new CandidateExplanation(reason, factors(item.path("selectionFactors"), item.path("explorationRationale")), evidence(item.path("evidenceSummary")), sources(item.path("discoverySources")), stringMap(item.path("qualityDimensions")), text(item,"poolRole"), text(item,"verificationStatus"), text(item,"originRelation"), text(item,"originRelationText"), text(item,"explanationStatus")));
       } catch (RuntimeException ignored) {
         // 展示理由不是歌曲事实；损坏的理由会被安全默认值替代。
       }
@@ -253,6 +253,11 @@ public class CandidatePoolApplicationService {
       if (!text.isBlank() && values.size() < 2) values.add(new RationaleView(text(item, "kind"), text.length() > 280 ? text.substring(0, 280) : text));
     }
     return List.copyOf(values);
+  }
+
+  private List<RationaleView> factors(JsonNode factors, JsonNode legacyRationales) {
+    var values = rationales(factors);
+    return values.isEmpty() ? rationales(legacyRationales) : values;
   }
 
   private List<EvidenceView> evidence(JsonNode node) {
@@ -313,7 +318,10 @@ public class CandidatePoolApplicationService {
       explanation == null ? List.of() : explanation.sources(),
       explanation == null ? Map.of() : explanation.quality(),
       explanation == null || explanation.poolRole()==null ? "MAIN" : explanation.poolRole(),
-      explanation == null || explanation.verificationStatus()==null ? "CATALOG_VERIFIED" : explanation.verificationStatus());
+      explanation == null || explanation.verificationStatus()==null ? "CATALOG_VERIFIED" : explanation.verificationStatus(),
+      explanation == null || explanation.originRelation()==null ? "OPEN_DISCOVERY" : explanation.originRelation(),
+      explanation == null || explanation.originRelationText()==null ? "由本次偏好发现" : explanation.originRelationText(),
+      explanation == null || explanation.explanationStatus()==null ? "CATALOG_FALLBACK" : explanation.explanationStatus());
   }
 
   private String summary(JsonNode result, String fallback) {
@@ -356,12 +364,15 @@ public class CandidatePoolApplicationService {
       List<DiscoverySourceView> discoverySources,
       Map<String,String> qualityDimensions,
       String poolRole,
-      String verificationStatus) {}
+      String verificationStatus,
+      String originRelation,
+      String originRelationText,
+      String explanationStatus) {}
 
   public record RationaleView(String kind, String text) {}
   public record EvidenceView(String title, String domain, String url, String trustLevel) {}
   public record DiscoverySourceView(String type,String provider,String url,String query) {}
-  private record CandidateExplanation(String reason, List<RationaleView> rationales, List<EvidenceView> evidence,List<DiscoverySourceView> sources,Map<String,String> quality,String poolRole,String verificationStatus) {}
+  private record CandidateExplanation(String reason, List<RationaleView> rationales, List<EvidenceView> evidence,List<DiscoverySourceView> sources,Map<String,String> quality,String poolRole,String verificationStatus,String originRelation,String originRelationText,String explanationStatus) {}
 
   public record WarningView(String code, String message) {}
 }

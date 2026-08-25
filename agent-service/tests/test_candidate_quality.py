@@ -4,7 +4,7 @@ import pytest
 
 from app.graph import _candidate_allowed, _hint_evidence_is_observed, _normalize_decision_reason, _validate_candidate_quality, build_candidate_pool_graph
 from app.evaluation import aggregate_metrics, evaluate_candidate_result
-from app.llm import CandidateDecision, DeepSeekCandidateSelector, DiscoveryHint, _literal_artist_mentions, classify_intent_locally
+from app.llm import CandidateDecision, DeepSeekCandidateSelector, DiscoveryHint, RerankedCandidates, _literal_artist_mentions, classify_intent_locally
 from app.schemas import CandidatePoolRequest
 from app.tools import _html_to_excerpt, _is_safe_public_url
 
@@ -238,6 +238,38 @@ def test_action_reason_code_is_semantically_normalized():
         decision_summary="读取目录",
     )
     assert _normalize_decision_reason(decision).reason_code == "verified_candidates_below_active_size"
+
+
+@pytest.mark.asyncio
+async def test_rerank_contract_preserves_pool_and_exposes_explanation_metadata():
+    artist = uuid4()
+
+    class RankingSelector(DeepSeekCandidateSelector):
+        async def rerank_candidates(self, _preference, items, _policy):
+            ranked = []
+            for index, item in enumerate(reversed(items)):
+                ranked.append(item | {
+                    "rankScore": 100 - index,
+                    "reason": f"《{item['title']}》与用户描述的深夜华语创作女声方向形成可比较的已核验作品。",
+                    "rankingReason": f"《{item['title']}》与用户描述的深夜华语创作女声方向形成可比较的已核验作品。",
+                    "selectionFactors": [{"kind": "mood", "text": "根据用户明确的深夜聆听场景进行排序。"}],
+                    "explanationStatus": "MODEL_GENERATED",
+                })
+            return RerankedCandidates(items=ranked, candidate_summary="已完成语义重排", model_batch_count=2)
+
+    selector = RankingSelector(); selector.model = None
+    graph = build_candidate_pool_graph(FakeCatalog(recordings(artist, "华语创作女声", 32)), FakeWeb(), FakeKnowledge(), selector)
+    state = await graph.ainvoke({"request": CandidatePoolRequest(
+        requestId=uuid4(), guestId="fixture", size=16, preferenceText="深夜聆听的华语创作女声"
+    )})
+
+    result = state["result"]
+    assert result.status == "ready_for_confirmation"
+    assert len(result.items) == 32
+    assert all(item.ranking_reason and item.selection_factors for item in result.items)
+    assert all(item.explanation_status == "MODEL_GENERATED" for item in result.items)
+    assert [item.pool_role for item in result.items[:16]] == ["MAIN"] * 16
+    assert [item.pool_role for item in result.items[16:]] == ["RESERVE"] * 16
 
 
 def test_quality_gate_blocks_short_active_pool_and_warns_short_reserve():

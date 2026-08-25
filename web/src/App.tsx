@@ -287,8 +287,9 @@ function CandidateCard({ item, playback, onPreview, onPrefetch, onRemove, remove
       <strong>{item.title}</strong>
       <small>{item.artistName}{item.albumTitle ? ` · ${item.albumTitle}` : ''}</small>
       {item.catalogSource === 'EXTERNAL_VERIFIED' && <span className="verification-badge">已补充核验歌曲</span>}
-      <p>{item.reason}</p>
-      {(item.explorationRationale?.length || item.evidenceSummary?.length) ? <details className="candidate-evidence"><summary>探索依据 · {item.verificationStatus === 'VERIFIED' ? 'MusicBrainz 已核验' : '目录已核验'}</summary>{item.explorationRationale?.map((rationale, index) => <p key={`${rationale.kind}-${index}`}>{rationale.text}</p>)}{item.evidenceSummary?.map((evidence, index) => <a key={`${evidence.url}-${index}`} href={evidence.url} target="_blank" rel="noreferrer">参考：{evidence.title || evidence.domain || '公开音乐资料'}</a>)}</details> : null}
+      <span className={`origin-relation ${item.originRelation || 'OPEN_DISCOVERY'}`}>{item.originRelation === 'ADJACENT_ARTIST' ? '相近方向扩展' : item.originRelation === 'SEED_ARTIST' ? '从你的起点艺人延展' : '由本次偏好发现'}</span>
+      <p>{item.rankingReason || item.reason}</p>
+      {(item.selectionFactors?.length || item.explorationRationale?.length || item.evidenceSummary?.length) ? <details className="candidate-evidence"><summary>探索依据 · {item.verificationStatus === 'VERIFIED' ? 'MusicBrainz 已核验' : '目录已核验'}{item.explanationStatus === 'CATALOG_FALLBACK' ? ' · 目录说明' : ''}</summary>{(item.selectionFactors || item.explorationRationale)?.map((rationale, index) => <p key={`${rationale.kind}-${index}`}>{rationale.text}</p>)}{item.originRelationText && <p>{item.originRelationText}</p>}{item.evidenceSummary?.map((evidence, index) => <a key={`${evidence.url}-${index}`} href={evidence.url} target="_blank" rel="noreferrer">参考：{evidence.title || evidence.domain || '公开音乐资料'}</a>)}</details> : null}
       <span className={`playback-state ${playback.phase}`}>{playbackLabel(playback.phase)}</span>
     </button>
     <ListeningLinks playback={playback} searchUrl={item.listeningSearchUrl}/>

@@ -10,6 +10,11 @@ export type CandidateItem = {
   catalogSource?: 'LOCAL_SEED' | 'EXTERNAL_VERIFIED'
   listeningSearchUrl: string
   reason: string
+  rankingReason?: string
+  selectionFactors?: { kind: string; text: string }[]
+  originRelation?: 'SEED_ARTIST' | 'ADJACENT_ARTIST' | 'OPEN_DISCOVERY'
+  originRelationText?: string
+  explanationStatus?: 'MODEL_GENERATED' | 'CATALOG_FALLBACK'
   explorationRationale?: { kind: string; text: string }[]
   evidenceSummary?: { title?: string; domain?: string; url: string; trustLevel?: string }[]
   discoverySources?: { type?: string; provider?: string; url?: string; query?: string }[]

@@ -1,8 +1,9 @@
+import asyncio
 import json
 from typing import Literal
 from uuid import UUID
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from .settings import settings
 from .schemas import IntentPolicy
 from .intent_rules import classify_intent_rule
@@ -16,6 +17,33 @@ class SelectedSong(BaseModel):
 class Selection(BaseModel):
     selected: list[SelectedSong]
     candidate_summary: str = Field(min_length=12, max_length=240)
+
+
+class RankingModel(BaseModel):
+    model_config = ConfigDict(alias_generator=lambda name: name.split("_")[0] + "".join(part.title() for part in name.split("_")[1:]), populate_by_name=True)
+
+
+class SelectionFactor(RankingModel):
+    kind: Literal["scene", "mood", "genre", "artist_relation", "culture", "lyrics_theme", "creation_context", "language", "era"] = Field(validation_alias=AliasChoices("kind", "factor"))
+    text: str = Field(min_length=4, max_length=100, validation_alias=AliasChoices("text", "detail", "reason", "description"))
+
+
+class RankedSong(RankingModel):
+    recording_id: UUID
+    rank_score: int = Field(ge=0, le=100)
+    ranking_reason: str = Field(min_length=30, max_length=120)
+    selection_factors: list[SelectionFactor] = Field(min_length=1, max_length=3)
+
+
+class RankingBatch(RankingModel):
+    ranked: list[RankedSong] = Field(validation_alias=AliasChoices("ranked", "rankingBatch", "RankingBatch", "items"))
+
+
+class RerankedCandidates(BaseModel):
+    items: list[dict]
+    candidate_summary: str
+    model_batch_count: int = 0
+    fallback_batch_count: int = 0
 
 
 class CandidateDecision(BaseModel):
@@ -241,6 +269,80 @@ ARTIST_LOCKED 只能检索允许艺人的作品；其他模式必须在明确艺
             # The graph will fall back to verified catalog records only.
             return None
 
+    async def rerank_candidates(self, preference: str, recordings: list[dict], intent_policy: IntentPolicy | None = None) -> RerankedCandidates | None:
+        """Score independent, verified batches concurrently, then merge deterministically.
+
+        The caller owns whether this is invoked.  A failed batch gets a transparent
+        catalog fallback; it never removes a verified song from a playable pool.
+        """
+        if self.model is None or not recordings:
+            return None
+        batches = [recordings[index:index + 16] for index in range(0, len(recordings), 16)]
+        # Keep bounded parallelism: it retains the latency benefit of subtask
+        # fan-out without causing the provider to reject four JSON calls at once.
+        semaphore = asyncio.Semaphore(2)
+        tasks = [self._rank_batch_with_retry(semaphore, preference, batch, intent_policy) for batch in batches]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        merged: list[dict] = []
+        model_batches = fallback_batches = 0
+        for batch, result in zip(batches, results):
+            by_id = {str(item["id"]): item for item in batch}
+            if isinstance(result, Exception) or result is None:
+                fallback_batches += 1
+                merged.extend(_fallback_ranked_items(batch, preference, intent_policy))
+                continue
+            proposed = {str(item.recording_id): item for item in result.ranked}
+            if set(proposed) != set(by_id) or len(proposed) != len(batch):
+                fallback_batches += 1
+                merged.extend(_fallback_ranked_items(batch, preference, intent_policy))
+                continue
+            model_batches += 1
+            for recording_id, item in by_id.items():
+                suggestion = proposed[recording_id]
+                merged.append(item | {
+                    "rankScore": suggestion.rank_score,
+                    "reason": suggestion.ranking_reason,
+                    "rankingReason": suggestion.ranking_reason,
+                    "selectionFactors": [factor.model_dump(by_alias=True) for factor in suggestion.selection_factors],
+                    "explanationStatus": "MODEL_GENERATED",
+                })
+        merged.sort(key=lambda item: (-int(item.get("rankScore", 0)), str(item.get("title", "")), str(item.get("id", ""))))
+        summary = "候选已按本次偏好与可核验音乐资料重新排序，可在主池与候补中继续取舍。"
+        if fallback_batches:
+            summary += " 部分入选理由采用了目录说明。"
+        return RerankedCandidates(items=merged, candidate_summary=summary, model_batch_count=model_batches, fallback_batch_count=fallback_batches)
+
+    async def _rank_batch_with_retry(self, semaphore: asyncio.Semaphore, preference: str, recordings: list[dict], intent_policy: IntentPolicy | None) -> RankingBatch:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                async with semaphore:
+                    return await asyncio.wait_for(self._rank_batch(preference, recordings, intent_policy), timeout=22)
+            except Exception as error:
+                last_error = error
+                if attempt == 0:
+                    await asyncio.sleep(0.35)
+        assert last_error is not None
+        raise last_error
+
+    async def _rank_batch(self, preference: str, recordings: list[dict], intent_policy: IntentPolicy | None) -> RankingBatch:
+        catalog = [{
+            "recordingId": item["id"], "title": item.get("title", ""), "artistName": item.get("artistName", ""),
+            "albumTitle": item.get("albumTitle", ""), "catalogSource": item.get("catalogSource", "EXTERNAL_VERIFIED"),
+            "evidenceSummary": _ranking_evidence(item), "themeClaims": item.get("themeClaims", []),
+        } for item in recordings]
+        prompt = f"""你是候选歌曲池 Agent 的并行排序子任务。只处理给定的已核验歌曲，不输出思维链。
+用户本次偏好：{preference}
+意图策略：{intent_policy.model_dump(mode='json', by_alias=True) if intent_policy else {}}
+候选事实：{json.dumps(catalog, ensure_ascii=False)}
+对每一首候选都输出一次。rankScore 为 0-100 的相对贴合排序信号；rankingReason 用 30-100 字，连接用户偏好与给定元数据、公开来源摘要或审核主题卡。不得从记忆补充歌曲、歌词、创作背景或风格事实；未知就用审慎的推荐性表述。selectionFactors 为 1-3 条，仅能使用 scene,mood,genre,artist_relation,culture,lyrics_theme,creation_context,language,era，文字必须可由输入事实或用户原文支持。只输出 RankingBatch JSON。"""
+        # DeepSeek's OpenAI-compatible endpoint is reliable for plain JSON but
+        # does not consistently accept the schema mechanism used by
+        # ``with_structured_output``.  Keep validation local and treat invalid
+        # replies as an individual batch fallback instead of losing the pool.
+        response = await self.model.ainvoke(prompt)
+        return RankingBatch.model_validate(_normalize_ranking_payload(json.loads(self._clean_json(response.content))))
+
     @staticmethod
     def _clean_json(content: str) -> str:
         content = content.strip()
@@ -249,6 +351,52 @@ ARTIST_LOCKED 只能检索允许艺人的作品；其他模式必须在明确艺
         if content.startswith("```") and content.endswith("```"):
             return content[3:-3].strip()
         return content
+
+
+def _ranking_evidence(item: dict) -> list[str]:
+    values = []
+    if item.get("evidenceSnippet"):
+        values.append(str(item["evidenceSnippet"])[:240])
+    for source in item.get("evidenceSummary", [])[:2]:
+        if isinstance(source, dict) and source.get("title"):
+            values.append(str(source["title"])[:120])
+    return values[:2]
+
+
+def _normalize_ranking_payload(payload: dict) -> dict:
+    """Accept harmless naming drift from JSON-mode providers before validation."""
+    if not isinstance(payload, dict):
+        return payload
+    ranked = next((value for key, value in payload.items() if key.lower() in {"ranked", "rankingbatch", "items", "candidaterankings"} and isinstance(value, list)), None)
+    if ranked is None:
+        return payload
+    for song in ranked:
+        if not isinstance(song, dict):
+            continue
+        factors = song.get("selectionFactors") or song.get("selection_factors") or []
+        for factor in factors:
+            if not isinstance(factor, dict):
+                continue
+            factor.setdefault("kind", factor.get("factor"))
+            factor.setdefault("text", next((factor.get(key) for key in ("detail", "reason", "description", "evidence") if factor.get(key)), ""))
+    return {"ranked": ranked}
+
+
+def _fallback_ranked_items(recordings: list[dict], preference: str, policy: IntentPolicy | None) -> list[dict]:
+    facets = policy.preference_facets if policy else None
+    terms = ((facets.mood + facets.scene + facets.genre + facets.language + facets.era)[:2] if facets else [])
+    direction = "、".join(terms) or "本次音乐方向"
+    result = []
+    for index, item in enumerate(recordings):
+        reason = f"《{item.get('title', '这首歌')}》是已核验的 {item.get('artistName', '艺人')} 作品，可作为与你所说的{direction}进行比较的一席。"
+        result.append(item | {
+            "rankScore": 50 - index,
+            "reason": reason,
+            "rankingReason": reason,
+            "selectionFactors": [{"kind": "artist_relation", "text": "基于已核验艺人与本次偏好范围入池。"}],
+            "explanationStatus": "CATALOG_FALLBACK",
+        })
+    return result
 
 
 def _literal_artist_mentions(preference: str) -> list[str]:

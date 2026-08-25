@@ -435,20 +435,22 @@ def build_candidate_pool_graph(
             available = _deduplicate_versions(state["recordings"])
             count = min(request.size * 2, len(available))
             try:
-                selection = await invoke_with_budget(
-                    lambda: selector.select(request.preference_text, count, available, state.get("intent_policy")),
+                reranked = await invoke_with_budget(
+                    lambda: selector.rerank_candidates(request.preference_text, available[:count], state.get("intent_policy")),
                     name="rerank_candidates", kind="subagent", context=context, budget=budget, history=history,
-                ) if count else None
+                    timeout_seconds=80,
+                ) if count and hasattr(selector, "rerank_candidates") else None
             except Exception:
-                selection = None
-            by_id = {UUID(item["id"]): item for item in available}
-            if selection and len(selection.selected) == count and all(item.recording_id in by_id for item in selection.selected):
-                ranked = [by_id[item.recording_id] | {"reason": item.reason} for item in selection.selected]
-                summary_text = selection.candidate_summary
+                reranked = None
+            if reranked and len(reranked.items) == count:
+                ranked = reranked.items
+                summary_text = reranked.candidate_summary
+                rerank_metrics = {"modelBatchCount": reranked.model_batch_count, "fallbackBatchCount": reranked.fallback_batch_count}
             else:
                 ranked = available[:count]
                 summary_text = "这组候选依据你的输入与可验证音乐目录生成；确认后才会创建赛事。"
-            return {"ranked": ranked, "summary": summary_text, "tool_history": history, "observations": state["observations"] + [{"action": action, "status": "success", "count": len(ranked)}]}
+                rerank_metrics = {"modelBatchCount": 0, "fallbackBatchCount": (count + 15) // 16 if count else 0}
+            return {"ranked": ranked, "summary": summary_text, "tool_history": history, "observations": state["observations"] + [{"action": action, "status": "success", "count": len(ranked), **rerank_metrics}]}
 
         if action == "submit_candidates":
             quality_gate = _validate_candidate_quality(state)
@@ -684,7 +686,16 @@ def _fallback_reason(item: dict, policy: IntentPolicy | None) -> str:
     if facets:
         terms = (facets.mood + facets.scene + facets.genre + facets.language + facets.era)[:2]
     direction = "、".join(terms) if terms else "你描述的音乐方向"
-    return f"《{item.get('title', '这首歌')}》来自已验证目录，可放进比赛中比较它与{direction}的贴合度。"
+    return f"《{item.get('title', '这首歌')}》来自已验证目录，适合作为本轮候选，和你所说的{direction}放在同一组里继续比较。"
+
+
+def _origin_relation(item: dict, policy: IntentPolicy | None) -> tuple[str, str]:
+    seed_ids = {str(value) for value in (policy.seed_artist_ids if policy else [])}
+    if seed_ids and str(item.get("artistId") or "") in seed_ids:
+        return "SEED_ARTIST", "来自你点名艺人的已核验作品"
+    if policy and policy.intent_mode == "ARTIST_SEEDED":
+        return "ADJACENT_ARTIST", "沿着你点名的艺人向相近方向扩展"
+    return "OPEN_DISCOVERY", "由本次偏好发现"
 
 
 def _trace_summary(state: State) -> dict:
@@ -795,6 +806,8 @@ def _build_result(state: State, insufficient: bool) -> CandidatePoolResult:
 
 def _candidate_item(item: dict, policy: IntentPolicy | None, source_by_url: dict, pool_role: str = "MAIN") -> CandidateItem:
     reason = item.get("reason") or _fallback_reason(item, policy)
+    ranking_reason = item.get("rankingReason") or reason
+    relation, relation_text = _origin_relation(item, policy)
     source = source_by_url.get(item.get("sourceUrl"))
     rationale = [{"kind": "preference_match", "text": reason[:160]}]
     evidence_summary: list[dict] = []
@@ -816,7 +829,10 @@ def _candidate_item(item: dict, policy: IntentPolicy | None, source_by_url: dict
     else:
         rationale.append({"kind": "catalog_match", "text": "基于已核验本地曲库与本场偏好生成。"})
     return CandidateItem(
-        recording_id=item["id"], reason=reason,
+        recording_id=item["id"], reason=reason, ranking_reason=ranking_reason,
+        selection_factors=item.get("selectionFactors") or [{"kind": "artist_relation", "text": "基于已核验艺人与本次偏好范围入池。"}],
+        origin_relation=relation, origin_relation_text=relation_text,
+        explanation_status=item.get("explanationStatus") or "CATALOG_FALLBACK",
         evidence=[source] if source else [],
         exploration_rationale=rationale[:2], evidence_summary=evidence_summary,
         discovery_sources=[{

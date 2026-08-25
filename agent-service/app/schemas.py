@@ -88,6 +88,11 @@ class IntentPolicy(ApiModel):
 class CandidateItem(ApiModel):
     recording_id: UUID
     reason: str = Field(min_length=8, max_length=120)
+    ranking_reason: str | None = Field(default=None, min_length=30, max_length=160)
+    selection_factors: list[dict] = Field(default_factory=list, max_length=3)
+    origin_relation: Literal["SEED_ARTIST", "ADJACENT_ARTIST", "OPEN_DISCOVERY"] = "OPEN_DISCOVERY"
+    origin_relation_text: str = Field(default="由本次偏好发现", max_length=120)
+    explanation_status: Literal["MODEL_GENERATED", "CATALOG_FALLBACK"] = "CATALOG_FALLBACK"
     evidence: list[dict] = Field(default_factory=list)
     exploration_rationale: list[dict] = Field(default_factory=list, max_length=2)
     evidence_summary: list[dict] = Field(default_factory=list, max_length=2)
