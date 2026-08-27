@@ -16,9 +16,10 @@ logger = logging.getLogger(__name__)
 
 
 class ReportDecision(BaseModel):
-    action: Literal["analyze_tournament", "search_web", "search_knowledge", "draft_report", "critique_report", "submit_report", "finish_degraded"]
+    action: Literal["analyze_tournament", "search_web", "search_domestic_content", "search_knowledge", "draft_report", "critique_report", "submit_report", "finish_degraded"]
     decision_summary: str = Field(min_length=4, max_length=120)
     query: str | None = Field(default=None, max_length=300)
+    provider: Literal["ZHIHU", "BILIBILI", "DOUBAN"] | None = None
 
 
 class ReportGenerator:
@@ -45,7 +46,7 @@ class ReportGenerator:
             return ReportDecision(action="submit_report", decision_summary="提交已通过审查的报告")
         prompt = f"""你是赛后报告 Agent 的 Supervisor，采用 ReAct，根据黑板观察只选择下一项动作，不输出思维链。
 黑板摘要：{json.dumps(board_summary, ensure_ascii=False)}
-动作白名单：analyze_tournament, search_web, search_knowledge, draft_report, critique_report, submit_report, finish_degraded。
+动作白名单：analyze_tournament, search_web, search_domestic_content, search_knowledge, draft_report, critique_report, submit_report, finish_degraded。仅当 blackboard 的 domesticResearchAvailable 非空时，才可自主选择 search_domestic_content，并指定其中一个 provider；它是可选研究工具，不是固定步骤。
 决策原则：当前单场赛事事实是主要依据。只要尚未做赛事分析，先分析；分析完成后，若尚未有网络资料，应优先 search_web 来寻找本地目录外的跨艺人探索依据；网络检索完成后，可按报告表达需要选择 search_knowledge 补充主题解释。Milvus 仅补充主题解释与推荐理由，不能替代网络发现。不要选择 recentActions 中已有且对应事实已经存在的动作；例如 analyzed=true 时不得再选 analyze_tournament，webSearched=true 时不得再选 search_web，knowledgeSearched=true 时不得再选 search_knowledge。提交前必须已有分析、报告草稿，并至少审查一次。
 当 action=search_web 时，query 必须给出一个具体中文检索词，优先使用 musicContext 中的艺人或胜者；其他动作可省略 query。
 仅输出 JSON：{{"action":"...","decision_summary":"简短理由","query":"可选检索词"}}"""

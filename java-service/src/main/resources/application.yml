@@ -15,6 +15,15 @@ spring:
   mvc:
     async:
       request-timeout: 15m
+  rabbitmq:
+    host: ${SPRING_RABBITMQ_HOST:rabbitmq}
+    port: ${SPRING_RABBITMQ_PORT:5672}
+    username: ${SPRING_RABBITMQ_USERNAME:indiesoundquest}
+    password: ${SPRING_RABBITMQ_PASSWORD:indiesoundquest}
+    listener:
+      simple:
+        acknowledge-mode: auto
+        default-requeue-rejected: false
 
 springdoc:
   swagger-ui:
@@ -24,7 +33,23 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,metrics,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      reportAgent:
+        slidingWindowSize: 10
+        minimumNumberOfCalls: 5
+        failureRateThreshold: 50
+        waitDurationInOpenState: 30s
+  timelimiter:
+    instances:
+      reportAgent:
+        timeoutDuration: 320s
   endpoint:
     health:
       probes:

@@ -3,9 +3,11 @@ import html
 import ipaddress
 import re
 import socket
+import time
 from urllib.parse import urlparse
 from uuid import UUID
 import httpx
+from .research import ResearchPurpose, ResearchSource, deduplicate_research_sources
 
 
 class MusicCatalogTool:
@@ -165,6 +167,126 @@ class WebSearchTool:
             except (httpx.HTTPError, ValueError):
                 continue
         return enriched
+
+
+class SpotifyCatalogTool:
+    """Official Spotify metadata search, used only as a discovery signal.
+
+    The access token and client secret remain inside the Agent process. Returned
+    tracks are deliberately shaped as unverified hints; downstream MusicBrainz
+    resolution is still required before Java can create a tournament entry.
+    """
+
+    TOKEN_URL = "https://accounts.spotify.com/api/token"
+    SEARCH_URL = "https://api.spotify.com/v1/search"
+
+    def __init__(self, client_id: str | None = None, client_secret: str | None = None, market: str | None = None):
+        self.client_id = (client_id or "").strip()
+        self.client_secret = (client_secret or "").strip()
+        self.market = (market or "").strip().upper() or None
+        self._token: str | None = None
+        self._token_expiry = 0.0
+        self._token_lock = asyncio.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.client_id and self.client_secret)
+
+    async def search_tracks(self, query: str, limit: int = 10) -> list[dict]:
+        if not self.enabled or len(query.strip()) < 2:
+            return []
+        token = await self._access_token()
+        params: dict[str, str | int] = {
+            "q": query.strip()[:300], "type": "track,artist,album", "limit": max(1, min(limit, 10)),
+        }
+        if self.market:
+            params["market"] = self.market
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.get(self.SEARCH_URL, params=params, headers={"Authorization": f"Bearer {token}"})
+            response.raise_for_status()
+        results: list[dict] = []
+        for item in response.json().get("tracks", {}).get("items", []):
+            title = str(item.get("name") or "").strip()
+            artists = [str(artist.get("name") or "").strip() for artist in item.get("artists", [])]
+            artist_name = ", ".join(value for value in artists if value)
+            external_url = str((item.get("external_urls") or {}).get("spotify") or "").strip()
+            if not title or not artist_name or not external_url.startswith("https://open.spotify.com/"):
+                continue
+            album = item.get("album") or {}
+            image = next((entry.get("url") for entry in album.get("images", []) if isinstance(entry, dict) and entry.get("url")), None)
+            results.append({
+                "kind": "spotify_catalog_source", "sourceUrl": external_url,
+                "sourceTitle": f"{title} · {artist_name}",
+                "summary": f"Spotify 目录收录：{title} · {artist_name}"[:1_200],
+                "queryPurpose": "candidate_discovery", "searchQuery": params["q"],
+                "catalogProvider": "SPOTIFY", "spotifyTrackId": str(item.get("id") or ""),
+                "isrc": str((item.get("external_ids") or {}).get("isrc") or ""),
+                "albumTitle": str(album.get("name") or ""), "coverUrl": image,
+                "title": title, "artistName": artist_name,
+            })
+        return _deduplicate_sources(results)
+
+    async def _access_token(self) -> str:
+        if self._token and time.monotonic() < self._token_expiry:
+            return self._token
+        async with self._token_lock:
+            if self._token and time.monotonic() < self._token_expiry:
+                return self._token
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(
+                    self.TOKEN_URL, data={"grant_type": "client_credentials"}, auth=(self.client_id, self.client_secret),
+                )
+                response.raise_for_status()
+            payload = response.json()
+            token = str(payload.get("access_token") or "")
+            if not token:
+                raise ValueError("Spotify token response has no access token")
+            # Refresh early to avoid passing an almost-expired token to a search.
+            self._token, self._token_expiry = token, time.monotonic() + max(30, int(payload.get("expires_in") or 3600) - 60)
+            return token
+
+
+class DomesticContentResearchTool:
+    """Optional, adapter-only gateway for community research sidecars.
+
+    The Agent cannot execute a platform CLI or forward arbitrary commands. A
+    disabled provider performs no network call and simply contributes no
+    evidence, allowing the normal online-first chain to continue.
+    """
+    def __init__(
+        self, *, zhihu_enabled: bool = False, bilibili_enabled: bool = False,
+        douban_enabled: bool = False, zhihu_base_url: str = "http://zhihu-research:8091",
+        bilibili_base_url: str = "http://bilibili-research:8092", douban_base_url: str = "http://douban-research:8093",
+        timeout_seconds: int = 12, max_sources: int = 8,
+    ):
+        self.providers = {
+            "ZHIHU": {"enabled": zhihu_enabled, "baseUrl": zhihu_base_url.rstrip("/")},
+            "BILIBILI": {"enabled": bilibili_enabled, "baseUrl": bilibili_base_url.rstrip("/")},
+            # The provider stays disabled until its lookup-only sidecar has
+            # passed a source/terms review; no direct scraping fallback exists.
+            "DOUBAN": {"enabled": douban_enabled, "baseUrl": douban_base_url.rstrip("/")},
+        }
+        self.timeout_seconds = timeout_seconds
+        self.max_sources = max(1, min(max_sources, 8))
+
+    async def search(self, provider: str, query: str, purpose: ResearchPurpose, limit: int = 5) -> list[dict]:
+        config = self.providers.get(provider)
+        if not config or not config["enabled"] or not config["baseUrl"]:
+            return []
+        payload = {"query": query.strip()[:240], "purpose": purpose, "limit": min(max(1, limit), self.max_sources)}
+        if len(payload["query"]) < 2:
+            return []
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.post(f"{config['baseUrl']}/v1/research/search", json=payload)
+                response.raise_for_status()
+            parsed = [ResearchSource.model_validate(item) for item in response.json().get("items", [])]
+            return [item.as_web_source() for item in deduplicate_research_sources(parsed)[:self.max_sources]]
+        except (httpx.HTTPError, ValueError):
+            return []
+
+    def enabled_providers(self) -> list[str]:
+        return [name for name, config in self.providers.items() if config["enabled"] and config["baseUrl"]]
 
 
 def _deduplicate_sources(sources: list[dict]) -> list[dict]:

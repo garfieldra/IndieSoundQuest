@@ -3,6 +3,7 @@ import { toPng } from 'html-to-image'
 import { deriveCandidateSelection, intentModeLabel, type ArtistChoice, type CandidateItem, type CandidatePoolResponse } from './candidatePool'
 import { playbackLabel, type PlaybackState, useListeningPreview } from './listening'
 import { TournamentResultView } from './tournamentResultView'
+import { sourcePresentation } from './sourcePresentation'
 import './report.css'
 import './discovery.css'
 import './export.css'
@@ -18,6 +19,7 @@ type Tournament = { id: string; status: string; size: number; completedVoteCount
 type Report = { reportId: string; tournamentId: string; version: number; status: 'PENDING' | 'RUNNING' | 'READY' | 'FAILED'; report?: { summary: string; dimensions: { name: string; confidence: string; explanation: string }[]; choiceTrajectory?: { matchId: string; roundNumber: number; matchIndex: number; winnerTitle: string; winnerArtistName: string; loserTitle: string; loserArtistName: string; signalRole: 'stable_anchor' | 'preference_boundary' | 'near_finalist'; derivedNote: string }[]; songRecommendations: { recordingId?: string; title?: string; artistName?: string; reason: string; searchUrl?: string; sourceStatus?: 'catalog_verified' | 'web_discovered'; sourceUrl?: string; sourceTitle?: string }[]; artistRecommendations: { artistId?: string; artistName?: string; reason: string; searchUrl?: string; sourceStatus?: 'catalog_verified' | 'web_discovered'; sourceUrl?: string; sourceTitle?: string }[]; explorationTags?: string[]; personalityEasterEgg: string; disclaimer: string; warnings?: string[] }; failureMessage?: string }
 type AgentProgress = { phase: string; status?: string; message: string; elapsedMs?: number }
 type AgentPlan = { revision: number; goal: string; summary: string; items: { id: string; title: string; status: 'pending' | 'running' | 'completed' | 'skipped' | 'blocked'; detail: string }[] }
+type SourceReference = { url: string; title?: string; domain?: string }
 
 function agentErrorMessage(error: unknown, fallback: string) {
   const message = error instanceof Error ? error.message.trim() : ''
@@ -289,9 +291,9 @@ function CandidateCard({ item, playback, onPreview, onPrefetch, onRemove, remove
       {item.catalogSource === 'EXTERNAL_VERIFIED' && <span className="verification-badge">已补充核验歌曲</span>}
       <span className={`origin-relation ${item.originRelation || 'OPEN_DISCOVERY'}`}>{item.originRelation === 'ADJACENT_ARTIST' ? '相近方向扩展' : item.originRelation === 'SEED_ARTIST' ? '从你的起点艺人延展' : '由本次偏好发现'}</span>
       <p>{item.rankingReason || item.reason}</p>
-      {(item.selectionFactors?.length || item.explorationRationale?.length || item.evidenceSummary?.length) ? <details className="candidate-evidence"><summary>探索依据 · {item.verificationStatus === 'VERIFIED' ? 'MusicBrainz 已核验' : '目录已核验'}{item.explanationStatus === 'CATALOG_FALLBACK' ? ' · 目录说明' : ''}</summary>{(item.selectionFactors || item.explorationRationale)?.map((rationale, index) => <p key={`${rationale.kind}-${index}`}>{rationale.text}</p>)}{item.originRelationText && <p>{item.originRelationText}</p>}{item.evidenceSummary?.map((evidence, index) => <a key={`${evidence.url}-${index}`} href={evidence.url} target="_blank" rel="noreferrer">参考：{evidence.title || evidence.domain || '公开音乐资料'}</a>)}</details> : null}
       <span className={`playback-state ${playback.phase}`}>{playbackLabel(playback.phase)}</span>
     </button>
+    {(item.selectionFactors?.length || item.explorationRationale?.length || item.evidenceSummary?.length) ? <details className="candidate-evidence"><summary>探索依据 · {item.verificationStatus === 'VERIFIED' ? 'MusicBrainz 已核验' : '目录已核验'}{item.explanationStatus === 'CATALOG_FALLBACK' ? ' · 目录说明' : ''}</summary>{(item.selectionFactors || item.explorationRationale)?.map((rationale, index) => <p key={`${rationale.kind}-${index}`}>{rationale.text}</p>)}{item.originRelationText && <p>{item.originRelationText}</p>}{item.evidenceSummary?.map((evidence, index) => <SourceReferenceCard compact key={`${evidence.url}-${index}`} source={{ url: evidence.url, title: evidence.title, domain: evidence.domain }}/>)}</details> : null}
     <ListeningLinks playback={playback} searchUrl={item.listeningSearchUrl}/>
     <button className="remove-candidate" onClick={onRemove} disabled={removeDisabled}>移除</button>
   </article>
@@ -352,7 +354,17 @@ function ReportExport({ report, champion, tournament, exportRef }: { report: Rep
   return <article className="report-export" ref={exportRef} aria-hidden="true"><p className="eyebrow">本场冠军 · {tournament.size} 首歌曲世界杯</p><section className="export-champion">{champion?.coverUrl ? <img src={champion.coverUrl} alt=""/> : <div className="export-disc">ISQ</div>}<div><h1>{champion?.title || '本场冠军'}</h1><p>{champion?.artistName || 'IndieSoundQuest'}</p></div></section><p className="eyebrow">偏好报告 · 第 {report.version} 版</p><p className="export-summary">{report.report.summary}</p>{report.report.explorationTags?.length ? <p className="export-tags">探索依据 · {report.report.explorationTags.join(' · ')}</p> : null}<div className="export-dimensions">{report.report.dimensions.map(item => <section key={item.name}><strong>{item.name}</strong><p>{item.explanation}</p></section>)}</div>{report.report.choiceTrajectory?.length ? <><h2>你的选择轨迹</h2>{report.report.choiceTrajectory.map(item => <p className="export-item" key={item.matchId}><strong>《{item.winnerTitle}》</strong> · {item.winnerArtistName}<br/><small>胜出于《{item.loserTitle}》· {item.loserArtistName}｜{item.derivedNote}</small></p>)}</> : null}<h2>继续听听</h2>{report.report.songRecommendations.map((item, index) => <p className="export-item" key={item.recordingId || index}><strong>{item.title}</strong> {item.artistName && `· ${item.artistName}`}<br/><small>{item.reason}{item.sourceStatus === 'web_discovered' ? `｜网络发现 · 待核验｜${item.sourceTitle || '来源资料'}｜请以音乐平台搜索结果为准` : ''}</small></p>)}<blockquote>{report.report.personalityEasterEgg}</blockquote><p className="export-disclaimer">{report.report.disclaimer}</p><footer>IndieSoundQuest</footer></article>
 }
 
+function SourceReferenceCard({ source, compact = false }: { source: SourceReference; compact?: boolean }) {
+  const presentation = sourcePresentation(source.url)
+  const title = source.title || source.domain || `${presentation.label}${presentation.detail}`
+  return <a className={`source-reference-card ${presentation.key} ${compact ? 'compact' : ''}`} href={source.url} target="_blank" rel="noreferrer noopener">
+    <span className="source-monogram" aria-hidden="true">{presentation.mark}</span>
+    <span className="source-reference-copy"><small>{presentation.label} · {presentation.detail}</small><strong>{title}</strong></span>
+    <span className="source-reference-action">查看</span>
+  </a>
+}
+
 function RecommendationCard({ title, subtitle, item }: { title: string; subtitle?: string; item: { reason: string; searchUrl?: string; sourceStatus?: string; sourceUrl?: string; sourceTitle?: string } }) {
   const webDiscovered = item.sourceStatus === 'web_discovered'
-  return <article className="recommendation-card"><a href={item.searchUrl || '#'} target="_blank" rel="noreferrer"><strong>{title}</strong>{webDiscovered && <span className="source-badge">网络发现 · 待核验</span>}<small>{subtitle ? `${subtitle} · ` : ''}{item.reason}</small></a>{webDiscovered && item.sourceUrl && <a className="source-link" href={item.sourceUrl} target="_blank" rel="noreferrer">查看发现来源{item.sourceTitle ? `：${item.sourceTitle}` : ''}</a>}</article>
+  return <article className="recommendation-card"><a href={item.searchUrl || '#'} target="_blank" rel="noreferrer"><strong>{title}</strong>{webDiscovered && <span className="source-badge">网络发现 · 待核验</span>}<small>{subtitle ? `${subtitle} · ` : ''}{item.reason}</small></a>{webDiscovered && item.sourceUrl && <SourceReferenceCard source={{ url: item.sourceUrl, title: item.sourceTitle }}/>}</article>
 }

@@ -1,0 +1,4 @@
+package com.indiesoundquest.async;
+import com.fasterxml.jackson.databind.*; import com.indiesoundquest.tournament.application.PreferenceReportApplicationService; import java.util.*; import org.springframework.amqp.rabbit.annotation.RabbitListener; import org.springframework.stereotype.*;
+@Component public class ReportGenerationConsumer { private final PreferenceReportApplicationService reports; private final ObjectMapper json; public ReportGenerationConsumer(PreferenceReportApplicationService reports,ObjectMapper json){this.reports=reports;this.json=json;}
+ @RabbitListener(queues=ReportQueueConfiguration.QUEUE) public void consume(String payload)throws Exception{var n=json.readTree(payload);reports.generateQueued(UUID.fromString(n.path("reportId").asText()),UUID.fromString(n.path("tournamentId").asText()),UUID.fromString(n.path("guestId").asText()),n.path("version").asInt());} }

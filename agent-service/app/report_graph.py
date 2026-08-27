@@ -10,7 +10,7 @@ from .report_llm import ReportDecision, ReportGenerator
 from .report_schemas import ChoiceTrajectoryItem, CritiqueResult, PreferenceReport, TournamentReportRequest
 from .runtime import AgentBlackboard, RuntimeBudget, invoke_with_budget
 from .subagents import CriticSubagent, EvidenceRegistry, NetworkResearchSubagent, PreferenceAnalysisSubagent, RecommendationValidationSubagent
-from .tools import KnowledgeSearchTool, TournamentFactsTool, WebSearchTool
+from .tools import DomesticContentResearchTool, KnowledgeSearchTool, TournamentFactsTool, WebSearchTool
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +192,7 @@ def _next_eligible_action(summary: dict) -> str:
     return "submit_report"
 
 
-def build_report_graph(facts_tool: TournamentFactsTool, generator: ReportGenerator, web: WebSearchTool, knowledge: KnowledgeSearchTool):
+def build_report_graph(facts_tool: TournamentFactsTool, generator: ReportGenerator, web: WebSearchTool, knowledge: KnowledgeSearchTool, domestic: DomesticContentResearchTool | None = None):
     preference_analyst = PreferenceAnalysisSubagent()
     network_researcher = NetworkResearchSubagent(web)
     recommendation_validator = RecommendationValidationSubagent()
@@ -221,6 +221,7 @@ def build_report_graph(facts_tool: TournamentFactsTool, generator: ReportGenerat
         summary = {
             "analyzed": bool(board.get("preference_signals")),
             "webSearched": "network_sources" in board,
+            "domesticResearchAvailable": domestic.enabled_providers() if domestic else [],
             "webSourceCount": len(board.get("network_sources", [])),
             "knowledgeSearched": "knowledge_context" in board,
             "knowledgeCount": len(board.get("knowledge_context", [])),
@@ -251,6 +252,7 @@ def build_report_graph(facts_tool: TournamentFactsTool, generator: ReportGenerat
         duplicate_actions = {
             "analyze_tournament": summary["analyzed"],
             "search_web": summary["webSearched"],
+            "search_domestic_content": not bool(summary["domesticResearchAvailable"]),
             "search_knowledge": summary["knowledgeSearched"],
         }
         if duplicate_actions.get(decision.action, False):
@@ -303,6 +305,20 @@ def build_report_graph(facts_tool: TournamentFactsTool, generator: ReportGenerat
             board["evidence_registry"].extend(registry.values())
             if not sources:
                 board["warnings"].append({"code": "WEB_RESEARCH_UNAVAILABLE", "message": "网络研究未返回可用资料。"})
+            return {"board": board}
+
+        if action == "search_domestic_content":
+            provider = state["decision"].provider
+            if not domestic or provider not in domestic.enabled_providers():
+                board["warnings"].append({"code": "DOMESTIC_RESEARCH_UNAVAILABLE", "message": "中文社区资料工具当前未启用。"})
+                return {"board": board}
+            query = state["decision"].query or " ".join(sorted({str(item.get("artistName", "")) for item in board["facts_snapshot"].get("entries", []) if item.get("artistName")}))[:240]
+            try:
+                sources = await invoke_with_budget(lambda: domestic.search(provider, query, "cultural_context"), name=f"report_domestic_{provider.lower()}", kind="tool", context=context, budget=budget, history=history)
+            except Exception:
+                sources = []
+            board["network_sources"] = list({item.get("sourceUrl"): item for item in [*board.get("network_sources", []), *sources] if item.get("sourceUrl")}.values())
+            if not sources: board["warnings"].append({"code": "DOMESTIC_RESEARCH_UNAVAILABLE", "message": "中文社区资料未返回可用来源。"})
             return {"board": board}
 
         if action == "search_knowledge":

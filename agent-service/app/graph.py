@@ -8,7 +8,7 @@ from langgraph.graph import END, StateGraph
 from .llm import CandidateDecision, DeepSeekCandidateSelector, _complete_external_query_plan, _deterministic_discovery_hints
 from .runtime import RunContext, RuntimeBudget, ToolCallRecord, invoke_with_budget
 from .schemas import CandidateItem, CandidatePoolRequest, CandidatePoolResult, IntentPolicy
-from .tools import KnowledgeSearchTool, MusicCatalogTool, WebSearchTool
+from .tools import DomesticContentResearchTool, KnowledgeSearchTool, MusicCatalogTool, SpotifyCatalogTool, WebSearchTool
 
 
 class State(TypedDict, total=False):
@@ -16,6 +16,7 @@ class State(TypedDict, total=False):
     recordings: list[dict]
     knowledge: list[dict]
     web_sources: list[dict]
+    domestic_sources: list[dict]
     discovery_hints: list[dict]
     external_queries: list[dict]
     ranked: list[dict]
@@ -47,6 +48,8 @@ def build_candidate_pool_graph(
     web: WebSearchTool,
     knowledge: KnowledgeSearchTool,
     selector: DeepSeekCandidateSelector,
+    domestic: DomesticContentResearchTool | None = None,
+    spotify: SpotifyCatalogTool | None = None,
 ):
     async def initialize(state: State):
         # Online-first pools may need several evidence pages and polite
@@ -55,7 +58,7 @@ def build_candidate_pool_graph(
         # the ReAct supervisor still chooses every next action.
         budget = RuntimeBudget(max_tool_calls=96, max_subagent_calls=64, deadline_seconds=900)
         return {
-            "recordings": [], "knowledge": [], "web_sources": [], "discovery_hints": [], "external_queries": [],
+            "recordings": [], "knowledge": [], "web_sources": [], "domestic_sources": [], "discovery_hints": [], "external_queries": [],
             "ranked": [], "summary": "", "action_history": [], "tool_history": [],
             "budget": budget, "run_context": budget.context(state["request"].request_id, state["request"].request_id, "candidate_generation"),
             "iteration": 0, "musicbrainz_called": False, "observations": [],
@@ -69,13 +72,17 @@ def build_candidate_pool_graph(
         target = request.size * 2
         last_observation = state["observations"][-1] if state["observations"] else {}
         no_gain = last_observation.get("status") == "failed" or (
-            last_observation.get("action") in {"search_catalog", "search_web", "resolve_musicbrainz"}
+            last_observation.get("action") in {"search_catalog", "search_web", "search_spotify", "search_domestic_content", "resolve_musicbrainz"}
             and last_observation.get("outputCount", last_observation.get("hintCount", 0)) == 0
         )
         stagnation_count = state.get("stagnation_count", 0) + 1 if no_gain else 0
         summary = {
             "catalogSearched": any(item["action"] == "search_catalog" for item in state["action_history"]),
             "webSearched": any(item["action"] == "search_web" for item in state["action_history"]),
+            "spotifyAvailable": bool(spotify and spotify.enabled),
+            "spotifySearched": any(item["action"] == "search_spotify" for item in state["action_history"]),
+            "domesticResearchAvailable": domestic.enabled_providers() if domestic else [],
+            "domesticSourceCount": len(state.get("domestic_sources", [])),
             "knowledgeSearched": any(item["action"] == "search_knowledge" for item in state["action_history"]),
             "musicBrainzCalled": state["musicbrainz_called"],
             "unresolvedHintCount": len(state["discovery_hints"]),
@@ -117,7 +124,7 @@ def build_candidate_pool_graph(
             decision = CandidateDecision(action="search_catalog" if not summary["catalogSearched"] else "search_web", reason_code="verified_candidates_below_target", decision_summary="艺人实体已解析，继续收集可核验歌曲")
         elif state.get("artist_seeds") and not state.get("artist_catalog_expanded") and len(state["recordings"]) < target:
             decision = CandidateDecision(action="expand_artist_catalog", reason_code="verified_candidates_below_target", decision_summary="已解析艺人作品不足，批量从 MusicBrainz 补充规范曲目")
-        elif state["discovery_hints"] and decision.action in {"search_web", "search_catalog", "rerank_candidates"}:
+        elif state["discovery_hints"] and decision.action in {"search_web", "search_spotify", "search_catalog", "rerank_candidates"}:
             # This is an evidence-consumption guard: a ReAct search decision cannot
             # discard already observed, unverified song evidence by searching again.
             decision = CandidateDecision(action="resolve_musicbrainz", reason_code="external_hints_require_resolution", decision_summary="已有可追溯网页线索，先进行 MusicBrainz 核验")
@@ -173,7 +180,7 @@ def build_candidate_pool_graph(
         # The Agent still owns ranking and submission; this guard only prevents
         # tool overrun after the requested evidence target is already met.
         if len(state["recordings"]) >= target and not (narrow_open_catalog and not summary["webSearched"]) and decision.action in {
-            "search_catalog", "expand_artist_catalog", "search_web", "resolve_musicbrainz",
+            "search_catalog", "expand_artist_catalog", "search_web", "search_spotify", "resolve_musicbrainz",
         }:
             decision = CandidateDecision(
                 action="rerank_candidates" if not state["ranked"] else "submit_candidates",
@@ -400,6 +407,60 @@ def build_candidate_pool_graph(
                 "discovery_rounds": state.get("discovery_rounds", 0) + 1,
             }
 
+        if action == "search_spotify":
+            if spotify is None or not spotify.enabled:
+                return {"tool_history": history, "observations": state["observations"] + [{"action": action, "status": "skipped", "reason": "not_configured", "outputCount": 0}]}
+            # User-approved, bounded search projection. No identity, historical
+            # messages, votes, secrets or internal URLs leave the service.
+            query = (state["decision"].query or request.preference_text).strip()[:300]
+            try:
+                sources = await invoke_with_budget(
+                    lambda: spotify.search_tracks(query), name="search_spotify", kind="tool", context=context, budget=budget, history=history,
+                )
+            except Exception as exc:
+                return {"tool_history": history, "observations": state["observations"] + [{"action": action, "status": "failed", "error": type(exc).__name__}]}
+            hints = [{
+                "title": item["title"], "artistName": item["artistName"], "sourceUrl": item["sourceUrl"],
+                "sourceTitle": item.get("sourceTitle", "Spotify 目录资料"),
+                "evidenceSnippet": item.get("summary", "Spotify 目录资料")[:200],
+                "queryPurpose": "spotify_catalog", "trustState": "DISCOVERY_HINT",
+            } for item in sources if item.get("title") and item.get("artistName") and item.get("sourceUrl") and _hint_allowed(item["artistName"], state.get("intent_policy"))]
+            return {
+                "web_sources": _merge_sources(state["web_sources"], sources),
+                "discovery_hints": _merge_hints(state["discovery_hints"], hints), "tool_history": history,
+                "observations": state["observations"] + [{"action": action, "status": "success", "query": query, "sourceCount": len(sources), "hintCount": len(hints)}],
+                "discovery_rounds": state.get("discovery_rounds", 0) + 1,
+            }
+
+        if action == "search_domestic_content":
+            provider = state["decision"].provider
+            if not domestic or provider not in domestic.enabled_providers():
+                return {"tool_history": history, "observations": state["observations"] + [{"action": action, "status": "failed", "error": "PROVIDER_DISABLED"}]}
+            query = state["decision"].query or request.preference_text
+            try:
+                sources = await invoke_with_budget(
+                    lambda: domestic.search(provider, query, "candidate_discovery"),
+                    name=f"search_domestic_{provider.lower()}", kind="tool", context=context, budget=budget, history=history,
+                )
+                hints = await invoke_with_budget(
+                    lambda: selector.extract_discovery_hints(request.preference_text, sources),
+                    name="extract_domestic_song_hints", kind="subagent", context=context, budget=budget, history=history, timeout_seconds=25,
+                )
+            except Exception as exc:
+                return {"tool_history": history, "observations": state["observations"] + [{"action": action, "status": "failed", "error": type(exc).__name__}]}
+            accepted = [{
+                "title": hint.title, "artistName": hint.artist_name, "sourceUrl": hint.source_url,
+                "sourceTitle": hint.source_title, "evidenceSnippet": hint.evidence_snippet,
+                "queryPurpose": hint.query_purpose, "trustState": "DISCOVERY_HINT",
+            } for hint in hints if _hint_allowed(hint.artist_name, state.get("intent_policy")) and _hint_evidence_is_observed(hint, sources)]
+            return {
+                "domestic_sources": _merge_sources(state.get("domestic_sources", []), sources),
+                "web_sources": _merge_sources(state["web_sources"], sources),
+                "discovery_hints": _merge_hints(state["discovery_hints"], accepted), "tool_history": history,
+                "observations": state["observations"] + [{"action": action, "status": "success", "provider": provider, "sourceCount": len(sources), "hintCount": len(accepted)}],
+                "discovery_rounds": state.get("discovery_rounds", 0) + 1,
+            }
+
         if action == "resolve_musicbrainz":
             try:
                 resolved = await invoke_with_budget(
@@ -498,6 +559,8 @@ def _normalize_decision_reason(decision: CandidateDecision) -> CandidateDecision
         "expand_artist_catalog": {"verified_candidates_below_active_size", "verified_candidates_below_target"},
         "search_knowledge": {"local_scope_exhausted", "cross_artist_expansion_allowed", "verified_candidates_below_target"},
         "search_web": {"local_scope_exhausted", "cross_artist_expansion_allowed", "verified_candidates_below_active_size", "verified_candidates_below_target"},
+        "search_spotify": {"local_scope_exhausted", "cross_artist_expansion_allowed", "verified_candidates_below_active_size", "verified_candidates_below_target"},
+        "search_domestic_content": {"local_scope_exhausted", "cross_artist_expansion_allowed", "verified_candidates_below_target"},
         "resolve_musicbrainz": {"external_hints_require_resolution"},
         "rerank_candidates": {"candidate_pool_requires_rerank"},
         "submit_candidates": {"candidate_pool_ready_for_validation", "budget_or_stagnation_limit_reached"},
@@ -513,6 +576,8 @@ def _normalize_decision_reason(decision: CandidateDecision) -> CandidateDecision
         "expand_artist_catalog": "verified_candidates_below_target",
         "search_knowledge": "local_scope_exhausted",
         "search_web": "cross_artist_expansion_allowed",
+        "search_spotify": "cross_artist_expansion_allowed",
+        "search_domestic_content": "cross_artist_expansion_allowed",
         "resolve_musicbrainz": "external_hints_require_resolution",
         "rerank_candidates": "candidate_pool_requires_rerank",
         "submit_candidates": "candidate_pool_ready_for_validation",

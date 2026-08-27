@@ -33,7 +33,7 @@ public class PreferenceReportController {
   }
 
   @PostMapping("/tournaments/{tournamentId}/preference-report")
-  ResponseEntity<Map<String,Object>> create(@PathVariable UUID tournamentId, @RequestBody(required=false) CreateBody body, HttpServletRequest request) {
+  @Transactional ResponseEntity<Map<String,Object>> create(@PathVariable UUID tournamentId, @RequestBody(required=false) CreateBody body, HttpServletRequest request) {
     var guest=guest(request); var tournament=ownedCompletedTournament(tournamentId, guest.getId());
     var latest=reports.findByTournament_IdOrderByVersionNumberDesc(tournamentId).stream().findFirst().orElse(null);
     boolean force=body!=null && body.force();
@@ -41,12 +41,12 @@ public class PreferenceReportController {
     if(latest!=null && (latest.getStatus()==PreferenceReportStatus.PENDING || latest.getStatus()==PreferenceReportStatus.RUNNING) && !force) return ResponseEntity.accepted().body(view(latest));
     int version=latest==null?1:latest.getVersionNumber()+1;
     var report=reports.save(TournamentPreferenceReport.pending(UUID.randomUUID(),tournament,version));
-    service.startAsync(report.getId(),tournamentId,guest.getId(),version);
+    service.enqueue(report.getId(),tournamentId,guest.getId(),version,request.getHeader("X-Request-Id"));
     return ResponseEntity.accepted().body(view(report));
   }
 
   @PostMapping(value="/tournaments/{tournamentId}/preference-report:stream", produces=MediaType.TEXT_EVENT_STREAM_VALUE)
-  StreamingResponseBody createStream(@PathVariable UUID tournamentId, @RequestBody(required=false) CreateBody body, HttpServletRequest request) {
+  @Transactional StreamingResponseBody createStream(@PathVariable UUID tournamentId, @RequestBody(required=false) CreateBody body, HttpServletRequest request) {
     var guest=guest(request); var tournament=ownedCompletedTournament(tournamentId, guest.getId());
     var latest=reports.findByTournament_IdOrderByVersionNumberDesc(tournamentId).stream().findFirst().orElse(null);
     boolean force=body!=null && body.force();
@@ -56,14 +56,14 @@ public class PreferenceReportController {
         catch (Exception ex) { safeWriteSse(output, "error", "{\"code\":\"REPORT_STREAM_UNAVAILABLE\",\"message\":\"报告暂不可用，请稍后重试\"}"); }
       };
     }
-    int version=latest==null?1:latest.getVersionNumber()+1;
-    var report=reports.save(TournamentPreferenceReport.pending(UUID.randomUUID(),tournament,version));
+    final TournamentPreferenceReport report;
+    if(latest!=null && (latest.getStatus()==PreferenceReportStatus.PENDING || latest.getStatus()==PreferenceReportStatus.RUNNING) && !force) report=latest;
+    else { int version=latest==null?1:latest.getVersionNumber()+1; report=reports.save(TournamentPreferenceReport.pending(UUID.randomUUID(),tournament,version)); service.enqueue(report.getId(),tournamentId,guest.getId(),version,request.getHeader("X-Request-Id")); }
     return output -> {
       try {
-        service.generateStreaming(report.getId(), tournamentId, guest.getId(), version, event -> safeWriteSse(output, event.event(), event.data()));
-        var completed=reports.findById(report.getId()).orElseThrow();
-        if (completed.getStatus()==PreferenceReportStatus.READY) writeSse(output, "result", objectMapper.writeValueAsString(view(completed)));
-        else writeSse(output, "error", "{\"code\":\"REPORT_WORKFLOW_FAILED\",\"message\":\"报告暂时无法生成，请稍后重试\"}");
+        PreferenceReportStatus previous=null; long deadline=System.currentTimeMillis()+330_000L;
+        while(System.currentTimeMillis()<deadline){ var current=reports.findById(report.getId()).orElseThrow(); if(current.getStatus()!=previous){safeWriteSse(output,"status",objectMapper.writeValueAsString(Map.of("reportId",current.getId(),"status",current.getStatus())));previous=current.getStatus();} if(current.getStatus()==PreferenceReportStatus.READY){writeSse(output,"result",objectMapper.writeValueAsString(view(current)));return;} if(current.getStatus()==PreferenceReportStatus.FAILED){writeSse(output,"error","{\"code\":\"REPORT_WORKFLOW_FAILED\",\"message\":\"报告暂时无法生成，请稍后重试\"}");return;} Thread.sleep(900); }
+        writeSse(output,"error","{\"code\":\"REPORT_WAIT_TIMEOUT\",\"message\":\"任务仍在处理中，请稍后查询报告\"}");
       } catch (Exception ignored) { safeWriteSse(output, "error", "{\"code\":\"REPORT_STREAM_UNAVAILABLE\",\"message\":\"报告过程暂不可用，请稍后重试\"}"); }
     };
   }

@@ -1,7 +1,14 @@
 import json
 import logging
+import os
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from .graph import build_candidate_pool_graph
 from .conversation_graph import ConversationReActRuntime
 from .report_graph import build_report_graph
@@ -10,22 +17,40 @@ from .report_schemas import TournamentReportRequest
 from .llm import DeepSeekCandidateSelector
 from .schemas import CandidatePoolRequest, ConversationAgentRequest
 from .settings import settings
-from .tools import KnowledgeSearchTool, MusicCatalogTool, TournamentFactsTool, WebSearchTool
+from .tools import DomesticContentResearchTool, KnowledgeSearchTool, MusicCatalogTool, SpotifyCatalogTool, TournamentFactsTool, WebSearchTool
 
 app = FastAPI(title="IndieSoundQuest Agent Service", version="0.1.0")
+if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+    provider = TracerProvider(resource=Resource.create({"service.name": "indiesoundquest-agent"}))
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(provider)
+FastAPIInstrumentor.instrument_app(app)
 # Reuse Uvicorn's configured handler so structured workflow summaries are emitted
 # reliably in containers without adding a second global logging configuration.
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.INFO)
 web_search = WebSearchTool(tavily_api_key=settings.tavily_api_key, bocha_api_key=settings.bocha_api_key)
-graph = build_candidate_pool_graph(MusicCatalogTool(settings.java_internal_base_url, settings.agent_internal_service_token), web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), DeepSeekCandidateSelector())
-report_graph = build_report_graph(TournamentFactsTool(settings.java_internal_base_url, settings.agent_internal_service_token), ReportGenerator(), web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection))
+domestic_research = DomesticContentResearchTool(
+    zhihu_enabled=settings.zhihu_research_enabled,
+    bilibili_enabled=settings.bilibili_research_enabled,
+    douban_enabled=settings.douban_research_enabled,
+    zhihu_base_url=settings.zhihu_research_base_url,
+    bilibili_base_url=settings.bilibili_research_base_url,
+    douban_base_url=settings.douban_research_base_url,
+    timeout_seconds=settings.domestic_research_timeout_seconds,
+    max_sources=settings.domestic_research_max_sources,
+)
+spotify_catalog = SpotifyCatalogTool(settings.spotify_client_id, settings.spotify_client_secret, settings.spotify_market)
+graph = build_candidate_pool_graph(MusicCatalogTool(settings.java_internal_base_url, settings.agent_internal_service_token), web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), DeepSeekCandidateSelector(), domestic_research, spotify_catalog if settings.spotify_discovery_enabled else None)
+report_graph = build_report_graph(TournamentFactsTool(settings.java_internal_base_url, settings.agent_internal_service_token), ReportGenerator(), web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), domestic_research)
 conversation_runtime = ConversationReActRuntime(web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection))
 
 _ACTION_PROGRESS = {
     "understand_preference": ("understand_preference", "正在理解你的音乐偏好"),
     "resolve_named_entities": ("resolve_artist", "正在核验你提到的艺人"),
     "search_web": ("discover_web", "正在从公开音乐资料中寻找线索"),
+    "search_spotify": ("discover_spotify", "正在从 Spotify 目录补充国际音乐线索"),
+    "search_domestic_content": ("discover_domestic", "正在补充中文社区音乐资料"),
     "resolve_musicbrainz": ("verify_musicbrainz", "正在通过 MusicBrainz 核验歌曲身份"),
     "search_catalog": ("search_catalog", "正在整理已核验的本地目录"),
     "expand_artist_catalog": ("expand_artist_catalog", "正在批量核验已提及艺人的作品"),
@@ -89,7 +114,7 @@ async def verify_caller(authorization: str = Header(default="")):
 async def live(): return {"status":"UP"}
 
 @app.get("/health/ready")
-async def ready(): return {"status":"UP", "catalog":"configured", "modelProvider": settings.llm_provider, "webSearch": bool(settings.tavily_api_key)}
+async def ready(): return {"status":"UP", "catalog":"configured", "modelProvider": settings.llm_provider, "webSearch": bool(settings.tavily_api_key), "spotifyDiscovery": settings.spotify_discovery_enabled and spotify_catalog.enabled, "domesticResearch": {"zhihu": settings.zhihu_research_enabled, "bilibili": settings.bilibili_research_enabled, "douban": settings.douban_research_enabled}}
 
 @app.post("/internal/v1/workflows/conversation:stream", dependencies=[Depends(verify_caller)])
 async def conversation(request: ConversationAgentRequest, x_request_id: str = Header()):

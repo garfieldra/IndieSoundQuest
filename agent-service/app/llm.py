@@ -48,7 +48,7 @@ class RerankedCandidates(BaseModel):
 
 class CandidateDecision(BaseModel):
     action: Literal[
-        "understand_preference", "resolve_named_entities", "request_clarification", "search_catalog", "expand_artist_catalog", "search_knowledge", "search_web",
+        "understand_preference", "resolve_named_entities", "request_clarification", "search_catalog", "expand_artist_catalog", "search_knowledge", "search_web", "search_spotify", "search_domestic_content",
         "resolve_musicbrainz", "rerank_candidates",
         "submit_candidates", "finish_insufficient",
     ]
@@ -61,6 +61,7 @@ class CandidateDecision(BaseModel):
     ]
     decision_summary: str = Field(min_length=4, max_length=120)
     query: str | None = Field(default=None, max_length=300)
+    provider: Literal["ZHIHU", "BILIBILI", "DOUBAN"] | None = None
 
 
 class DiscoveryHint(BaseModel):
@@ -195,7 +196,7 @@ class DeepSeekCandidateSelector:
 用户兴趣：{preference}
 当前规范候选数：{active_count}
 黑板摘要：{json.dumps(state_summary, ensure_ascii=False)}
-动作白名单：understand_preference, resolve_named_entities, request_clarification, search_catalog, expand_artist_catalog, search_knowledge, search_web, resolve_musicbrainz, rerank_candidates, submit_candidates, finish_insufficient。
+动作白名单：understand_preference, resolve_named_entities, request_clarification, search_catalog, expand_artist_catalog, search_knowledge, search_web, search_spotify, search_domestic_content, resolve_musicbrainz, rerank_candidates, submit_candidates, finish_insufficient。
 reasonCode 白名单：intent_policy_missing, locked_artist_identity_unresolved, verified_candidates_below_active_size, verified_candidates_below_target, local_scope_exhausted, cross_artist_expansion_allowed, external_hints_require_resolution, candidate_pool_requires_rerank, candidate_pool_ready_for_validation, budget_or_stagnation_limit_reached。
 规则：没有 intentPolicy 时先理解偏好；命名艺人尚未解析时优先 resolve_named_entities；存在未确认歧义时必须 request_clarification；对已解析的明确艺人，可自主选择 expand_artist_catalog 从 MusicBrainz 批量发现规范曲目；非锁定模式下应把明确艺人作为起点，并通过 search_web 主动寻找相近艺人、专辑或歌曲，再经 MusicBrainz 核验；最终歌曲必须有内部 recording ID；本地目录只是缓存补充；ARTIST_LOCKED 不能扩展到允许集合外；未达到等量 reserve 时不得提交 ready_for_confirmation；不要重复无收益动作。
 仅输出 JSON：{{"action":"...","reason_code":"...","decision_summary":"不含思维链的简短理由","query":"可选检索词"}}"""

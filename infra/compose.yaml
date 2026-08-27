@@ -29,12 +29,17 @@ services:
       SPRING_DATASOURCE_USERNAME: ${MYSQL_USER}
       SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD}
       SPRING_DATA_REDIS_URL: redis://redis:6379/0
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_DEFAULT_USER:-indiesoundquest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-indiesoundquest}
       AGENT_INTERNAL_BASE_URL: http://agent-service:8000
       AGENT_INTERNAL_SERVICE_TOKEN: ${AGENT_INTERNAL_SERVICE_TOKEN}
     depends_on:
       mysql:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://localhost:8080/actuator/health | grep -q '\"status\":\"UP\"'"]
@@ -57,10 +62,24 @@ services:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       BOCHA_API_KEY: ${BOCHA_API_KEY:-}
+      SPOTIFY_DISCOVERY_ENABLED: ${SPOTIFY_DISCOVERY_ENABLED:-false}
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
+      SPOTIFY_MARKET: ${SPOTIFY_MARKET:-}
       MILVUS_URI: ${MILVUS_URI}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL}
       HF_HOME: /cache/huggingface
       FASTEMBED_CACHE_PATH: /cache/fastembed
+      ZHIHU_RESEARCH_ENABLED: ${ZHIHU_RESEARCH_ENABLED:-false}
+      BILIBILI_RESEARCH_ENABLED: ${BILIBILI_RESEARCH_ENABLED:-false}
+      DOUBAN_RESEARCH_ENABLED: ${DOUBAN_RESEARCH_ENABLED:-false}
+      ZHIHU_RESEARCH_BASE_URL: http://zhihu-research:8091
+      BILIBILI_RESEARCH_BASE_URL: http://bilibili-research:8092
+      DOUBAN_RESEARCH_BASE_URL: http://douban-research:8093
+      DOMESTIC_RESEARCH_MAX_CALLS: ${DOMESTIC_RESEARCH_MAX_CALLS:-4}
+      DOMESTIC_RESEARCH_TIMEOUT_SECONDS: ${DOMESTIC_RESEARCH_TIMEOUT_SECONDS:-12}
+      DOMESTIC_RESEARCH_MAX_SOURCES: ${DOMESTIC_RESEARCH_MAX_SOURCES:-8}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
     depends_on:
       java-service:
         condition: service_healthy
@@ -71,6 +90,34 @@ services:
       - public
     volumes:
       - agent-model-cache:/cache
+
+  zhihu-research:
+    profiles: ["domestic-research"]
+    build:
+      context: ../zhihu-research
+    environment:
+      # Official Zhihu Open Platform credential. Keep it in an ignored .env or
+      # deployment secret store; the agent service never receives this value.
+      ZHIHU_ACCESS_SECRET: ${ZHIHU_ACCESS_SECRET:-}
+    networks:
+      - internal
+      - research-egress
+
+  bilibili-research:
+    profiles: ["domestic-research"]
+    build:
+      context: ../bilibili-research
+    networks:
+      - internal
+      - research-egress
+
+  douban-research:
+    profiles: ["domestic-research"]
+    build:
+      context: ../douban-research
+    networks:
+      - internal
+      - research-egress
 
   mysql:
     image: mysql:8.4
@@ -102,6 +149,42 @@ services:
       - redis-data:/data
     networks:
       - internal
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-indiesoundquest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-indiesoundquest}
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - internal
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes: ["./observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro"]
+    networks: [internal]
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes: ["./observability/tempo.yaml:/etc/tempo.yaml:ro", "tempo-data:/tmp/tempo"]
+    networks: [internal]
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes: ["./observability/prometheus.yaml:/etc/prometheus/prometheus.yml:ro"]
+    networks: [internal]
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports: ["3000:3000"]
+    depends_on: [prometheus, tempo]
+    networks: [public, internal]
 
   etcd:
     image: quay.io/coreos/etcd:v3.5.5
@@ -143,6 +226,9 @@ networks:
   public:
   internal:
     internal: true
+  # Research sidecars need DNS/HTTPS egress for public read-only sources, but
+  # expose no host ports and do not share the application public network.
+  research-egress:
 
 volumes:
   mysql-data:
@@ -151,3 +237,5 @@ volumes:
   minio-data:
   milvus-data:
   agent-model-cache:
+  rabbitmq-data:
+  tempo-data:
