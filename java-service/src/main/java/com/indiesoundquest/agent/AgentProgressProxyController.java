@@ -13,6 +13,8 @@ import java.time.Duration;
 import java.util.*;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
@@ -20,6 +22,7 @@ import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBo
 @RestController
 @RequestMapping("/api/v1/agent-runs")
 public class AgentProgressProxyController {
+  private static final Logger log=LoggerFactory.getLogger(AgentProgressProxyController.class);
   private final ObjectMapper json; private final String baseUrl, token; private final CandidatePoolApplicationService candidatePools;
   private final HttpClient client=HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).connectTimeout(Duration.ofSeconds(5)).build();
   public AgentProgressProxyController(ObjectMapper json, CandidatePoolApplicationService candidatePools, @Value("${agent.internal.base-url:http://agent-service:8000}") String baseUrl,@Value("${agent.internal.service-token}") String token){this.json=json;this.candidatePools=candidatePools;this.baseUrl=baseUrl;this.token=token;}
@@ -38,7 +41,10 @@ public class AgentProgressProxyController {
       try(var lines=new BufferedReader(new java.io.InputStreamReader(response.body()))){String line; String event=null,data=null; while((line=lines.readLine())!=null){
         if(line.startsWith("event: ")) event=line.substring(7).trim(); else if(line.startsWith("data: ")) data=line.substring(6).trim(); else if(line.isEmpty()) { if(("progress".equals(event) || "plan_updated".equals(event)) && data!=null) write(output,event,data); else if("result".equals(event) && data!=null) write(output,"result",json.writeValueAsString(candidatePools.fromAgentResult(requestId,size,json.readTree(data),seeds))); else if("error".equals(event) && data!=null) write(output,"error",data); event=null; data=null; }
       }}
-    }catch(Exception ex){try{output.write(("event: error\ndata: {\"code\":\"AGENT_STREAM_UNAVAILABLE\",\"message\":\"探索过程暂不可用，请稍后重试\"}\n\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));output.flush();}catch(Exception ignored){}}
+    }catch(Exception ex){
+      log.warn("Candidate SSE relay failed requestId={} type={} message={}",requestId,ex.getClass().getSimpleName(),ex.getMessage());
+      try{output.write(("event: error\ndata: {\"code\":\"AGENT_STREAM_UNAVAILABLE\",\"message\":\"候选整理超时或被外部资料源中断；已完成的线索不会丢失，请重试或缩小赛事规模。\"}\n\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));output.flush();}catch(Exception ignored){}
+    }
   }
   private void write(OutputStream output,String event,String data) throws java.io.IOException { output.write(("event: "+event+"\ndata: "+data+"\n\n").getBytes(java.nio.charset.StandardCharsets.UTF_8)); output.flush(); }
   record CandidateBody(int size,String preferenceText,List<UUID> seedArtistIds,List<Map<String,Object>> confirmedArtists){}

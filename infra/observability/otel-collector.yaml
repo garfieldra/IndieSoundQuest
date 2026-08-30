@@ -1,8 +1,13 @@
 receivers:
   otlp:
     protocols:
-      grpc: {}
-      http: {}
+      # Collector runs in its own container.  Explicit wildcard listeners are
+      # required: the upstream defaults bind to localhost, which makes the
+      # endpoint invisible to Java/Python containers on the internal network.
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
 exporters:
   otlp/tempo:
     endpoint: tempo:4317

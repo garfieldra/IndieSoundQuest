@@ -157,9 +157,13 @@ services:
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-indiesoundquest}
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 10s
-      timeout: 5s
+      # The Erlang diagnostics process can take several seconds while the
+      # broker is recovering.  A 5-second/10-second loop piles up diagnostics
+      # processes and can itself make RabbitMQ unhealthy.
+      interval: 30s
+      timeout: 20s
       retries: 12
+      start_period: 30s
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
     networks:
