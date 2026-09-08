@@ -15,9 +15,10 @@ from .report_graph import build_report_graph
 from .report_llm import ReportGenerator
 from .report_schemas import TournamentReportRequest
 from .llm import DeepSeekCandidateSelector
-from .schemas import CandidatePoolRequest, ConversationAgentRequest
+from .schemas import CandidatePoolRequest, ConversationAgentRequest, ConversationResumeRequest
 from .settings import settings
 from .tools import DomesticContentResearchTool, KnowledgeSearchTool, MusicCatalogTool, SpotifyCatalogTool, TournamentFactsTool, WebSearchTool
+from .registry import skill_registry, tool_registry
 
 app = FastAPI(title="IndieSoundQuest Agent Service", version="0.1.0")
 if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
@@ -43,7 +44,7 @@ domestic_research = DomesticContentResearchTool(
 spotify_catalog = SpotifyCatalogTool(settings.spotify_client_id, settings.spotify_client_secret, settings.spotify_market)
 graph = build_candidate_pool_graph(MusicCatalogTool(settings.java_internal_base_url, settings.agent_internal_service_token), web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), DeepSeekCandidateSelector(), domestic_research, spotify_catalog if settings.spotify_discovery_enabled else None)
 report_graph = build_report_graph(TournamentFactsTool(settings.java_internal_base_url, settings.agent_internal_service_token), ReportGenerator(), web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), domestic_research)
-conversation_runtime = ConversationReActRuntime(web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection))
+conversation_runtime = ConversationReActRuntime(web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), tool_registry, skill_registry, graph)
 
 _ACTION_PROGRESS = {
     "understand_preference": ("understand_preference", "正在理解你的音乐偏好"),
@@ -60,6 +61,8 @@ _ACTION_PROGRESS = {
     "draft_response": ("draft_response", "正在整理这次音乐探索的回应"),
     "clarify": ("clarify", "正在确认这次探索还需要哪些信息"),
     "propose_tournament": ("propose_tournament", "正在准备歌曲世界杯入口"),
+    "build_candidate_pool": ("build_candidate_pool", "正在自主构建并核验歌曲世界杯候选池"),
+    "generate_exploration_report": ("generate_exploration_report", "正在根据当前对话生成探索报告"),
     "respond": ("draft_response", "正在整理这次音乐探索的回应"),
     "critique_report": ("review_report", "正在核验报告事实与推荐来源"),
     "rerank_candidates": ("organize_candidates", "正在并行重排候选，并生成入选理由"),
@@ -83,7 +86,7 @@ def _plan_event(request_id, state: dict, workflow: str) -> str:
         items = [
             {"id":"understand","title":"理解这次音乐问题","status":status("understand", {"understand_preference"}),"detail":"结合本次提问与已有对话上下文"},
             {"id":"research","title":"按需查找音乐资料","status":status("research", {"search_web", "search_knowledge"}),"detail":"仅在回答或探索确有需要时调用工具"},
-            {"id":"decide","title":"决定下一步探索方式","status":status("decide", {"clarify", "propose_tournament", "respond"}),"detail":"继续对话、澄清方向或进入歌曲世界杯"},
+            {"id":"decide","title":"决定下一步探索方式","status":status("decide", {"clarify", "propose_tournament", "build_candidate_pool", "generate_exploration_report", "respond"}),"detail":"继续对话、生成探索报告或进入歌曲世界杯"},
         ]
         goal, summary = "推进这次音乐探索对话", "Agent 正在根据对话状态自主决定下一步。"
     elif workflow == "candidate":
@@ -114,7 +117,7 @@ async def verify_caller(authorization: str = Header(default="")):
 async def live(): return {"status":"UP"}
 
 @app.get("/health/ready")
-async def ready(): return {"status":"UP", "catalog":"configured", "modelProvider": settings.llm_provider, "webSearch": bool(settings.tavily_api_key), "spotifyDiscovery": settings.spotify_discovery_enabled and spotify_catalog.enabled, "domesticResearch": {"zhihu": settings.zhihu_research_enabled, "bilibili": settings.bilibili_research_enabled, "douban": settings.douban_research_enabled}}
+async def ready(): return {"status":"UP", "catalog":"configured", "modelProvider": settings.llm_provider, "webSearch": bool(settings.tavily_api_key), "spotifyDiscovery": settings.spotify_discovery_enabled and spotify_catalog.enabled, "toolRegistry": tool_registry.summaries(), "skills": skill_registry.summaries(), "domesticResearch": {"zhihu": settings.zhihu_research_enabled, "bilibili": settings.bilibili_research_enabled, "douban": settings.douban_research_enabled}}
 
 @app.post("/internal/v1/workflows/conversation:stream", dependencies=[Depends(verify_caller)])
 async def conversation(request: ConversationAgentRequest, x_request_id: str = Header()):
@@ -140,6 +143,22 @@ async def conversation(request: ConversationAgentRequest, x_request_id: str = He
         except Exception:
             logger.exception("conversation workflow failed")
             yield f"event: error\ndata: {json.dumps({'code':'CONVERSATION_UNAVAILABLE','message':'这次音乐对话暂时无法完成，请稍后重试'},ensure_ascii=False)}\n\n"
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+@app.post("/internal/v1/workflows/conversation:resume", dependencies=[Depends(verify_caller)])
+async def conversation_resume(request: ConversationResumeRequest, x_request_id: str = Header()):
+    if str(request.request_id) != x_request_id: raise HTTPException(400, "X-Request-Id must match requestId")
+    async def events():
+        yield _progress(request.request_id, "build_candidate_pool", 0)
+        try:
+            confirmed = request.confirmed_artists
+            result = await conversation_runtime.run_candidate_pool(request.guest_id, request.preference_text, request.pool_size, confirmed)
+            yield f"event: progress\ndata: {json.dumps({'runId': str(request.request_id), 'phase': 'build_candidate_pool', 'status': 'running', 'message': '正在根据确认结果继续构建候选池', 'elapsedMs': 0}, ensure_ascii=False)}\n\n"
+            logger.info("conversation resume completed request_id=%s trace=%s", request.request_id, result.trace_summary)
+            yield f"event: result\ndata: {result.model_dump_json(by_alias=True)}\n\n"
+        except Exception:
+            logger.exception("conversation resume failed")
+            yield f"event: error\ndata: {json.dumps({'code':'CONVERSATION_RESUME_UNAVAILABLE','message':'澄清后的候选池暂时无法继续，请稍后重试'},ensure_ascii=False)}\n\n"
     return StreamingResponse(events(), media_type="text/event-stream")
 
 @app.post("/internal/v1/workflows/candidate-pool:stream", dependencies=[Depends(verify_caller)])

@@ -91,6 +91,26 @@ services:
     volumes:
       - agent-model-cache:/cache
 
+  agent-worker:
+    build:
+      context: ../agent-service
+    command: ["python", "-m", "app.worker"]
+    environment:
+      JAVA_INTERNAL_BASE_URL: http://java-service:8080
+      AGENT_INTERNAL_SERVICE_TOKEN: ${AGENT_INTERNAL_SERVICE_TOKEN}
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-indiesoundquest}:${RABBITMQ_DEFAULT_PASS:-indiesoundquest}@rabbitmq/
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      BOCHA_API_KEY: ${BOCHA_API_KEY:-}
+      MILVUS_URI: ${MILVUS_URI}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+    depends_on:
+      java-service: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+      milvus: {condition: service_started}
+    networks: [internal, public]
+    volumes: [agent-model-cache:/cache]
+
   zhihu-research:
     profiles: ["domestic-research"]
     build:
@@ -166,6 +186,7 @@ services:
       start_period: 30s
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
     networks:
       - internal
 
@@ -188,6 +209,9 @@ services:
     image: grafana/grafana:11.2.0
     ports: ["3000:3000"]
     depends_on: [prometheus, tempo]
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
     networks: [public, internal]
 
   etcd:

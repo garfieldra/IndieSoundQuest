@@ -18,6 +18,8 @@ java-service/.mvn/wrapper/maven-wrapper.jar
 *.class
 
 # Python
+__pycache__/
+*.py[cod]
 agent-service/.venv/
 agent-service/__pycache__/
 agent-service/**/__pycache__/

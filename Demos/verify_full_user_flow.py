@@ -155,7 +155,9 @@ def verify(base_url: str, preference: str, size: int) -> None:
     report = report_view.get("report") or {}
     assert report.get("songRecommendations"), report
     assert report.get("artistRecommendations"), report
-    assert any(event in {"progress", "plan_updated"} for event, _ in report_events), report_events
+    # The report now runs through Outbox/RabbitMQ.  The SSE stream exposes
+    # recoverable task state rather than proxying the Agent's private progress.
+    assert any(event == "status" for event, _ in report_events), report_events
 
     persisted, _ = client.request("GET", f"/api/v1/tournaments/{tournament_id}/preference-report")
     assert persisted["status"] == "READY", persisted
@@ -172,7 +174,7 @@ def verify(base_url: str, preference: str, size: int) -> None:
         "size": size,
         "completedVotes": detail["completedVoteCount"],
         "reportId": report_view["reportId"],
-        "reportProgressEvents": sum(1 for event, _ in report_events if event in {"progress", "plan_updated"}),
+        "reportStatusEvents": sum(1 for event, _ in report_events if event == "status"),
         "recommendationCounts": {"songs": len(report["songRecommendations"]), "artists": len(report["artistRecommendations"])},
     }, ensure_ascii=False))
 

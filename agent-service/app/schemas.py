@@ -21,20 +21,35 @@ class CandidatePoolRequest(ApiModel):
     seed_artist_ids: list[UUID] = Field(default_factory=list)
     confirmed_artists: list["ConfirmedArtist"] = Field(default_factory=list, max_length=8)
     exclude_recording_ids: list[UUID] = Field(default_factory=list)
+    recent_feedback: list[str] = Field(default_factory=list, max_length=12)
 
 
 class ConversationAgentRequest(ApiModel):
     request_id: UUID
     agent_run_id: UUID
     conversation_id: UUID
+    guest_id: str = Field(min_length=1, max_length=80)
     user_message: str = Field(min_length=1, max_length=2000)
     summary: str = Field(default="", max_length=4000)
     recent_messages: list[dict] = Field(default_factory=list, max_length=12)
     confirmed_memories: list[str] = Field(default_factory=list, max_length=20)
+    recent_feedback: list[str] = Field(default_factory=list, max_length=12)
+    forced_action: str | None = Field(default=None, max_length=40)
+    pool_size: Literal[16, 32] | None = None
+
+
+class ConversationResumeRequest(ApiModel):
+    request_id: UUID
+    agent_run_id: UUID
+    conversation_id: UUID
+    guest_id: str = Field(min_length=1, max_length=80)
+    preference_text: str = Field(min_length=3, max_length=2000)
+    pool_size: Literal[16, 32] = 32
+    confirmed_artists: list["ConfirmedArtist"] = Field(default_factory=list, max_length=8)
 
 
 class ConversationCardIntent(ApiModel):
-    message_type: Literal["CLARIFICATION_CARD", "TOURNAMENT_CARD", "RECOMMENDATION_CARD"]
+    message_type: Literal["CLARIFICATION_CARD", "CANDIDATE_POOL_CARD", "TOURNAMENT_CARD", "REPORT_CARD", "RECOMMENDATION_CARD"]
     card_type: str = Field(min_length=1, max_length=40)
     payload: dict = Field(default_factory=dict)
 

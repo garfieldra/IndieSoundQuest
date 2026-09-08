@@ -52,6 +52,10 @@ def build_candidate_pool_graph(
     spotify: SpotifyCatalogTool | None = None,
 ):
     async def initialize(state: State):
+        request = state["request"]
+        if request.recent_feedback:
+            feedback = "；".join(request.recent_feedback[:8])
+            request = request.model_copy(update={"preference_text": request.preference_text + "\n近期反馈：" + feedback})
         # Online-first pools may need several evidence pages and polite
         # MusicBrainz batches before 16 active + 16 reserve records are
         # available.  This is a runtime budget (not a prescribed workflow):
@@ -60,11 +64,12 @@ def build_candidate_pool_graph(
         return {
             "recordings": [], "knowledge": [], "web_sources": [], "domestic_sources": [], "discovery_hints": [], "external_queries": [],
             "ranked": [], "summary": "", "action_history": [], "tool_history": [],
-            "budget": budget, "run_context": budget.context(state["request"].request_id, state["request"].request_id, "candidate_generation"),
+            "budget": budget, "run_context": budget.context(request.request_id, request.request_id, "candidate_generation"),
             "iteration": 0, "musicbrainz_called": False, "observations": [],
             "stagnation_count": 0,
             "entity_resolution_complete": False, "clarifications": [],
             "discovery_rounds": 0, "musicbrainz_rounds": 0, "preference_hypotheses": [], "artist_seeds": [], "artist_catalog_expanded": False,
+            "request": request,
         }
 
     async def supervisor(state: State):
@@ -308,7 +313,7 @@ def build_candidate_pool_graph(
                 return {"artist_catalog_expanded": True, "tool_history": history, "observations": state["observations"] + [{"action": action, "status": "failed", "error": type(exc).__name__}]}
             imported = [{
                 "id": str(item["recordingId"]), "title": item["title"], "artistName": item["artistName"],
-                "artistId": str(item.get("artistId") or ""), "albumTitle": item.get("albumTitle") or "", "coverStatus": item.get("coverStatus") or "PENDING",
+                "artistId": str(item.get("artistId") or ""), "albumTitle": item.get("albumTitle") or "", "coverUrl": item.get("coverUrl") or None, "coverStatus": item.get("coverStatus") or "PENDING",
                 "sourceUrl": item.get("sourceUrl"), "musicbrainzMbid": item.get("recordingMbid"), "catalogSource": item.get("catalogSource") or "EXTERNAL_VERIFIED", "trustState": "CATALOG_IMPORTED",
             } for item in resolved if item.get("status") == "RESOLVED" and item.get("recordingId") and item.get("recordingMbid") and _candidate_allowed(item, state.get("intent_policy"))]
             merged = _merge_recordings(state["recordings"], imported)
@@ -472,7 +477,7 @@ def build_candidate_pool_graph(
             imported = [
                 {
                     "id": str(item["recordingId"]), "title": item["title"], "artistName": item["artistName"],
-                    "artistId": str(item.get("artistId") or ""), "albumTitle": item.get("albumTitle") or "", "coverStatus": item.get("coverStatus") or "PENDING",
+                    "artistId": str(item.get("artistId") or ""), "albumTitle": item.get("albumTitle") or "", "coverUrl": item.get("coverUrl") or None, "coverStatus": item.get("coverStatus") or "PENDING",
                     "sourceUrl": item.get("sourceUrl"), "musicbrainzMbid": item.get("recordingMbid"),
                     "catalogSource": item.get("catalogSource") or "EXTERNAL_VERIFIED",
                     "trustState": "CATALOG_IMPORTED",

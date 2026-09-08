@@ -5,6 +5,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
+import com.indiesoundquest.redis.IdempotencyCacheService;
+import com.indiesoundquest.redis.TournamentStateCacheService;
 import com.indiesoundquest.tournament.domain.*;
 import com.indiesoundquest.tournament.repository.*;
 import java.util.*;
@@ -19,13 +21,15 @@ class TournamentCreationIdempotencyTest {
   private final VoteRepository votes = mock(VoteRepository.class);
   private final MusicPreferenceProfileService profiles = mock(MusicPreferenceProfileService.class);
   private final GuestSessionRepository guests = mock(GuestSessionRepository.class);
+  private final IdempotencyCacheService idempotency = mock(IdempotencyCacheService.class);
+  private final TournamentStateCacheService tournamentState = mock(TournamentStateCacheService.class);
   private TournamentApplicationService service;
   private GuestSession guest;
   private List<Recording> recordings;
 
   @BeforeEach
   void setUp() {
-    service = new TournamentApplicationService(tournaments, entries, matches, votes, profiles, guests);
+    service = new TournamentApplicationService(tournaments, entries, matches, votes, profiles, guests, idempotency, tournamentState);
     guest = new GuestSession(UUID.randomUUID(), "a".repeat(64));
     var artist = Artist.imported("测试艺人", "测试艺人", UUID.randomUUID().toString());
     recordings = new ArrayList<>();

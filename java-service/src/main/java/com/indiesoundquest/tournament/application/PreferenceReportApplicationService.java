@@ -5,32 +5,25 @@ import com.indiesoundquest.tournament.domain.TournamentPreferenceReport;
 import com.indiesoundquest.tournament.repository.TournamentPreferenceReportRepository;
 import com.indiesoundquest.async.AsyncOutboxEvent;
 import com.indiesoundquest.async.AsyncOutboxEventRepository;
-import java.net.URI;
-import java.net.http.*;
-import java.time.Duration;
+import com.indiesoundquest.agent.application.AgentRunApplicationService;
+import com.indiesoundquest.agent.domain.AgentRunEventType;
+import com.indiesoundquest.agent.domain.AgentRunType;
 import java.util.UUID;
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
-import java.util.function.Consumer;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 
 @Service
 public class PreferenceReportApplicationService {
   private final TournamentPreferenceReportRepository reports;
   private final AsyncOutboxEventRepository outbox;
+  private final AgentRunApplicationService agentRuns;
   private final ObjectMapper objectMapper;
-  private final HttpClient httpClient = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).connectTimeout(Duration.ofSeconds(5)).build();
-  private final String agentBaseUrl;
-  private final String agentToken;
-
-  public PreferenceReportApplicationService(TournamentPreferenceReportRepository reports, AsyncOutboxEventRepository outbox, ObjectMapper objectMapper,
-      @Value("${agent.internal.base-url:http://agent-service:8000}") String agentBaseUrl,
-      @Value("${agent.internal.service-token:change-me}") String agentToken) {
-    this.reports = reports; this.outbox=outbox; this.objectMapper = objectMapper; this.agentBaseUrl = agentBaseUrl; this.agentToken = agentToken;
+  public PreferenceReportApplicationService(TournamentPreferenceReportRepository reports, AsyncOutboxEventRepository outbox,
+      AgentRunApplicationService agentRuns, ObjectMapper objectMapper) {
+    this.reports = reports;
+    this.outbox = outbox;
+    this.agentRuns = agentRuns;
+    this.objectMapper = objectMapper;
   }
 
   @Transactional
@@ -48,51 +41,82 @@ public class PreferenceReportApplicationService {
     reports.findById(reportId).ifPresent(report -> { report.markFailed(message); reports.save(report); });
   }
 
-  @Transactional public void enqueue(UUID reportId, UUID tournamentId, UUID guestSessionId, int version, String traceId) {
-    try { outbox.save(AsyncOutboxEvent.pending(reportId,objectMapper.writeValueAsString(java.util.Map.of("reportId",reportId,"tournamentId",tournamentId,"guestId",guestSessionId,"version",version)),traceId)); }
-    catch(Exception e){throw new IllegalStateException("REPORT_OUTBOX_SERIALIZATION_FAILED",e);}
-  }
-  /** Idempotent queue consumer entrypoint. */
-  @CircuitBreaker(name="reportAgent") public void generateQueued(UUID reportId, UUID tournamentId, UUID guestSessionId, int version) {
-    var report=reports.findById(reportId).orElseThrow(); if(report.getStatus()==com.indiesoundquest.tournament.domain.PreferenceReportStatus.READY)return;
-    generateStreaming(reportId,tournamentId,guestSessionId,version,ignored->{});
-  }
-
-  /** Runs the existing report workflow while forwarding only Agent-approved public progress events. */
-  public void generateStreaming(UUID reportId, UUID tournamentId, UUID guestSessionId, int version, Consumer<StreamEvent> onProgress) {
+  /** Creates the durable report run and its Outbox message in the caller's report transaction. */
+  @Transactional
+  public void enqueueAgentRun(UUID runId, UUID reportId, UUID tournamentId, UUID guestSessionId, int version, String traceId) {
     try {
-      markRunning(reportId);
-      var requestId = UUID.randomUUID();
-      var body = objectMapper.writeValueAsString(java.util.Map.of("requestId",requestId,"reportId",reportId,"tournamentId",tournamentId,"guestId",guestSessionId.toString(),"tournamentVersion",version,"includePersonalityEasterEgg",true));
-      var request = HttpRequest.newBuilder(URI.create(agentBaseUrl + "/internal/v1/workflows/tournament-report:stream"))
-          .timeout(Duration.ofSeconds(320)).header("Authorization", "Bearer " + agentToken).header("X-Request-Id", requestId.toString()).header("traceparent", traceparent(requestId)).header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(body)).build();
-      var response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
-      if (response.statusCode() < 200 || response.statusCode() >= 300) throw new IllegalStateException("AGENT_HTTP_" + response.statusCode());
-      var reportJson = parseResult(response.body(), onProgress);
-      if (reportJson == null) throw new IllegalStateException("AGENT_RESULT_MISSING");
-      markReady(reportId, reportJson);
-    } catch (Exception ex) {
-      String message = ex.getMessage() == null ? "REPORT_WORKFLOW_FAILED" : ex.getMessage().substring(0, Math.min(500, ex.getMessage().length()));
-      markFailed(reportId, message);
+      var input = new java.util.LinkedHashMap<String,Object>();
+      input.put("requestId", runId);
+      input.put("reportId", reportId);
+      input.put("tournamentId", tournamentId);
+      input.put("guestId", guestSessionId.toString());
+      input.put("tournamentVersion", version);
+      input.put("includePersonalityEasterEgg", true);
+      var task = java.util.Map.of("runId", runId, "runType", AgentRunType.TOURNAMENT_REPORT.name(), "input", input);
+      agentRuns.createQueuedForTournament(runId, guestSessionId, tournamentId, AgentRunType.TOURNAMENT_REPORT, objectMapper.writeValueAsString(input));
+      agentRuns.appendEvent(runId, AgentRunEventType.PROGRESS, "{\"phase\":\"queued\",\"message\":\"赛后报告任务已入队\"}");
+      outbox.save(AsyncOutboxEvent.pendingAgentRun(runId, objectMapper.writeValueAsString(task), traceId == null ? runId.toString() : traceId));
+    } catch (Exception e) {
+      throw new IllegalStateException("REPORT_AGENT_RUN_ENQUEUE_FAILED", e);
     }
   }
 
-    private String parseResult(java.io.InputStream input, Consumer<StreamEvent> onProgress) throws Exception {
-    try (var lines = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
-      String event = null, data = null, line;
-      while ((line = lines.readLine()) != null) {
-        if (line.startsWith("event: ")) event = line.substring(7).trim();
-        else if (line.startsWith("data: ")) data = line.substring(6).trim();
-        else if (line.isEmpty()) {
-          if (("progress".equals(event) || "plan_updated".equals(event)) && data != null) { objectMapper.readTree(data); onProgress.accept(new StreamEvent(event, data)); }
-          if ("result".equals(event) && data != null) { objectMapper.readTree(data); return data; }
-          if ("error".equals(event)) throw new IllegalStateException("AGENT_WORKFLOW_ERROR");
-          event = null; data = null;
-        }
-      }
-    }
-    return null;
+  @Transactional
+  public void markAgentRunRunning(UUID runId, String leaseToken, UUID reportId) {
+    agentRuns.assertLease(runId, leaseToken);
+    markRunning(reportId);
   }
-  public record StreamEvent(String event, String data) {}
-  private String traceparent(UUID requestId) { return "00-"+requestId.toString().replace("-","")+"-"+UUID.randomUUID().toString().replace("-","").substring(0,16)+"-01"; }
+
+  /** Java owns final contract validation and commits report + AgentRun atomically. */
+  @Transactional
+  public void completeAgentRun(UUID runId, String leaseToken, UUID reportId, String reportJson) {
+    agentRuns.assertLease(runId, leaseToken);
+    var report = reports.findById(reportId).orElseThrow();
+    validateReport(report, reportJson);
+    report.markReady(reportJson);
+    reports.save(report);
+    try {
+      agentRuns.complete(runId, objectMapper.writeValueAsString(java.util.Map.of(
+          "reportId", reportId,
+          "tournamentId", report.getTournamentId(),
+          "version", report.getVersionNumber(),
+          "status", "READY")));
+    } catch (Exception e) {
+      throw new IllegalStateException("REPORT_ARTIFACT_SERIALIZATION_FAILED", e);
+    }
+    agentRuns.finishLease(runId, leaseToken);
+  }
+
+  @Transactional
+  public void failAgentRun(UUID runId, String leaseToken, UUID reportId, String code, String message) {
+    agentRuns.assertLease(runId, leaseToken);
+    var safeMessage = message == null ? code : message.substring(0, Math.min(500, message.length()));
+    markFailed(reportId, safeMessage);
+    try {
+      agentRuns.fail(runId, objectMapper.writeValueAsString(java.util.Map.of("code", code, "message", safeMessage)));
+    } catch (Exception e) {
+      throw new IllegalStateException("REPORT_FAILURE_SERIALIZATION_FAILED", e);
+    }
+    agentRuns.finishLease(runId, leaseToken);
+  }
+
+  private void validateReport(TournamentPreferenceReport report, String reportJson) {
+    try {
+      var value = objectMapper.readTree(reportJson);
+      if (!"1.0".equals(value.path("schemaVersion").asText())) throw new IllegalArgumentException("REPORT_SCHEMA_VERSION_INVALID");
+      if (!report.getTournamentId().toString().equals(value.path("tournamentId").asText())) throw new IllegalArgumentException("REPORT_TOURNAMENT_MISMATCH");
+      if (value.path("summary").asText().isBlank()) throw new IllegalArgumentException("REPORT_SUMMARY_MISSING");
+      int dimensions = value.path("dimensions").size();
+      int songs = value.path("songRecommendations").size();
+      int artists = value.path("artistRecommendations").size();
+      if (dimensions < 3 || dimensions > 5) throw new IllegalArgumentException("REPORT_DIMENSIONS_INVALID");
+      if (songs < 5 || songs > 7) throw new IllegalArgumentException("REPORT_SONG_RECOMMENDATIONS_INVALID");
+      if (artists > 3) throw new IllegalArgumentException("REPORT_ARTIST_RECOMMENDATIONS_INVALID");
+      if (!value.path("choiceTrajectory").isArray()) throw new IllegalArgumentException("REPORT_TRAJECTORY_INVALID");
+    } catch (IllegalArgumentException e) {
+      throw e;
+    } catch (Exception e) {
+      throw new IllegalArgumentException("REPORT_JSON_INVALID", e);
+    }
+  }
 }

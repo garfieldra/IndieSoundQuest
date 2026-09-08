@@ -3,6 +3,7 @@ package com.indiesoundquest.internal;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ibm.icu.text.Transliterator;
+import com.indiesoundquest.redis.ProviderCacheService;
 import com.indiesoundquest.tournament.domain.Artist;
 import com.indiesoundquest.tournament.domain.Recording;
 import com.indiesoundquest.tournament.repository.ArtistRepository;
@@ -25,9 +26,11 @@ public class MusicBrainzCatalogService {
   private static final long MIN_INTERVAL_MILLIS = 1_050;
   private static final ThreadLocal<Transliterator> TO_SIMPLIFIED =
       ThreadLocal.withInitial(() -> Transliterator.getInstance("Traditional-Simplified"));
+  private static final String PROVIDER_NAME = "musicbrainz";
   private final ArtistRepository artists;
   private final RecordingRepository recordings;
   private final ObjectMapper objectMapper;
+  private final ProviderCacheService providerCache;
   private final HttpClient httpClient;
   private final String baseUrl;
   private final String userAgent;
@@ -37,11 +40,13 @@ public class MusicBrainzCatalogService {
       ArtistRepository artists,
       RecordingRepository recordings,
       ObjectMapper objectMapper,
+      ProviderCacheService providerCache,
       @Value("${musicbrainz.base-url:https://musicbrainz.org/ws/2}") String baseUrl,
       @Value("${musicbrainz.user-agent:IndieSoundQuest/0.1 (https://github.com/garfieldra/IndieSoundQuest)}") String userAgent) {
     this.artists = artists;
     this.recordings = recordings;
     this.objectMapper = objectMapper;
+    this.providerCache = providerCache;
     this.baseUrl = baseUrl.replaceAll("/$", "");
     this.userAgent = userAgent;
     this.httpClient = HttpClient.newBuilder()
@@ -275,7 +280,12 @@ public class MusicBrainzCatalogService {
     return titleMatch && artistMatch;
   }
 
-  private synchronized HttpResponse<String> send(URI uri) throws Exception {
+  private synchronized HttpPayload send(URI uri) throws Exception {
+    var fingerprint = ProviderCacheService.fingerprint(uri.toString());
+    var cached = providerCache.get(PROVIDER_NAME, fingerprint);
+    if (cached.isPresent()) {
+      return new HttpPayload(200, cached.get());
+    }
     HttpResponse<String> response = null;
     // A discovery run contains other recovery paths (web search and subsequent ReAct turns).
     // Do not let one unresponsive upstream request consume a whole user-facing run.
@@ -298,14 +308,21 @@ public class MusicBrainzCatalogService {
       } finally {
         lastRequestAt = System.currentTimeMillis();
       }
-      if (response.statusCode() != 429 && response.statusCode() != 503) return response;
+      if (response.statusCode() != 429 && response.statusCode() != 503) {
+        if (response.statusCode() == 200 && response.body() != null && !response.body().isBlank()) {
+          providerCache.put(PROVIDER_NAME, fingerprint, response.body());
+        }
+        return new HttpPayload(response.statusCode(), response.body());
+      }
       var retryAfter = response.headers().firstValue("Retry-After").flatMap(value -> {
         try { return Optional.of(Long.parseLong(value)); } catch (NumberFormatException ignored) { return Optional.empty(); }
       }).orElse(1L << attempt);
       Thread.sleep(Math.min(retryAfter, 4) * 1_000);
     }
-    return response;
+    return new HttpPayload(response.statusCode(), response.body());
   }
+
+  private record HttpPayload(int statusCode, String body) {}
 
   private static String text(JsonNode node, String field) {
     var value = node.path(field);
@@ -333,17 +350,17 @@ public class MusicBrainzCatalogService {
     static SearchOutcome unresolved(String reason) { return new SearchOutcome(Optional.empty(), reason); }
   }
   public record Resolution(String title, String artistName, String sourceUrl, String status,
-                           UUID recordingId, UUID artistId, String recordingMbid, String albumTitle,
+                           UUID recordingId, UUID artistId, String recordingMbid, String albumTitle, String coverUrl,
                            String coverStatus, String catalogSource, String trustState, int score, boolean imported, String reason) {
     static Resolution resolved(Hint hint, Recording recording, int score, boolean imported) {
       return new Resolution(recording.getTitle(), recording.getArtist().getName(), hint.sourceUrl(), "RESOLVED",
-          recording.getId(), recording.getArtist().getId(), recording.getMusicbrainzMbid(), recording.getAlbumTitle(),
+          recording.getId(), recording.getArtist().getId(), recording.getMusicbrainzMbid(), recording.getAlbumTitle(), Optional.ofNullable(recording.getCoverUrl()).orElse(""),
           Optional.ofNullable(recording.getCoverStatus()).orElse("UNAVAILABLE"), recording.getCatalogSource(), "CATALOG_IMPORTED", score, imported, null);
     }
     static Resolution unresolved(Hint hint, String reason) {
       var trustState = "AMBIGUOUS_MATCH".equals(reason) ? "MB_AMBIGUOUS" : "REJECTED";
       return new Resolution(hint.title(), hint.artistName(), hint.sourceUrl(), "UNRESOLVED", null, null, null,
-          null, null, null, trustState, 0, false, reason);
+          null, null, null, null, trustState, 0, false, reason);
     }
   }
 }

@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.indiesoundquest.identity.GuestIdentityFilter;
+import com.indiesoundquest.agent.application.AgentRunApplicationService;
+import com.indiesoundquest.agent.domain.AgentRunType;
+import com.indiesoundquest.redis.RedisRateLimitService;
 import com.indiesoundquest.tournament.application.PreferenceReportApplicationService;
 import com.indiesoundquest.tournament.domain.*;
 import com.indiesoundquest.tournament.repository.*;
@@ -23,31 +26,41 @@ public class PreferenceReportController {
   private final TournamentRepository tournaments;
   private final TournamentPreferenceReportRepository reports;
   private final PreferenceReportApplicationService service;
+  private final AgentRunApplicationService agentRuns;
   private final RecordingRepository recordings;
   private final ArtistRepository artists;
   private final ObjectMapper objectMapper;
+  private final RedisRateLimitService rateLimit;
 
   public PreferenceReportController(TournamentRepository tournaments, TournamentPreferenceReportRepository reports,
-      PreferenceReportApplicationService service, RecordingRepository recordings, ArtistRepository artists, ObjectMapper objectMapper) {
-    this.tournaments=tournaments; this.reports=reports; this.service=service; this.recordings=recordings; this.artists=artists; this.objectMapper=objectMapper;
+      PreferenceReportApplicationService service, AgentRunApplicationService agentRuns, RecordingRepository recordings, ArtistRepository artists, ObjectMapper objectMapper,
+      RedisRateLimitService rateLimit) {
+    this.tournaments=tournaments; this.reports=reports; this.service=service; this.agentRuns=agentRuns; this.recordings=recordings; this.artists=artists; this.objectMapper=objectMapper; this.rateLimit=rateLimit;
   }
 
   @PostMapping("/tournaments/{tournamentId}/preference-report")
-  @Transactional ResponseEntity<Map<String,Object>> create(@PathVariable UUID tournamentId, @RequestBody(required=false) CreateBody body, HttpServletRequest request) {
-    var guest=guest(request); var tournament=ownedCompletedTournament(tournamentId, guest.getId());
+  @Transactional ResponseEntity<Map<String,Object>> create(@PathVariable UUID tournamentId, @RequestHeader(value="X-Request-Id",required=false) UUID requestId, @RequestBody(required=false) CreateBody body, HttpServletRequest request) {
+    var guest=guest(request);
+    rateLimit.assertReportAllowed(guest.getId());
+    var tournament=ownedCompletedTournament(tournamentId, guest.getId());
     var latest=reports.findByTournament_IdOrderByVersionNumberDesc(tournamentId).stream().findFirst().orElse(null);
     boolean force=body!=null && body.force();
-    if(latest!=null && latest.getStatus()==PreferenceReportStatus.READY && !force) return ResponseEntity.ok(view(latest));
-    if(latest!=null && (latest.getStatus()==PreferenceReportStatus.PENDING || latest.getStatus()==PreferenceReportStatus.RUNNING) && !force) return ResponseEntity.accepted().body(view(latest));
+    if(latest!=null && latest.getStatus()==PreferenceReportStatus.READY && !force) return ResponseEntity.ok(viewWithRun(latest));
+    if(latest!=null && (latest.getStatus()==PreferenceReportStatus.PENDING || latest.getStatus()==PreferenceReportStatus.RUNNING) && !force) return ResponseEntity.accepted().body(viewWithRun(latest));
+    var runId=requestId==null?UUID.randomUUID():requestId;
+    var existing=agentRuns.findOwned(runId,guest.getId());
+    if(existing.isPresent() && latest!=null) return ResponseEntity.accepted().body(viewWithRun(latest,existing.get().getId()));
     int version=latest==null?1:latest.getVersionNumber()+1;
     var report=reports.save(TournamentPreferenceReport.pending(UUID.randomUUID(),tournament,version));
-    service.enqueue(report.getId(),tournamentId,guest.getId(),version,request.getHeader("X-Request-Id"));
-    return ResponseEntity.accepted().body(view(report));
+    service.enqueueAgentRun(runId,report.getId(),tournamentId,guest.getId(),version,request.getHeader("X-Request-Id"));
+    return ResponseEntity.accepted().body(viewWithRun(report,runId));
   }
 
   @PostMapping(value="/tournaments/{tournamentId}/preference-report:stream", produces=MediaType.TEXT_EVENT_STREAM_VALUE)
   @Transactional StreamingResponseBody createStream(@PathVariable UUID tournamentId, @RequestBody(required=false) CreateBody body, HttpServletRequest request) {
-    var guest=guest(request); var tournament=ownedCompletedTournament(tournamentId, guest.getId());
+    var guest=guest(request);
+    rateLimit.assertReportAllowed(guest.getId());
+    var tournament=ownedCompletedTournament(tournamentId, guest.getId());
     var latest=reports.findByTournament_IdOrderByVersionNumberDesc(tournamentId).stream().findFirst().orElse(null);
     boolean force=body!=null && body.force();
     if (latest!=null && latest.getStatus()==PreferenceReportStatus.READY && !force) {
@@ -58,7 +71,7 @@ public class PreferenceReportController {
     }
     final TournamentPreferenceReport report;
     if(latest!=null && (latest.getStatus()==PreferenceReportStatus.PENDING || latest.getStatus()==PreferenceReportStatus.RUNNING) && !force) report=latest;
-    else { int version=latest==null?1:latest.getVersionNumber()+1; report=reports.save(TournamentPreferenceReport.pending(UUID.randomUUID(),tournament,version)); service.enqueue(report.getId(),tournamentId,guest.getId(),version,request.getHeader("X-Request-Id")); }
+    else { int version=latest==null?1:latest.getVersionNumber()+1; report=reports.save(TournamentPreferenceReport.pending(UUID.randomUUID(),tournament,version)); var runId=UUID.randomUUID(); service.enqueueAgentRun(runId,report.getId(),tournamentId,guest.getId(),version,request.getHeader("X-Request-Id")); }
     return output -> {
       try {
         PreferenceReportStatus previous=null; long deadline=System.currentTimeMillis()+330_000L;
@@ -74,7 +87,18 @@ public class PreferenceReportController {
     ownedCompletedTournament(tournamentId, guest(request).getId());
     var report=reports.findByTournament_IdOrderByVersionNumberDesc(tournamentId).stream().findFirst()
         .orElseThrow(()->new org.springframework.web.server.ResponseStatusException(HttpStatus.NOT_FOUND));
-    return view(report);
+    return viewWithRun(report);
+  }
+
+  private Map<String,Object> viewWithRun(TournamentPreferenceReport report) {
+    var runId=agentRuns.latestTournamentRun(report.getTournamentId(),AgentRunType.TOURNAMENT_REPORT).map(run->run.getId()).orElse(null);
+    return viewWithRun(report,runId);
+  }
+
+  private Map<String,Object> viewWithRun(TournamentPreferenceReport report, UUID runId) {
+    var result=new LinkedHashMap<>(view(report));
+    if(runId!=null) result.put("runId",runId);
+    return result;
   }
 
   private Tournament ownedCompletedTournament(UUID tournamentId, UUID guestId) {

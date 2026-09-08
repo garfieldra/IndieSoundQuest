@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.indiesoundquest.identity.GuestIdentityFilter;
 import com.indiesoundquest.tournament.application.CandidatePoolApplicationService;
 import com.indiesoundquest.tournament.domain.GuestSession;
+import com.indiesoundquest.agent.application.AgentRunApplicationService;
+import com.indiesoundquest.agent.domain.*;
+import com.indiesoundquest.async.*;
 import jakarta.servlet.http.HttpServletRequest;
 import java.io.BufferedReader;
 import java.io.OutputStream;
@@ -23,9 +26,12 @@ import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBo
 @RequestMapping("/api/v1/agent-runs")
 public class AgentProgressProxyController {
   private static final Logger log=LoggerFactory.getLogger(AgentProgressProxyController.class);
-  private final ObjectMapper json; private final String baseUrl, token; private final CandidatePoolApplicationService candidatePools;
+  private final ObjectMapper json; private final String baseUrl, token; private final CandidatePoolApplicationService candidatePools; private final AgentRunApplicationService agentRuns; private final AsyncOutboxEventRepository outbox;
   private final HttpClient client=HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).connectTimeout(Duration.ofSeconds(5)).build();
-  public AgentProgressProxyController(ObjectMapper json, CandidatePoolApplicationService candidatePools, @Value("${agent.internal.base-url:http://agent-service:8000}") String baseUrl,@Value("${agent.internal.service-token}") String token){this.json=json;this.candidatePools=candidatePools;this.baseUrl=baseUrl;this.token=token;}
+  public AgentProgressProxyController(ObjectMapper json, CandidatePoolApplicationService candidatePools,AgentRunApplicationService agentRuns,AsyncOutboxEventRepository outbox,@Value("${agent.internal.base-url:http://agent-service:8000}") String baseUrl,@Value("${agent.internal.service-token}") String token){this.json=json;this.candidatePools=candidatePools;this.agentRuns=agentRuns;this.outbox=outbox;this.baseUrl=baseUrl;this.token=token;}
+
+  @PostMapping("/candidate-pool")
+  org.springframework.http.ResponseEntity<Map<String,Object>> enqueueCandidate(@RequestHeader("X-Request-Id")UUID requestId,@RequestBody CandidateBody body,HttpServletRequest request){var guest=((GuestSession)request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();try{return org.springframework.http.ResponseEntity.accepted().body(agentRuns.owned(requestId,guest)!=null?Map.of("runId",requestId,"status",agentRuns.owned(requestId,guest).getStatus().name(),"replayed",true):Map.of());}catch(NoSuchElementException ignored){}var seeds=Optional.ofNullable(body.seedArtistIds()).orElse(List.of());try{var input=Map.of("requestId",requestId,"guestId",guest.toString(),"size",body.size(),"candidateCount",body.size()*2,"preferenceText",body.preferenceText(),"seedArtistIds",seeds,"confirmedArtists",Optional.ofNullable(body.confirmedArtists()).orElse(List.of()),"excludeRecordingIds",List.of());var task=Map.of("runId",requestId,"runType","CANDIDATE_POOL","input",input);agentRuns.createQueued(requestId,guest,null,AgentRunType.CANDIDATE_POOL,json.writeValueAsString(input));agentRuns.appendEvent(requestId,AgentRunEventType.PROGRESS,"{\"phase\":\"queued\",\"message\":\"候选池任务已入队\"}");outbox.save(AsyncOutboxEvent.pendingAgentRun(requestId,json.writeValueAsString(task),requestId.toString()));return org.springframework.http.ResponseEntity.accepted().body(Map.of("runId",requestId,"status","QUEUED","replayed",false));}catch(Exception e){throw new IllegalStateException("CANDIDATE_ENQUEUE_FAILED",e);}}
 
   @PostMapping(value="/candidate-pool:stream",produces=MediaType.TEXT_EVENT_STREAM_VALUE)
   StreamingResponseBody candidate(@RequestHeader("X-Request-Id") UUID requestId,@RequestBody CandidateBody body,HttpServletRequest request){

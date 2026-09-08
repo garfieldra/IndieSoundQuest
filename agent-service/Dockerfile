@@ -6,6 +6,7 @@ COPY pyproject.toml ./
 RUN pip install --no-cache-dir \
     "fastapi>=0.115,<1" "uvicorn[standard]>=0.32,<1" \
     "pydantic-settings>=2.6,<3" "httpx>=0.27,<1" \
+    "aio-pika>=9.4,<10" \
     "langchain-core>=0.3,<1" "langchain-openai>=0.2,<1" "langgraph>=0.2,<1" \
     "pymilvus>=2.5,<3" "fastembed>=0.4,<1" \
     "opentelemetry-api>=1.28,<2" "opentelemetry-sdk>=1.28,<2" "opentelemetry-exporter-otlp-proto-http>=1.28,<2" "opentelemetry-instrumentation-fastapi>=0.49b0,<1"

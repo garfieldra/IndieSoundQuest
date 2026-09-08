@@ -17,7 +17,7 @@ type Artist = { id: string; name: string }
 type Entry = { id: string; recordingId: string; title: string; artistName: string; albumTitle?: string; coverUrl?: string; coverStatus: string; listeningSearchUrl: string }
 type Match = { id: string; roundNumber: number; matchIndex: number; leftEntryId: string | null; rightEntryId: string | null; winnerEntryId: string | null; status: string }
 type Tournament = { id: string; status: string; size: number; completedVoteCount: number; completedAt?: string | null; entries: Entry[]; matches: Match[]; currentMatch: Match | null }
-type Report = { reportId: string; tournamentId: string; version: number; status: 'PENDING' | 'RUNNING' | 'READY' | 'FAILED'; report?: { summary: string; dimensions: { name: string; confidence: string; explanation: string }[]; choiceTrajectory?: { matchId: string; roundNumber: number; matchIndex: number; winnerTitle: string; winnerArtistName: string; loserTitle: string; loserArtistName: string; signalRole: 'stable_anchor' | 'preference_boundary' | 'near_finalist'; derivedNote: string }[]; songRecommendations: { recordingId?: string; title?: string; artistName?: string; reason: string; searchUrl?: string; sourceStatus?: 'catalog_verified' | 'web_discovered'; sourceUrl?: string; sourceTitle?: string }[]; artistRecommendations: { artistId?: string; artistName?: string; reason: string; searchUrl?: string; sourceStatus?: 'catalog_verified' | 'web_discovered'; sourceUrl?: string; sourceTitle?: string }[]; explorationTags?: string[]; personalityEasterEgg: string; disclaimer: string; warnings?: string[] }; failureMessage?: string }
+type Report = { runId?: string; reportId: string; tournamentId: string; version: number; status: 'PENDING' | 'RUNNING' | 'READY' | 'FAILED'; report?: { summary: string; dimensions: { name: string; confidence: string; explanation: string }[]; choiceTrajectory?: { matchId: string; roundNumber: number; matchIndex: number; winnerTitle: string; winnerArtistName: string; loserTitle: string; loserArtistName: string; signalRole: 'stable_anchor' | 'preference_boundary' | 'near_finalist'; derivedNote: string }[]; songRecommendations: { recordingId?: string; title?: string; artistName?: string; reason: string; searchUrl?: string; sourceStatus?: 'catalog_verified' | 'web_discovered'; sourceUrl?: string; sourceTitle?: string }[]; artistRecommendations: { artistId?: string; artistName?: string; reason: string; searchUrl?: string; sourceStatus?: 'catalog_verified' | 'web_discovered'; sourceUrl?: string; sourceTitle?: string }[]; explorationTags?: string[]; personalityEasterEgg: string; disclaimer: string; warnings?: string[] }; failureMessage?: string }
 type AgentProgress = { phase: string; status?: string; message: string; elapsedMs?: number }
 type AgentPlan = { revision: number; goal: string; summary: string; items: { id: string; title: string; status: 'pending' | 'running' | 'completed' | 'skipped' | 'blocked'; detail: string }[] }
 type SourceReference = { url: string; title?: string; domain?: string }
@@ -34,25 +34,45 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>
 }
 
-async function streamAgent<T>(path: string, options: RequestInit, onProgress: (progress: AgentProgress) => void, onPlan: (plan: AgentPlan) => void): Promise<T> {
-  const response = await fetch(`/api/v1${path}`, { credentials: 'include', ...options })
-  if (!response.ok || !response.body) throw new Error(`请求失败（${response.status}）`)
-  const reader = response.body.getReader(); const decoder = new TextDecoder(); let pending = ''; let result: T | undefined
-  const consume = (block: string) => {
-    const event = block.match(/^event:\s*(.+)$/m)?.[1]?.trim()
-    const data = block.match(/^data:\s*(.+)$/m)?.[1]?.trim()
-    if (!event || !data) return
-    if (event === 'progress') onProgress(JSON.parse(data) as AgentProgress)
-    else if (event === 'plan_updated') onPlan(JSON.parse(data) as AgentPlan)
-    else if (event === 'result') result = JSON.parse(data) as T
-    else if (event === 'error') { const issue = JSON.parse(data) as { message?: string }; throw new Error(issue.message || 'Agent 服务暂时不可用') }
+async function queuedAgentRun<T>(path: string, options: RequestInit, onProgress: (progress: AgentProgress) => void, onPlan: (plan: AgentPlan) => void): Promise<T> {
+  const queued = await api<{ runId: string }>(path, options)
+  let cursor = 0
+  for (let attempt = 0; attempt < 900; attempt++) {
+    const snapshot = await api<{ runStatus: string; events: { sequenceNumber: number; type: string; payloadJson: string }[] }>(`/agent-runs/${queued.runId}/events?afterSequence=${cursor}`)
+    for (const event of snapshot.events) {
+      cursor = Math.max(cursor, event.sequenceNumber)
+      const data = JSON.parse(event.payloadJson) as Record<string, unknown>
+      if (event.type === 'PROGRESS' || event.type === 'RETRY') onProgress({ phase: String(data.phase || 'progress'), message: String(data.message || ''), elapsedMs: Number(data.elapsedMs || 0) })
+      else if (event.type === 'PLAN_UPDATED') onPlan(data as unknown as AgentPlan)
+      else if (event.type === 'RESULT') return data as unknown as T
+      else if (event.type === 'FAILED') throw new Error(String(data.message || 'Agent 任务失败'))
+    }
+    if (snapshot.runStatus === 'FAILED') throw new Error('Agent 任务失败')
+    await new Promise(resolve => window.setTimeout(resolve, 1000))
   }
-  while (true) { const { value, done } = await reader.read(); pending += decoder.decode(value ?? new Uint8Array(), { stream: !done }); let boundary: number
-    while ((boundary = pending.indexOf('\n\n')) >= 0) { consume(pending.slice(0, boundary)); pending = pending.slice(boundary + 2) }
-    if (done) break
+  throw new Error('Agent 任务等待超时')
+}
+
+async function createAndWaitForReport(tournamentId: string, force: boolean, onProgress: (progress: AgentProgress) => void, onPlan: (plan: AgentPlan) => void): Promise<Report> {
+  let report = await api<Report>(`/tournaments/${tournamentId}/preference-report`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': crypto.randomUUID() }, body: JSON.stringify({ force }) })
+  let cursor = 0
+  for (let attempt = 0; attempt < 330 && report.status !== 'READY'; attempt++) {
+    if (report.status === 'FAILED') throw new Error(report.failureMessage || '报告生成失败')
+    if (report.runId) {
+      const snapshot = await api<{ runStatus: string; events: { sequenceNumber: number; type: string; payloadJson: string }[] }>(`/agent-runs/${report.runId}/events?afterSequence=${cursor}`)
+      for (const event of snapshot.events) {
+        cursor = Math.max(cursor, event.sequenceNumber)
+        const data = JSON.parse(event.payloadJson) as Record<string, unknown>
+        if (event.type === 'PROGRESS' || event.type === 'RETRY') onProgress({ phase: String(data.phase || 'progress'), message: String(data.message || ''), elapsedMs: Number(data.elapsedMs || 0) })
+        else if (event.type === 'PLAN_UPDATED') onPlan(data as unknown as AgentPlan)
+        else if (event.type === 'FAILED') throw new Error(String(data.message || '报告生成失败'))
+      }
+    }
+    await new Promise(resolve => window.setTimeout(resolve, 1000))
+    report = await api<Report>(`/tournaments/${tournamentId}/preference-report`)
   }
-  if (!result) throw new Error('Agent 未返回最终结果')
-  return result
+  if (report.status !== 'READY') throw new Error('报告仍在处理中，请稍后重试')
+  return report
 }
 
 export function App({ embedded = false, onExit }: { embedded?: boolean; onExit?: () => void }) {
@@ -135,7 +155,7 @@ export function App({ embedded = false, onExit }: { embedded?: boolean; onExit?:
     setLoading(true); setAgentRunActive(true); setMessage(''); setAgentProgress([]); setAgentPlan(null); setProgressCollapsed(false)
     try {
       const requestId = crypto.randomUUID()
-      const data = await streamAgent<CandidatePoolResponse>('/agent-runs/candidate-pool:stream', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': requestId }, body: JSON.stringify({ size, preferenceText, seedArtistIds: seedArtistId ? [seedArtistId] : [], confirmedArtists: nextConfirmedArtists }) }, item => setAgentProgress(current => [...current, item]), setAgentPlan)
+      const data = await queuedAgentRun<CandidatePoolResponse>('/agent-runs/candidate-pool', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': requestId }, body: JSON.stringify({ size, preferenceText, seedArtistIds: seedArtistId ? [seedArtistId] : [], confirmedArtists: nextConfirmedArtists }) }, item => setAgentProgress(current => [...current, item]), setAgentPlan)
       setCandidateResult(data); setExcludedIds([]); setPreparingTournamentId(null); creationAttempt.current = null
       if (conversationId) await persistConversationCard('CANDIDATE_POOL_CARD', 'CANDIDATE_POOL', { size, status: data.status, preferenceText, summary: data.candidatePool?.candidateSummary || '', items: data.candidatePool?.items.map(item => ({ recordingId: item.recordingId, title: item.title, artistName: item.artistName, coverUrl: item.coverUrl })) || [] })
       if (data.status === 'insufficient_candidates') setMessage(data.candidatePool?.warnings[0]?.message || '可验证歌曲不足，请调整兴趣方向。')
@@ -191,7 +211,8 @@ export function App({ embedded = false, onExit }: { embedded?: boolean; onExit?:
     if (!tournament) return
     setReportLoading(true); setAgentRunActive(true); setMessage(''); setAgentProgress([]); setAgentPlan(null); setProgressCollapsed(false)
     try {
-      const created = await streamAgent<Report>(`/tournaments/${tournament.id}/preference-report:stream`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force }) }, item => setAgentProgress(current => [...current, item]), setAgentPlan)
+      setAgentProgress([{ phase: 'queued', message: '报告任务已提交，正在分析本场选择轨迹。' }])
+      const created = await createAndWaitForReport(tournament.id, force, item => setAgentProgress(current => [...current, item]), setAgentPlan)
       setReport(created)
       await persistConversationCard('REPORT_CARD', 'PREFERENCE_REPORT', { tournamentId: tournament.id, reportId: created.reportId, version: created.version, status: created.status, championTitle: tournament.entries.find(entry => entry.id === tournament.matches.find(match => match.roundNumber === Math.max(...tournament.matches.map(item => item.roundNumber)) && match.winnerEntryId)?.winnerEntryId)?.title || '' })
     } catch (error) { setMessage(agentErrorMessage(error, '报告暂时无法生成')) }

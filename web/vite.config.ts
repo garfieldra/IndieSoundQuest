@@ -10,9 +10,9 @@ export default defineConfig(({ mode }) => {
       port: 5173,
       proxy: {
         '/api': {
-          // Docker resolves the Java service by Compose name; local Vite can
-          // override this with VITE_API_PROXY_TARGET=http://localhost:8080.
-          target: env.VITE_API_PROXY_TARGET ?? 'http://java-service:8080',
+          // Vite only serves local development; the production web container
+          // uses Caddy and its own reverse proxy configuration.
+          target: env.VITE_API_PROXY_TARGET ?? 'http://localhost:8080',
           changeOrigin: true,
         },
       },
