@@ -6,9 +6,9 @@ import com.indiesoundquest.redis.RedisRateLimitService;
 import com.indiesoundquest.tournament.domain.GuestSession;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.UUID;
-import org.springframework.http.MediaType;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
 @RestController
 @RequestMapping("/api/v1/conversations")
@@ -21,10 +21,13 @@ public class ConversationExplorationReportController {
     this.rateLimit = rateLimit;
   }
 
-  @PostMapping(value = "/{id}/exploration-report", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-  StreamingResponseBody explorationReport(@PathVariable UUID id, @RequestHeader("Idempotency-Key") UUID key, HttpServletRequest request) {
+  @PostMapping("/{id}/exploration-report")
+  ResponseEntity<QueuedView> explorationReport(@PathVariable UUID id, @RequestHeader("Idempotency-Key") UUID key, HttpServletRequest request) {
     var guest = ((GuestSession) request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();
     rateLimit.assertExplorationReportAllowed(guest);
-    return output -> service.streamExplorationReport(id, guest, key, output);
+    var queued = service.enqueueExplorationReport(id, guest, key);
+    return ResponseEntity.status(HttpStatus.ACCEPTED).body(new QueuedView(queued.runId(), queued.status(), "/api/v1/agent-runs/" + queued.runId() + "/events:stream", queued.replayed()));
   }
+
+  record QueuedView(UUID runId, String status, String eventsUrl, boolean replayed) {}
 }

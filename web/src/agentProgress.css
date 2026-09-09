@@ -15,4 +15,7 @@
 .agent-progress ol { list-style: none; margin: 0; padding: 2px 16px 14px; }
 .agent-progress li { display: flex; justify-content: space-between; gap: 20px; padding: 10px 0 0; color: #655a52; font-size: .92rem; border-top: 1px solid #eee4da; }
 .agent-progress li small { color: #9b8f85; white-space: nowrap; }
+.agent-progress li.started span::before { content: '进行中 · '; color: #9c493a; }
+.agent-progress li.completed span::before { content: '完成 · '; color: #536b59; }
+.agent-progress li.degraded span::before { content: '已调整 · '; color: #9c493a; }
 @media (max-width: 760px) { .agent-progress-toggle { grid-template-columns: 1fr auto; } .agent-progress-toggle small { grid-column: 1 / -1; } }

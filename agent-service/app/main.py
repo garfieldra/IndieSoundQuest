@@ -31,6 +31,7 @@ FastAPIInstrumentor.instrument_app(app)
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.INFO)
 web_search = WebSearchTool(tavily_api_key=settings.tavily_api_key, bocha_api_key=settings.bocha_api_key)
+music_catalog = MusicCatalogTool(settings.java_internal_base_url, settings.agent_internal_service_token)
 domestic_research = DomesticContentResearchTool(
     zhihu_enabled=settings.zhihu_research_enabled,
     bilibili_enabled=settings.bilibili_research_enabled,
@@ -42,9 +43,9 @@ domestic_research = DomesticContentResearchTool(
     max_sources=settings.domestic_research_max_sources,
 )
 spotify_catalog = SpotifyCatalogTool(settings.spotify_client_id, settings.spotify_client_secret, settings.spotify_market)
-graph = build_candidate_pool_graph(MusicCatalogTool(settings.java_internal_base_url, settings.agent_internal_service_token), web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), DeepSeekCandidateSelector(), domestic_research, spotify_catalog if settings.spotify_discovery_enabled else None)
+graph = build_candidate_pool_graph(music_catalog, web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), DeepSeekCandidateSelector(), domestic_research, spotify_catalog if settings.spotify_discovery_enabled else None)
 report_graph = build_report_graph(TournamentFactsTool(settings.java_internal_base_url, settings.agent_internal_service_token), ReportGenerator(), web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), domestic_research)
-conversation_runtime = ConversationReActRuntime(web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), tool_registry, skill_registry, graph)
+conversation_runtime = ConversationReActRuntime(web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), tool_registry, skill_registry, graph, music_catalog)
 
 _ACTION_PROGRESS = {
     "understand_preference": ("understand_preference", "正在理解你的音乐偏好"),
@@ -63,6 +64,7 @@ _ACTION_PROGRESS = {
     "propose_tournament": ("propose_tournament", "正在准备歌曲世界杯入口"),
     "build_candidate_pool": ("build_candidate_pool", "正在自主构建并核验歌曲世界杯候选池"),
     "generate_exploration_report": ("generate_exploration_report", "正在根据当前对话生成探索报告"),
+    "recommend_music": ("recommend_music", "正在提取并核验歌曲与艺人推荐"),
     "respond": ("draft_response", "正在整理这次音乐探索的回应"),
     "critique_report": ("review_report", "正在核验报告事实与推荐来源"),
     "rerank_candidates": ("organize_candidates", "正在并行重排候选，并生成入选理由"),
@@ -73,41 +75,64 @@ def _progress(request_id, action: str, elapsed_ms: int, metrics: dict | None = N
     payload = {"runId": str(request_id), "phase": phase, "status": "started", "message": message, "elapsedMs": elapsed_ms, "metrics": metrics or {}}
     return f"event: progress\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-def _plan_event(request_id, state: dict, workflow: str) -> str:
-    """Public plan projection: action facts only, never model reasoning or prompts."""
-    action = state.get("decision").action if state.get("decision") else None
-    history = [item.get("action") for item in state.get("action_history", [])]
+_PLAN_ACTIONS = {
+    "understand_preference": ("理解音乐偏好", "结合本轮输入与已有上下文确定探索边界"),
+    "resolve_named_entities": ("核验艺人身份", "检查用户提到的艺人及可能歧义"),
+    "request_clarification": ("等待用户确认", "存在会影响候选正确性的身份歧义"),
+    "search_catalog": ("检查规范歌曲目录", "读取已核验曲目作为可用补充"),
+    "expand_artist_catalog": ("扩展明确艺人的作品", "从公开音乐目录批量发现并核验作品"),
+    "search_web": ("搜索公开音乐资料", "从网络寻找歌曲、艺人及相关音乐语境"),
+    "search_domestic_content": ("检索中文内容平台", "补充国内社区中的音乐资料"),
+    "search_spotify": ("检索流媒体目录", "补充国际音乐目录线索"),
+    "search_knowledge": ("检索歌曲主题卡", "以本地知识库补充主题与文化语境"),
+    "resolve_musicbrainz": ("核验新发现歌曲", "把网络线索解析为规范歌曲身份"),
+    "rerank_candidates": ("重排候选歌曲", "按偏好相关性和证据质量生成入选理由"),
+    "submit_candidates": ("检查并提交候选池", "确认主池与补位池满足开赛要求"),
+    "finish_insufficient": ("说明候选不足", "整理已完成的搜索与仍缺少的数量"),
+    "analyze_tournament": ("分析关键对局", "归纳胜出、淘汰和稳定偏好信号"),
+    "draft_report": ("撰写偏好报告", "基于赛事事实组织结论和推荐"),
+    "critique_report": ("审查报告证据", "核对推荐来源、事实边界与表达风险"),
+    "submit_report": ("提交赛后报告", "完成结构化结果并交由 Java 校验"),
+    "finish_degraded": ("生成保守报告", "在证据有限时明确边界并完成报告"),
+    "clarify": ("澄清音乐方向", "只询问会实质影响下一步的信息"),
+    "propose_tournament": ("准备世界杯入口", "把当前偏好整理为可进入的歌曲世界杯"),
+    "build_candidate_pool": ("构建世界杯候选池", "调用候选池能力完成在线发现与身份核验"),
+    "generate_exploration_report": ("生成对话探索报告", "总结当前对话中的偏好和探索方向"),
+    "recommend_music": ("生成音乐推荐", "从公开资料提取具体推荐并核验歌曲身份"),
+    "respond": ("整理音乐回应", "基于现有信息生成可继续追问的回答"),
+}
+
+def _plan_event(request_id, state: dict, workflow: str, current_completed: bool = False) -> str:
+    """Project actual ReAct decisions into a revisable public todo list."""
+    history = [item for item in state.get("action_history", []) if item.get("action") in _PLAN_ACTIONS]
+    occurrences: dict[str, int] = {}
+    items = []
+    for index, entry in enumerate(history):
+        action = entry["action"]
+        occurrences[action] = occurrences.get(action, 0) + 1
+        title, fallback_detail = _PLAN_ACTIONS[action]
+        is_current = index == len(history) - 1
+        items.append({
+            "id": f"{action}-{occurrences[action]}",
+            "title": title,
+            "status": "completed" if not is_current or current_completed or state.get("result") else "running",
+            "detail": str(entry.get("summary") or fallback_detail)[:160],
+        })
+    items = items[-5:]
     count = len(state.get("recordings", []))
-    def status(key: str, actions: set[str]) -> str:
-        if action in actions: return "running"
-        if any(item in actions for item in history): return "completed"
-        return "pending"
-    if workflow == "conversation":
-        items = [
-            {"id":"understand","title":"理解这次音乐问题","status":status("understand", {"understand_preference"}),"detail":"结合本次提问与已有对话上下文"},
-            {"id":"research","title":"按需查找音乐资料","status":status("research", {"search_web", "search_knowledge"}),"detail":"仅在回答或探索确有需要时调用工具"},
-            {"id":"decide","title":"决定下一步探索方式","status":status("decide", {"clarify", "propose_tournament", "build_candidate_pool", "generate_exploration_report", "respond"}),"detail":"继续对话、生成探索报告或进入歌曲世界杯"},
-        ]
-        goal, summary = "推进这次音乐探索对话", "Agent 正在根据对话状态自主决定下一步。"
-    elif workflow == "candidate":
+    if workflow == "candidate":
         target = state.get("request").size * 2 if state.get("request") else 0
-        items = [
-            {"id":"understand","title":"理解本次音乐偏好","status":status("understand", {"understand_preference", "resolve_named_entities"}),"detail":"已识别输入中的音乐方向"},
-            {"id":"artist-catalog","title":"核验明确艺人的作品","status":status("artist", {"expand_artist_catalog", "search_catalog"}),"detail":f"已获得 {count} 首可核验歌曲"},
-            {"id":"adjacent","title":"探索相近音乐方向","status":status("adjacent", {"search_web", "search_knowledge"}),"detail":"从公开音乐资料补充待核验线索"},
-            {"id":"verify","title":"核验新发现歌曲","status":status("verify", {"resolve_musicbrainz"}),"detail":"将外部线索转为规范歌曲身份"},
-            {"id":"review","title":"语义重排并检查候补数量","status":status("review", {"rerank_candidates", "submit_candidates"}),"detail":"并行生成入选理由，确保赛事与候补队列都满足数量要求"},
-        ]
-        goal, summary = f"为 {target // 2} 首赛事准备 {target} 首可核验候选", f"已核验 {count} / {target} 首；当前正由 Agent 决定下一步。"
+        goal, summary = f"为 {target // 2} 首赛事准备 {target} 首可核验候选", f"已核验 {count} / {target} 首；计划会随搜索结果继续调整。"
+    elif workflow == "report":
+        goal, summary = "基于本场歌曲世界杯生成偏好报告", "计划正依据赛事事实、外部证据和审查结果滚动调整。"
     else:
-        items = [
-            {"id":"facts","title":"分析本场关键选择","status":status("facts", {"analyze_tournament"}),"detail":"归纳胜出、淘汰与关键对局"},
-            {"id":"research","title":"补充探索资料","status":status("research", {"search_web", "search_knowledge"}),"detail":"按需查找公开音乐资料"},
-            {"id":"draft","title":"生成偏好报告与推荐","status":status("draft", {"draft_report"}),"detail":"基于本场赛事事实组织结论"},
-            {"id":"review","title":"审查推荐与事实边界","status":status("review", {"critique_report", "submit_report"}),"detail":"检查来源、对局依据与表达边界"},
-        ]
-        goal, summary = "基于本场歌曲世界杯生成偏好报告", "正在根据已完成的对局事实推进报告。"
-    payload = {"runId": str(request_id), "revision": len(history), "goal": goal, "summary": summary, "items": items}
+        goal, summary = "推进这次音乐探索对话", "计划正根据对话内容和工具结果滚动调整。"
+    if not items:
+        items = [{"id":"prepare-1","title":"准备本次音乐探索","status":"running","detail":"正在读取本轮请求与可用上下文"}]
+    # Starting and completing an action are distinct public snapshots, so they
+    # need distinct revisions even when action_history itself is unchanged.
+    revision = max(1, len(history) * 2 - (0 if current_completed else 1))
+    payload = {"runId": str(request_id), "revision": revision, "goal": goal, "summary": summary, "changeSummary": "已根据最新 ReAct 决策重排公开计划", "items": items}
     return f"event: plan_updated\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 async def verify_caller(authorization: str = Header(default="")):

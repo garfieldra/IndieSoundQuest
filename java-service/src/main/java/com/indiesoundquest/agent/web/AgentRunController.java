@@ -9,6 +9,7 @@ import com.indiesoundquest.identity.GuestIdentityFilter;
 import com.indiesoundquest.redis.RedisRateLimitService;
 import com.indiesoundquest.tournament.domain.GuestSession;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.*;
 import java.util.*;
@@ -47,7 +48,9 @@ public class AgentRunController {
   }
 
   @GetMapping(value="/{id}/events:stream",produces=MediaType.TEXT_EVENT_STREAM_VALUE)
-  StreamingResponseBody streamEvents(@PathVariable UUID id,@RequestParam(defaultValue="0")long afterSequence,HttpServletRequest request){var guest=((GuestSession)request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();agentRuns.owned(id,guest);return output->{long cursor=afterSequence;for(int idle=0;idle<300;idle++){var batch=agentRuns.eventsAfter(id,guest,cursor);for(var event:batch){cursor=event.getSequenceNumber();var data=json.writeValueAsString(EventView.of(event));output.write(("id: "+cursor+"\nevent: run_event\ndata: "+data+"\n\n").getBytes(StandardCharsets.UTF_8));}var status=agentRuns.owned(id,guest).getStatus();if(status==AgentRunStatus.COMPLETED||status==AgentRunStatus.FAILED||status==AgentRunStatus.CANCELLED||status==AgentRunStatus.EXPIRED)break;if(batch.isEmpty()){output.write(": heartbeat\n\n".getBytes(StandardCharsets.UTF_8));output.flush();try{Thread.sleep(1000);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();break;}}}};}
+  StreamingResponseBody streamEvents(@PathVariable UUID id,@RequestParam(defaultValue="0")long afterSequence,@RequestHeader(value="Last-Event-ID",required=false)Long lastEventId,HttpServletRequest request,HttpServletResponse response){var guest=((GuestSession)request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();agentRuns.owned(id,guest);response.setContentType(MediaType.TEXT_EVENT_STREAM_VALUE);response.setCharacterEncoding(StandardCharsets.UTF_8.name());response.setHeader(HttpHeaders.CACHE_CONTROL,"no-cache, no-transform");response.setHeader("X-Accel-Buffering","no");return output->{long cursor=Math.max(afterSequence,lastEventId==null?0:lastEventId);for(int idle=0;idle<900;idle++){var batch=agentRuns.eventsAfter(id,guest,cursor);for(var event:batch){cursor=event.getSequenceNumber();var data=json.writeValueAsString(EventView.of(event));output.write(("id: "+cursor+"\nevent: run_event\ndata: "+data+"\n\n").getBytes(StandardCharsets.UTF_8));}var status=agentRuns.owned(id,guest).getStatus();if(isStreamTerminal(status)){output.write(("event: run_status\ndata: {\"status\":\""+status.name()+"\",\"lastSequence\":"+cursor+"}\n\n").getBytes(StandardCharsets.UTF_8));output.flush();return;}if(batch.isEmpty())output.write(": heartbeat\n\n".getBytes(StandardCharsets.UTF_8));output.flush();try{Thread.sleep(1000);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();return;}}};}
+
+  private boolean isStreamTerminal(AgentRunStatus status){return status==AgentRunStatus.COMPLETED||status==AgentRunStatus.WAITING_FOR_USER||status==AgentRunStatus.FAILED||status==AgentRunStatus.CANCELLED||status==AgentRunStatus.EXPIRED;}
 
   @PostMapping(value = "/{id}/answers", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
   StreamingResponseBody answers(@PathVariable UUID id, @RequestHeader("Idempotency-Key") UUID key, @Valid @RequestBody AnswersBody body, HttpServletRequest request) {

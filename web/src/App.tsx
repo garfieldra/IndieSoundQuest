@@ -4,6 +4,7 @@ import { deriveCandidateSelection, intentModeLabel, type ArtistChoice, type Cand
 import { playbackLabel, type PlaybackState, useListeningPreview } from './listening'
 import { TournamentResultView } from './tournamentResultView'
 import { sourcePresentation } from './sourcePresentation'
+import { enqueueAgentRun, followAgentRun, progressMetricsText, type AgentRunPlan, type AgentRunProgress } from './agentRunStream'
 import './report.css'
 import './discovery.css'
 import './export.css'
@@ -18,8 +19,8 @@ type Entry = { id: string; recordingId: string; title: string; artistName: strin
 type Match = { id: string; roundNumber: number; matchIndex: number; leftEntryId: string | null; rightEntryId: string | null; winnerEntryId: string | null; status: string }
 type Tournament = { id: string; status: string; size: number; completedVoteCount: number; completedAt?: string | null; entries: Entry[]; matches: Match[]; currentMatch: Match | null }
 type Report = { runId?: string; reportId: string; tournamentId: string; version: number; status: 'PENDING' | 'RUNNING' | 'READY' | 'FAILED'; report?: { summary: string; dimensions: { name: string; confidence: string; explanation: string }[]; choiceTrajectory?: { matchId: string; roundNumber: number; matchIndex: number; winnerTitle: string; winnerArtistName: string; loserTitle: string; loserArtistName: string; signalRole: 'stable_anchor' | 'preference_boundary' | 'near_finalist'; derivedNote: string }[]; songRecommendations: { recordingId?: string; title?: string; artistName?: string; reason: string; searchUrl?: string; sourceStatus?: 'catalog_verified' | 'web_discovered'; sourceUrl?: string; sourceTitle?: string }[]; artistRecommendations: { artistId?: string; artistName?: string; reason: string; searchUrl?: string; sourceStatus?: 'catalog_verified' | 'web_discovered'; sourceUrl?: string; sourceTitle?: string }[]; explorationTags?: string[]; personalityEasterEgg: string; disclaimer: string; warnings?: string[] }; failureMessage?: string }
-type AgentProgress = { phase: string; status?: string; message: string; elapsedMs?: number }
-type AgentPlan = { revision: number; goal: string; summary: string; items: { id: string; title: string; status: 'pending' | 'running' | 'completed' | 'skipped' | 'blocked'; detail: string }[] }
+type AgentProgress = AgentRunProgress
+type AgentPlan = AgentRunPlan
 type SourceReference = { url: string; title?: string; domain?: string }
 
 function agentErrorMessage(error: unknown, fallback: string) {
@@ -35,42 +36,17 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
 }
 
 async function queuedAgentRun<T>(path: string, options: RequestInit, onProgress: (progress: AgentProgress) => void, onPlan: (plan: AgentPlan) => void): Promise<T> {
-  const queued = await api<{ runId: string }>(path, options)
-  let cursor = 0
-  for (let attempt = 0; attempt < 900; attempt++) {
-    const snapshot = await api<{ runStatus: string; events: { sequenceNumber: number; type: string; payloadJson: string }[] }>(`/agent-runs/${queued.runId}/events?afterSequence=${cursor}`)
-    for (const event of snapshot.events) {
-      cursor = Math.max(cursor, event.sequenceNumber)
-      const data = JSON.parse(event.payloadJson) as Record<string, unknown>
-      if (event.type === 'PROGRESS' || event.type === 'RETRY') onProgress({ phase: String(data.phase || 'progress'), message: String(data.message || ''), elapsedMs: Number(data.elapsedMs || 0) })
-      else if (event.type === 'PLAN_UPDATED') onPlan(data as unknown as AgentPlan)
-      else if (event.type === 'RESULT') return data as unknown as T
-      else if (event.type === 'FAILED') throw new Error(String(data.message || 'Agent 任务失败'))
-    }
-    if (snapshot.runStatus === 'FAILED') throw new Error('Agent 任务失败')
-    await new Promise(resolve => window.setTimeout(resolve, 1000))
-  }
-  throw new Error('Agent 任务等待超时')
+  const queued = await enqueueAgentRun(path, options)
+  const completed = await followAgentRun<T>(queued.runId, { onProgress, onPlan })
+  if (!completed.result) throw new Error('Agent 已结束，但没有返回可用结果')
+  return completed.result
 }
 
 async function createAndWaitForReport(tournamentId: string, force: boolean, onProgress: (progress: AgentProgress) => void, onPlan: (plan: AgentPlan) => void): Promise<Report> {
   let report = await api<Report>(`/tournaments/${tournamentId}/preference-report`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': crypto.randomUUID() }, body: JSON.stringify({ force }) })
-  let cursor = 0
-  for (let attempt = 0; attempt < 330 && report.status !== 'READY'; attempt++) {
-    if (report.status === 'FAILED') throw new Error(report.failureMessage || '报告生成失败')
-    if (report.runId) {
-      const snapshot = await api<{ runStatus: string; events: { sequenceNumber: number; type: string; payloadJson: string }[] }>(`/agent-runs/${report.runId}/events?afterSequence=${cursor}`)
-      for (const event of snapshot.events) {
-        cursor = Math.max(cursor, event.sequenceNumber)
-        const data = JSON.parse(event.payloadJson) as Record<string, unknown>
-        if (event.type === 'PROGRESS' || event.type === 'RETRY') onProgress({ phase: String(data.phase || 'progress'), message: String(data.message || ''), elapsedMs: Number(data.elapsedMs || 0) })
-        else if (event.type === 'PLAN_UPDATED') onPlan(data as unknown as AgentPlan)
-        else if (event.type === 'FAILED') throw new Error(String(data.message || '报告生成失败'))
-      }
-    }
-    await new Promise(resolve => window.setTimeout(resolve, 1000))
-    report = await api<Report>(`/tournaments/${tournamentId}/preference-report`)
-  }
+  if (report.status === 'FAILED') throw new Error(report.failureMessage || '报告生成失败')
+  if (report.status !== 'READY' && report.runId) await followAgentRun(report.runId, { onProgress, onPlan })
+  report = await api<Report>(`/tournaments/${tournamentId}/preference-report`)
   if (report.status !== 'READY') throw new Error('报告仍在处理中，请稍后重试')
   return report
 }
@@ -293,7 +269,7 @@ function AgentProgressPanel({ items, collapsed, onToggle }: { items: AgentProgre
     <button className="agent-progress-toggle" onClick={onToggle} aria-expanded={!collapsed}>
       <span>{collapsed ? '已完成本次音乐探索' : '正在梳理这次音乐探索'}</span><small>{latest?.message}</small><span>{collapsed ? '展开' : '收起'}</span>
     </button>
-    {!collapsed && <ol>{items.map((item, index) => <li key={`${item.phase}-${index}`}><span>{item.message}</span>{item.elapsedMs != null && <small>{Math.max(1, Math.round(item.elapsedMs / 1000))} 秒</small>}</li>)}</ol>}
+    {!collapsed && <ol>{items.map((item, index) => <li key={`${item.phase}-${index}`} className={item.status}><span>{item.message}</span>{progressMetricsText(item) && <small>{progressMetricsText(item)}</small>}</li>)}</ol>}
   </aside>
 }
 
@@ -301,7 +277,7 @@ function AgentPlanPanel({ plan, collapsed, onToggle }: { plan: AgentPlan; collap
   const completed = plan.items.filter(item => item.status === 'completed').length
   return <aside className={`agent-plan ${collapsed ? 'collapsed' : ''}`} aria-live="polite">
     <button className="agent-plan-toggle" onClick={onToggle} aria-expanded={!collapsed}><span>探索计划</span><small>{completed} / {plan.items.length} 已完成</small><span>{collapsed ? '展开' : '收起'}</span></button>
-    {!collapsed && <><p>{plan.goal}</p><small className="agent-plan-summary">{plan.summary}</small><ol>{plan.items.map(item => <li key={item.id} className={item.status}><i aria-hidden="true"/>{item.title}<small>{item.detail}</small></li>)}</ol></>}
+    {!collapsed && <><p>{plan.goal}</p><small className="agent-plan-summary">{plan.summary}{plan.changeSummary ? ` · ${plan.changeSummary}` : ''}</small><ol>{plan.items.map(item => <li key={item.id} className={item.status}><i aria-hidden="true"/>{item.title}<small>{item.detail}</small></li>)}</ol></>}
   </aside>
 }
 

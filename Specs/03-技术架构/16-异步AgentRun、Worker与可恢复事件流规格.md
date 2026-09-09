@@ -2,9 +2,9 @@
 
 > 状态：已实现并验收
 
-> 2026-09-08 实施记录：统一对话、候选池和赛后报告均已完成 `202 + runId`、事务 Outbox、统一 RabbitMQ Python Worker、Attempt 租约/心跳、最多三次自动重试、租约过期接管、publisher confirm、Agent DLQ、事件重放、并发幂等与 Micrometer 指标。`tournament_preference_report` 仅保存报告业务制品，执行状态统一由 `AgentRun` 控制面管理。前端采用“提交任务 -> 按 runId 读取持久事件 -> 读取业务制品”，不再依赖长 SSE 连接；旧报告专用消费者和队列已经移除，旧 SSE URL 仅保留为调用统一 AgentRun 的接口兼容层。
+> 2026-09-08 实施记录：统一对话、候选池、赛后报告和非赛事探索报告均已完成 `202 + runId`、事务 Outbox、统一 RabbitMQ Python Worker、Attempt 租约/心跳、最多三次自动重试、租约过期接管、publisher confirm、Agent DLQ、事件重放、并发幂等与 Micrometer 指标。`tournament_preference_report` 仅保存报告业务制品，执行状态统一由 `AgentRun` 控制面管理。前端采用“提交任务 -> EventSource 订阅持久事件 -> 读取业务制品”，SSE 为主协议，REST 增量读取仅作断线降级；旧报告专用消费者和队列已经移除。
 
-> 同日验收：实际 DeepSeek + MusicBrainz 候选任务生成 32 条可核验结果（16 主池 + 16 补位），随后完成 15 次投票与统一 AgentRun 赛后报告生成。人工停止报告 Worker 后，租约过期任务自动从 `RUNNING` 恢复为 `QUEUED`，Worker 重启后以第 2 次 Attempt 完成，最终只有一份 READY 报告和一个 RESULT 事件。Python 29 项、Java 20 项、Web 19 项测试通过；Prometheus 已成功抓取 Java 与 RabbitMQ，Grafana 已自动装载 `IndieSoundQuest Agent Control Plane` 看板。
+> 同日验收：实际 DeepSeek + MusicBrainz 候选任务生成 32 条可核验结果（16 主池 + 16 补位），随后完成 15 次投票与统一 AgentRun 赛后报告生成。人工停止报告 Worker 后，租约过期任务自动从 `RUNNING` 恢复为 `QUEUED`，Worker 重启后以第 2 次 Attempt 完成，最终只有一份 READY 报告和一个 RESULT 事件。升级 SSE 主协议后再次完成普通对话、候选池、赛后报告、非赛事探索报告四类真实验收；`afterSequence` 与 `Last-Event-ID` 均能准确续传。Python 29 项、Java 20 项、Web 21 项测试通过；Prometheus 已成功抓取 Java 与 RabbitMQ，Grafana 已自动装载 `IndieSoundQuest Agent Control Plane` 看板。
 
 ## 1. 目标
 
@@ -63,6 +63,8 @@ Java 是任务与业务数据的唯一事实来源。RabbitMQ 不是状态库，
 - 定期输出心跳，防止反向代理误判空闲。
 - Run 进入终态后发送终态事件并结束连接。
 - `GET /api/v1/agent-runs/{runId}/events` 作为轮询降级和排障接口。
+- 浏览器优先使用 `EventSource`；以事件 `id`/`sequence` 保存游标并自动重连两次，仍失败才使用 REST 增量恢复。
+- SSE 响应禁用代理缓冲、缓存和转换；终态由独立 `run_status` 事件明确表达。
 
 ## 5. AgentRun 状态机
 
@@ -75,7 +77,7 @@ QUEUED -> RUNNING -> WAITING_FOR_USER -> QUEUED
    +----------------------> EXPIRED
 ```
 
-- 终态：`COMPLETED / FAILED / CANCELLED / EXPIRED`。
+- 对一次 SSE 订阅而言，`COMPLETED / WAITING_FOR_USER / FAILED / CANCELLED / EXPIRED` 均结束本次连接；其中 `WAITING_FOR_USER` 是可恢复的业务暂停态而非最终失败。
 - 状态转移必须由 Java 校验，Worker 只能提交转移请求。
 - 终态不得被普通重试改写。
 - 澄清恢复产生新 Attempt，但沿用原 `runId`。

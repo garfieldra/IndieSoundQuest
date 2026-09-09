@@ -77,7 +77,7 @@ def build_candidate_pool_graph(
         target = request.size * 2
         last_observation = state["observations"][-1] if state["observations"] else {}
         no_gain = last_observation.get("status") == "failed" or (
-            last_observation.get("action") in {"search_catalog", "search_web", "search_spotify", "search_domestic_content", "resolve_musicbrainz"}
+            last_observation.get("action") in {"search_catalog", "expand_artist_catalog", "search_web", "search_spotify", "search_domestic_content", "resolve_musicbrainz"}
             and last_observation.get("outputCount", last_observation.get("hintCount", 0)) == 0
         )
         stagnation_count = state.get("stagnation_count", 0) + 1 if no_gain else 0
@@ -317,7 +317,11 @@ def build_candidate_pool_graph(
                 "sourceUrl": item.get("sourceUrl"), "musicbrainzMbid": item.get("recordingMbid"), "catalogSource": item.get("catalogSource") or "EXTERNAL_VERIFIED", "trustState": "CATALOG_IMPORTED",
             } for item in resolved if item.get("status") == "RESOLVED" and item.get("recordingId") and item.get("recordingMbid") and _candidate_allowed(item, state.get("intent_policy"))]
             merged = _merge_recordings(state["recordings"], imported)
-            return {"recordings": merged, "artist_catalog_expanded": True, "tool_history": history, "observations": state["observations"] + [{"action": action, "status": "success", "inputCount": len(resolved), "outputCount": len(imported), "verifiedCount": len(merged)}]}
+            # An empty provider response is not proof that a resolved artist has
+            # no works. Keep the expansion eligible for a later ReAct retry;
+            # otherwise one transient MusicBrainz response permanently forces
+            # the run onto weaker web hints.
+            return {"recordings": merged, "artist_catalog_expanded": bool(imported), "tool_history": history, "observations": state["observations"] + [{"action": action, "status": "success" if imported else "failed", "inputCount": len(resolved), "outputCount": len(imported), "verifiedCount": len(merged)}]}
 
         if action == "search_knowledge":
             try:

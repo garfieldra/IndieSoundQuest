@@ -32,6 +32,7 @@ class ConversationAgentRequest(ApiModel):
     user_message: str = Field(min_length=1, max_length=2000)
     summary: str = Field(default="", max_length=4000)
     recent_messages: list[dict] = Field(default_factory=list, max_length=12)
+    recent_cards: list[dict] = Field(default_factory=list, max_length=6)
     confirmed_memories: list[str] = Field(default_factory=list, max_length=20)
     recent_feedback: list[str] = Field(default_factory=list, max_length=12)
     forced_action: str | None = Field(default=None, max_length=40)

@@ -61,5 +61,5 @@ class CandidateQualityJudge:
 六个维度各打 1–5 分：intent_understanding、preference_relevance、scope_adherence、intent_appropriate_variety、reason_specificity、pool_coherence。
 多样性必须服从意图；明确单艺人锁定时，不得因艺人单一扣分。rationale 简述整体依据，concerns 只列可观察问题。
 输入：""" + json.dumps(payload, ensure_ascii=False)
-        structured = self.model.with_structured_output(CandidateJudgeResult)
+        structured = self.model.with_structured_output(CandidateJudgeResult, method="function_calling")
         return await structured.ainvoke(prompt)

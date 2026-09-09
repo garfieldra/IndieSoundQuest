@@ -6,7 +6,7 @@ import socket
 import aio_pika
 import httpx
 
-from .main import conversation_runtime, graph, report_graph, _plan_event
+from .main import conversation_runtime, graph, report_graph, _plan_event, _ACTION_PROGRESS
 from .report_schemas import TournamentReportRequest
 from .schemas import ConversationAgentRequest, CandidatePoolRequest
 from .settings import settings
@@ -14,6 +14,50 @@ from .settings import settings
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 JAVA = settings.java_internal_base_url.rstrip("/")
 HEADERS = {"Authorization": f"Bearer {settings.agent_internal_service_token}"}
+
+_PUBLIC_TOOLS = {
+    "understand_preference": ("偏好理解子任务", "subagent"),
+    "resolve_named_entities": ("艺人身份解析", "tool"),
+    "search_catalog": ("规范歌曲目录", "tool"),
+    "expand_artist_catalog": ("艺人作品扩展", "tool"),
+    "search_web": ("网络音乐搜索", "tool"),
+    "search_domestic_content": ("中文内容检索", "tool"),
+    "search_spotify": ("流媒体目录检索", "tool"),
+    "search_knowledge": ("Milvus 主题知识库", "tool"),
+    "resolve_musicbrainz": ("MusicBrainz 身份核验", "tool"),
+    "rerank_candidates": ("候选语义重排", "subagent"),
+    "analyze_tournament": ("赛事偏好分析", "subagent"),
+    "draft_report": ("报告撰写", "subagent"),
+    "critique_report": ("报告证据审查", "subagent"),
+    "generate_exploration_report": ("对话探索报告", "subagent"),
+    "recommend_music": ("普通音乐推荐", "subagent"),
+}
+
+def _tool_records(state: dict) -> list:
+    board = state.get("board") or {}
+    return list(board.get("tool_call_history", state.get("tool_history", [])) or [])
+
+def _observations(state: dict) -> list[dict]:
+    return list(state.get("observations", []) or [])
+
+def _record_value(record, key: str, default=None):
+    if isinstance(record, dict):
+        return record.get(key, default)
+    return getattr(record, key, default)
+
+def _tool_payload(run_id: str, action: str, status: str, record=None, observation: dict | None = None) -> dict:
+    name, kind = _PUBLIC_TOOLS.get(action, (action.replace("_", " "), "tool"))
+    metrics = {}
+    for key in ("inputCount", "outputCount", "verifiedCount", "sourceCount", "hintCount", "count"):
+        value = (observation or {}).get(key)
+        if isinstance(value, (int, float)): metrics[key] = value
+    duration = int(_record_value(record, "duration_ms", 0) or 0)
+    messages = {
+        "started": f"正在调用{name}",
+        "completed": f"{name}已完成",
+        "degraded": f"{name}暂不可用，Agent 正在调整计划",
+    }
+    return {"runId": run_id, "toolKey": action, "toolName": name, "kind": kind, "status": status, "message": messages[status], "durationMs": duration, "metrics": metrics}
 
 async def callback(client, run_id, path, lease, payload=None):
     headers = {**HEADERS, "X-Lease-Token": lease}
@@ -39,7 +83,7 @@ async def execute(message: aio_pika.IncomingMessage):
             pulse = asyncio.create_task(heartbeat())
             try:
                 run_type=task.get("runType","CONVERSATION")
-                if run_type == "CONVERSATION":
+                if run_type in {"CONVERSATION", "EXPLORATION_REPORT"}:
                     request = ConversationAgentRequest.model_validate(task["input"])
                     runtime_graph = conversation_runtime.graph
                     config = {"configurable": {"thread_id": str(request.agent_run_id)}, "recursion_limit": 24}
@@ -57,24 +101,49 @@ async def execute(message: aio_pika.IncomingMessage):
                     await callback(client, run_id, "report-started", lease, {"reportId": str(request.report_id)})
                 else:
                     raise ValueError(f"unsupported runType: {run_type}")
-                result = None; last_action = None; state = {}
+                result = None; last_action = None; last_plan = None; state = {}; observation_count = 0; tool_record_count = 0
                 async for state in runtime_graph.astream({"request": request}, config, stream_mode="values"):
                     action = state.get("decision").action if state.get("decision") else None
                     if action and action != last_action:
                         last_action = action
-                        payload = {"runId": run_id, "phase": action, "status": "started", "message": "Agent 正在继续处理"}
+                        phase, message_text = _ACTION_PROGRESS.get(action, (action, "Agent 正在继续处理"))
+                        payload = {"runId": run_id, "phase": phase, "status": "started", "message": message_text}
                         await callback(client, run_id, "events", lease, {"type":"progress","payloadJson":json.dumps(payload,ensure_ascii=False)})
-                    if state.get("action_history"):
-                        raw = _plan_event(request.request_id, state, plan_kind).split("data: ",1)[1].strip()
-                        await callback(client, run_id, "events", lease, {"type":"plan_updated","payloadJson":raw})
+                        if action in _PUBLIC_TOOLS:
+                            tool = _tool_payload(run_id, action, "started")
+                            await callback(client, run_id, "events", lease, {"type":"tool_started","payloadJson":json.dumps(tool,ensure_ascii=False)})
+                    records = _tool_records(state); observations = _observations(state)
+                    completed_now = False
+                    if len(records) > tool_record_count:
+                        new_records = records[tool_record_count:]
+                        tool_status = "completed" if all(str(_record_value(record, "status", "success")) == "success" for record in new_records) else "degraded"
+                        duration_ms = sum(int(_record_value(record, "duration_ms", 0) or 0) for record in new_records)
+                        observation = next((item for item in reversed(observations[observation_count:]) if item.get("action") == action), None)
+                        tool = _tool_payload(run_id, action or str(_record_value(new_records[-1], "name", "tool")), tool_status, record={"duration_ms": duration_ms}, observation=observation)
+                        await callback(client, run_id, "events", lease, {"type":f"tool_{tool_status}","payloadJson":json.dumps(tool,ensure_ascii=False)})
+                        tool_record_count = len(records); completed_now = True
+                    elif len(observations) > observation_count:
+                        for observation in observations[observation_count:]:
+                            observed_action = str(observation.get("action") or action or "tool")
+                            if observed_action not in _PUBLIC_TOOLS: continue
+                            tool_status = "completed" if observation.get("status") == "success" else "degraded"
+                            tool = _tool_payload(run_id, observed_action, tool_status, observation=observation)
+                            await callback(client, run_id, "events", lease, {"type":f"tool_{tool_status}","payloadJson":json.dumps(tool,ensure_ascii=False)})
+                        completed_now = True
+                    observation_count = len(observations)
                     if state.get("result"): result = state["result"]
+                    if state.get("action_history"):
+                        raw = _plan_event(request.request_id, state, plan_kind, current_completed=completed_now or state.get("result") is not None).split("data: ",1)[1].strip()
+                        if raw != last_plan:
+                            last_plan = raw
+                            await callback(client, run_id, "events", lease, {"type":"plan_updated","payloadJson":raw})
                 if state.get("error_code"):
                     raise RuntimeError(str(state["error_code"]))
                 if result is None: raise RuntimeError(f"{run_type.lower()} result missing")
                 # Agent results contain UUID values. Use Pydantic's JSON mode
                 # so every worker callback receives wire-safe data.
                 dumped=result.model_dump(by_alias=True, mode="json")
-                if run_type=="CONVERSATION":
+                if run_type in {"CONVERSATION", "EXPLORATION_REPORT"}:
                     card=dumped.get("cardIntent"); await callback(client,run_id,"complete",lease,{"conversationId":str(request.conversation_id),"text":dumped["text"],"card":card})
                 elif run_type=="CANDIDATE_POOL":
                     await callback(client,run_id,"complete-candidate",lease,{"size":request.size,"seedArtistIds":[str(x) for x in request.seed_artist_ids],"resultJson":json.dumps(dumped,ensure_ascii=False)})

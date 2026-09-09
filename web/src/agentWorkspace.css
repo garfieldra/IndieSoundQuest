@@ -1,0 +1,13 @@
+.conversation-agent-inline { display: none; }
+.conversation-plan li small,
+.conversation-progress li small,
+.conversation-plan-change { color: #7d7068; }
+.conversation-plan-change { display: block; padding: 0 15px 10px; }
+.conversation-progress li.started span::before { content: '进行中 · '; color: #9c493a; }
+.conversation-progress li.completed span::before { content: '完成 · '; color: #536b59; }
+.conversation-progress li.degraded span::before { content: '已调整 · '; color: #9c493a; }
+.recommendation-refinement { display: block; margin: 3px 0 14px; color: #8a6559; line-height: 1.7; }
+
+@media (max-width: 980px) {
+  .conversation-agent-inline { display: block; margin: 0 0 14px; }
+}

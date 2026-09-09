@@ -132,7 +132,7 @@ class DeepSeekCandidateSelector:
 提取输入中明确出现的艺人名称；不要凭记忆补充。evidenceSpans 只能引用用户短原文。
 只输出符合 IntentPolicy 的 JSON，字段使用 camelCase。"""
         try:
-            structured = self.model.with_structured_output(IntentPolicy)
+            structured = self.model.with_structured_output(IntentPolicy, method="function_calling")
             proposed = await structured.ainvoke(prompt)
         except Exception:
             return baseline
@@ -158,7 +158,7 @@ class DeepSeekCandidateSelector:
 意图策略：{policy.model_dump(mode='json', by_alias=True)}
 输出 PreferenceHypotheses JSON。"""
         try:
-            parsed = await self.model.with_structured_output(PreferenceHypotheses).ainvoke(prompt)
+            parsed = await self.model.with_structured_output(PreferenceHypotheses, method="function_calling").ainvoke(prompt)
             accepted = [item.model_dump() for item in parsed.hypotheses if item.evidence in preference]
             return accepted or baseline
         except Exception:
@@ -172,7 +172,7 @@ class DeepSeekCandidateSelector:
 用户文本：{preference}
 每个 mention 必须逐字出现在用户文本中。只输出符合 NamedArtistExtraction 的 JSON。"""
         try:
-            parsed = await self.model.with_structured_output(NamedArtistExtraction).ainvoke(prompt)
+            parsed = await self.model.with_structured_output(NamedArtistExtraction, method="function_calling").ainvoke(prompt)
             mentions = [item.mention for item in parsed.artists if item.mention in preference]
         except Exception:
             mentions = []
@@ -239,7 +239,7 @@ Supervisor 建议查询：{suggested_query or '无'}
 ARTIST_LOCKED 只能检索允许艺人的作品；其他模式必须在明确艺人检索之外，额外提出 1–2 条“相近艺人/专辑/歌曲”假设检索词。这些仅是待公开资料验证的探索方向，不能直接当作音乐事实。查询目的只能是 find_curated_song_lists、find_adjacent_artists、find_specific_works。
 只输出 JSON：{{"queries":[{{"purpose":"...","query":"..."}}]}}"""
         try:
-            structured = self.model.with_structured_output(ExternalQueryPlan)
+            structured = self.model.with_structured_output(ExternalQueryPlan, method="function_calling")
             plan = await structured.ainvoke(prompt)
             return _complete_external_query_plan(preference, plan.queries, hypotheses, prior_queries)
         except Exception:
