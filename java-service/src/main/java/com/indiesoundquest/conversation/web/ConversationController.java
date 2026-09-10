@@ -61,6 +61,18 @@ public class ConversationController {
     return ResponseEntity.noContent().build();
   }
 
+  @PostMapping("/{id}/archive")
+  ResponseEntity<Void> archive(@PathVariable UUID id, HttpServletRequest request) { service.archive(id, guest(request).getId()); return ResponseEntity.noContent().build(); }
+
+  @PostMapping("/{id}/restore")
+  ResponseEntity<Void> restore(@PathVariable UUID id, HttpServletRequest request) { service.restore(id, guest(request).getId()); return ResponseEntity.noContent().build(); }
+
+  @GetMapping("/{id}/memory")
+  MemoryView memory(@PathVariable UUID id, HttpServletRequest request) { return MemoryView.of(service.memoryStatus(id, guest(request).getId())); }
+
+  @PostMapping("/{id}/memory:compress")
+  MemoryView compressMemory(@PathVariable UUID id, HttpServletRequest request) { return MemoryView.of(service.compressMemory(id, guest(request).getId())); }
+
   @PostMapping("/{id}/cards")
   MessageView card(@PathVariable UUID id, @RequestHeader("Idempotency-Key") UUID key, @Valid @RequestBody Card body, HttpServletRequest request) {
     return MessageView.of(service.card(id, guest(request).getId(), key, body.type(), body.cardType(), body.payloadJson()));
@@ -101,10 +113,14 @@ public class ConversationController {
 
   record Card(@NotNull ConversationMessageType type, @NotBlank @Size(max = 40) String cardType, @NotBlank @Size(max = 20000) String payloadJson) {}
 
-  record View(UUID id, String title, String summary, ConversationStatus status, java.time.Instant lastMessageAt) {
+  record View(UUID id, String title, String summary, int summaryVersion, long summaryThroughSequence, java.time.Instant summaryUpdatedAt, ConversationStatus status, java.time.Instant lastMessageAt) {
     static View of(Conversation c) {
-      return new View(c.getId(), c.getTitle(), c.getSummary(), c.getStatus(), c.getLastMessageAt());
+      return new View(c.getId(), c.getTitle(), c.getSummary(), c.getSummaryVersion(), c.getSummaryThroughSequence(), c.getSummaryUpdatedAt(), c.getStatus(), c.getLastMessageAt());
     }
+  }
+
+  record MemoryView(int estimatedTokens,int tokenThreshold,int workingContextBudget,int providerContextWindow,int percent,int unsummarizedTurns,int turnThreshold,int retainedRecentTurns,boolean autoCompressionReady,boolean manualCompressionAvailable,int summaryVersion,long summaryThroughSequence,java.time.Instant lastCompressedAt) {
+    static MemoryView of(ConversationApplicationService.MemoryStatus value) { return new MemoryView(value.estimatedTokens(),value.tokenThreshold(),value.workingContextBudget(),value.providerContextWindow(),value.percent(),value.unsummarizedTurns(),value.turnThreshold(),value.retainedRecentTurns(),value.autoCompressionReady(),value.manualCompressionAvailable(),value.summaryVersion(),value.summaryThroughSequence(),value.lastCompressedAt()); }
   }
 
   record MessageView(UUID id, UUID agentRunId, ConversationMessageRole role, ConversationMessageType type, String content, String cardType, String cardPayloadJson, ConversationMessageStatus status, long sequenceNumber, java.time.Instant createdAt) {

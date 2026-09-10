@@ -21,6 +21,9 @@ class ConversationDecision(BaseModel):
     action: Literal["search_web", "search_knowledge", "recommend_music", "clarify", "propose_tournament", "build_candidate_pool", "generate_exploration_report", "respond"]
     public_summary: str = Field(min_length=4, max_length=100)
     query: str | None = Field(default=None, max_length=300)
+    clarification_question: str | None = Field(default=None, max_length=300)
+    clarification_reason: str | None = Field(default=None, max_length=240)
+    clarification_options: list[str] = Field(default_factory=list, max_length=8)
 
 
 class ConversationState(TypedDict, total=False):
@@ -71,6 +74,7 @@ class ConversationReActRuntime:
             api_key=settings.deepseek_api_key,
             base_url="https://api.deepseek.com",
             temperature=0.35,
+            extra_body={"thinking": {"type": "disabled"}},
             max_retries=1,
         )
         self.graph = self._build().compile(checkpointer=MemorySaver())
@@ -101,7 +105,7 @@ class ConversationReActRuntime:
 - search_web：问题需要当前公开音乐资料、外部事实或具体推荐线索；用户要求推荐、相似艺人/歌曲或风格延展时，应先搜索再回答，除非当前观察中已有足够公开资料；
 - search_knowledge：本地主题卡可以补充歌词主题或文化语境，但它不是歌曲发现主来源；
 - recommend_music：已有足够公开资料时，提取具体歌曲/艺人推荐，并通过 MusicBrainz 核验可核验的歌曲；这是普通探索 Tool，与世界杯无关；
-- clarify：偏好过于含糊或存在必须由用户选择的信息；
+- clarify：仅当同名实体、互相冲突的硬约束或会显著改变结果的缺失信息必须由用户决定时使用。可安全推断并允许之后纠正的细节不得阻塞；选择此动作时填写一个最小 clarificationQuestion、简短 clarificationReason 和实际需要的 clarificationOptions（可以为空，禁止硬凑）；
 - propose_tournament：仅当用户明确说想玩歌曲世界杯、淘汰赛或两两对决，但尚未要求立即构建候选时，展示世界杯启动卡；
 - build_candidate_pool：用户明确要求开始/直接开赛/生成 16 或 32 首世界杯候选时，调用候选池复合 Tool；
 - generate_exploration_report：用户明确要求根据当前对话生成偏好/探索报告时，调用报告复合 Tool；
@@ -151,7 +155,7 @@ class ConversationReActRuntime:
     async def answer(self, state: ConversationState, action: str) -> str:
         request = state["request"]
         if action == "clarify":
-            return "我还需要一个更明确的起点：你可以告诉我一两位喜欢的艺人、最近反复听的歌，或者想要的情绪、场景与语言范围。"
+            return state["decision"].clarification_question or "我还需要一个更明确的起点：你可以告诉我一两位喜欢的艺人、最近反复听的歌，或者想要的情绪、场景与语言范围。"
         if action == "propose_tournament":
             return "这个方向已经足够形成一场歌曲世界杯。我会在你进入候选确认后，通过在线搜索发现歌曲，并用 MusicBrainz 核验身份；候选池由你确认后才会正式开赛。"
         if action == "build_candidate_pool":
@@ -298,6 +302,19 @@ class ConversationReActRuntime:
                         "defaultSize": 32,
                     },
                 )
+            elif action == "clarify":
+                decision = state["decision"]
+                question = decision.clarification_question or text
+                card = ConversationCardIntent(
+                    message_type="CLARIFICATION_CARD",
+                    card_type="GENERAL_CLARIFICATION",
+                    payload={
+                        "question": question,
+                        "reason": decision.clarification_reason or "这个信息会实质影响下一步的结果。",
+                        "options": decision.clarification_options,
+                        "allowFreeText": True,
+                    },
+                )
             elif action == "respond" and state.get("web_sources"):
                 card = _public_source_card(state["web_sources"])
             return {
@@ -326,6 +343,67 @@ class ConversationReActRuntime:
         graph.add_edge("supervisor", "execute_action")
         graph.add_conditional_edges("execute_action", route, {"supervisor": "supervisor", "end": END})
         return graph
+
+    async def compress_memory(self, previous_summary: str, compression_messages: list[dict]) -> str:
+        """Incrementally compress an old transcript segment, never the recent raw window."""
+        if self.model is None:
+            parts = [previous_summary.strip()]
+            parts.extend(
+                f"{str(item.get('role') or '')}：{str(item.get('content') or '').strip()}"
+                for item in compression_messages
+                if isinstance(item, dict) and str(item.get("content") or "").strip()
+            )
+            return "\n".join(dict.fromkeys(item for item in parts if item))[-12000:]
+        prompt = f"""你是对话记忆压缩器。只输出可供下一轮使用的中文摘要，不输出思维链或 JSON。
+将旧摘要与这一段即将离开近期窗口的公开对话合并为中期记忆。这不是用户画像，不要总结尚未传入的新消息。
+保留：持续目标、明确偏好、排除项、已确认实体、未解决问题、有用结论与必要的上下文。新增段与旧摘要冲突时以新增段为准。
+不得加入密钥、Cookie、内部地址、未展示工具响应、思维链或自行推断的人格结论。按信息密度组织，最多 2400 字。
+旧摘要：{previous_summary}
+本次增量压缩段：{compression_messages}"""
+        try:
+            response = await self.model.ainvoke(prompt)
+            value = str(response.content).strip()
+            return value[:12000] if value else previous_summary[:12000]
+        except Exception:
+            additions = "\n".join(
+                f"{str(item.get('role') or '')}：{str(item.get('content') or '').strip()}"
+                for item in compression_messages if str(item.get("content") or "").strip()
+            )
+            return f"{previous_summary.strip()}\n{additions}".strip()[-12000:]
+
+    async def build_memory_summary(self, request: ConversationAgentRequest, result: ConversationAgentResult) -> str | None:
+        if not request.memory_compression_messages or request.memory_compression_through_sequence <= request.summary_through_sequence:
+            return None
+        result.memory_summary_through_sequence = request.memory_compression_through_sequence
+        return await self.compress_memory(request.summary, request.memory_compression_messages)
+
+    async def resume(self, request: ConversationResumeRequest) -> ConversationAgentResult:
+        if request.resume_kind == "ARTIST_IDENTITY":
+            return await self.run_candidate_pool(request.guest_id, request.preference_text, request.pool_size, request.confirmed_artists)
+        original = dict(request.original_request)
+        original.update({
+            "requestId": str(request.request_id),
+            "agentRunId": str(request.agent_run_id),
+            "conversationId": str(request.conversation_id),
+            "guestId": request.guest_id,
+            "userMessage": f"针对上一轮必要澄清，用户回答：{request.answer}",
+            "forcedAction": None,
+        })
+        context = list(original.get("recentMessages") or [])
+        context.append({"role": "USER", "content": request.answer})
+        original["recentMessages"] = context[-12:]
+        resumed = ConversationAgentRequest.model_validate(original)
+        result = None
+        async for state in self.graph.astream(
+            {"request": resumed},
+            {"configurable": {"thread_id": str(request.agent_run_id)}, "recursion_limit": 24},
+            stream_mode="values",
+        ):
+            result = state.get("result") or result
+        if result is None:
+            raise RuntimeError("resumed conversation result missing")
+        result.memory_summary = await self.build_memory_summary(resumed, result)
+        return result
 
     async def _build_candidate_pool_result(self, state: ConversationState, preference_text: str, size: int, confirmed_artists: list[ConfirmedArtist]):
         request = state["request"]
@@ -505,7 +583,11 @@ def _fallback_decision(state: ConversationState) -> ConversationDecision:
         query = text if question_signal else f"{text} 音乐推荐 相似艺人 歌曲"
         return ConversationDecision(action="search_web", public_summary="正在检索相关音乐资料与推荐线索", query=query[:300])
     if len(text) < 5:
-        return ConversationDecision(action="clarify", public_summary="还需要一个更明确的音乐起点")
+        return ConversationDecision(
+            action="clarify", public_summary="还需要一个更明确的音乐起点",
+            clarification_question="你希望从哪位艺人、哪首歌，或哪种情绪与场景开始？",
+            clarification_reason="当前信息不足以确定你想探索的音乐方向。",
+        )
     return ConversationDecision(action="respond", public_summary="结合当前对话整理音乐回应")
 
 

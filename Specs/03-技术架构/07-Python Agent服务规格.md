@@ -299,7 +299,7 @@ class ChatModelProvider(Protocol):
 
 ```text
 LLM_PROVIDER=deepseek
-LLM_MODEL=deepseek-chat
+LLM_MODEL=deepseek-v4-flash
 LLM_API_KEY=...
 LLM_BASE_URL=https://api.deepseek.com
 LLM_TIMEOUT_SECONDS=45

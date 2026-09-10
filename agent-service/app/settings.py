@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     agent_internal_service_token: str = "change-me"
     java_internal_base_url: str = "http://java-service:8080"
     llm_provider: str = "deepseek"
-    llm_model: str = "deepseek-chat"
+    llm_model: str = "deepseek-v4-flash"
     deepseek_api_key: str | None = None
     tavily_api_key: str | None = None
     bocha_api_key: str | None = None

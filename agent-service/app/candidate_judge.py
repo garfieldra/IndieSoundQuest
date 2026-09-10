@@ -33,6 +33,7 @@ class CandidateQualityJudge:
             api_key=settings.deepseek_api_key,
             base_url="https://api.deepseek.com",
             temperature=0,
+            extra_body={"thinking": {"type": "disabled"}},
         )
 
     async def evaluate(self, case: dict[str, Any], result: dict[str, Any], catalog: dict[str, dict]) -> CandidateJudgeResult:

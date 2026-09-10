@@ -29,6 +29,7 @@ class ReportGenerator:
             api_key=settings.deepseek_api_key,
             base_url="https://api.deepseek.com",
             temperature=0.25,
+            extra_body={"thinking": {"type": "disabled"}},
             model_kwargs={"response_format": {"type": "json_object"}},
             max_retries=1,
         )

@@ -17,10 +17,13 @@ import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 import java.nio.charset.StandardCharsets;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @RestController
 @RequestMapping("/api/v1/agent-runs")
 public class AgentRunController {
+  private static final Logger log = LoggerFactory.getLogger(AgentRunController.class);
   private final AgentRunApplicationService agentRuns;
   private final ConversationApplicationService conversations;
   private final ConversationAgentGateway agent;
@@ -65,16 +68,16 @@ public class AgentRunController {
         if (run.getStatus() != AgentRunStatus.WAITING_FOR_USER) throw new IllegalStateException("AGENT_RUN_NOT_WAITING");
         var snapshot = json.readTree(run.getContextSnapshotJson() == null ? "{}" : run.getContextSnapshotJson());
         var conversationId = run.getConversationId();
+        var publicAnswer = Optional.ofNullable(body.answer()).filter(value -> !value.isBlank()).orElseGet(() -> Optional.ofNullable(body.selections()).orElse(List.of()).stream().map(item -> item.mention() + "：" + item.name()).reduce((left, right) -> left + "；" + right).orElse("已确认澄清选项"));
+        conversations.appendClarificationAnswer(conversationId, guest, key, publicAnswer);
         agentRuns.resume(id);
-        var confirmed = body.selections().stream().map(item -> Map.<String, Object>of("mention", item.mention(), "mbid", item.mbid().toString(), "name", item.name())).toList();
-        var payload = Map.<String, Object>of(
-            "requestId", id,
-            "agentRunId", id,
-            "conversationId", conversationId,
-            "guestId", guest.toString(),
-            "preferenceText", snapshot.path("preferenceText").asText(),
-            "poolSize", snapshot.path("poolSize").asInt(32),
-            "confirmedArtists", confirmed);
+        var confirmed = Optional.ofNullable(body.selections()).orElse(List.of()).stream().map(item -> Map.<String, Object>of("mention", item.mention(), "mbid", item.mbid().toString(), "name", item.name())).toList();
+        var resumeKind = snapshot.path("resumeKind").asText("ARTIST_IDENTITY");
+        var payload = new LinkedHashMap<String, Object>();
+        payload.put("requestId", id); payload.put("agentRunId", id); payload.put("conversationId", conversationId); payload.put("guestId", guest.toString());
+        payload.put("resumeKind", resumeKind); payload.put("preferenceText", snapshot.path("preferenceText").asText()); payload.put("poolSize", snapshot.path("poolSize").asInt(32)); payload.put("confirmedArtists", confirmed);
+        payload.put("answer", Optional.ofNullable(body.answer()).orElse(""));
+        if (snapshot.has("originalRequest")) payload.put("originalRequest", json.convertValue(snapshot.path("originalRequest"), Map.class));
         var result = agent.resume(payload, id, event -> {
           try {
             agentRuns.relaySseEvent(id, event.type(), event.data());
@@ -85,6 +88,7 @@ public class AgentRunController {
         agentRuns.complete(id, json.writeValueAsString(Map.of("messageId", message.getId())));
         write(output, "message_completed", json.writeValueAsString(Map.of("id", message.getId(), "content", message.getTextContent())));
       } catch (Exception e) {
+        log.error("Failed to resume Agent Run {} after clarification", id, e);
         write(output, "error", "{\"code\":\"AGENT_ANSWER_FAILED\",\"message\":\"澄清答案暂时无法处理，请稍后重试\"}");
       }
     };
@@ -97,7 +101,9 @@ public class AgentRunController {
     } catch (Exception ignored) {}
   }
 
-  record AnswersBody(@NotEmpty List<@Valid Selection> selections) {}
+  record AnswersBody(List<@Valid Selection> selections, @Size(max = 2000) String answer) {
+    AnswersBody { if ((selections == null || selections.isEmpty()) && (answer == null || answer.isBlank())) throw new IllegalArgumentException("answer or selections is required"); }
+  }
 
   record Selection(@NotBlank @Size(max = 120) String mention, @NotNull UUID mbid, @NotBlank @Size(max = 160) String name) {}
 

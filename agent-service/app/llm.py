@@ -115,6 +115,7 @@ class DeepSeekCandidateSelector:
         self.model = None if not settings.deepseek_api_key else ChatOpenAI(
             model=settings.llm_model, api_key=settings.deepseek_api_key,
             base_url="https://api.deepseek.com", temperature=0.35,
+            extra_body={"thinking": {"type": "disabled"}},
         )
 
     async def infer_intent(self, preference: str, seed_artist_ids: list[UUID]) -> IntentPolicy:

@@ -144,7 +144,20 @@ async def execute(message: aio_pika.IncomingMessage):
                 # so every worker callback receives wire-safe data.
                 dumped=result.model_dump(by_alias=True, mode="json")
                 if run_type in {"CONVERSATION", "EXPLORATION_REPORT"}:
-                    card=dumped.get("cardIntent"); await callback(client,run_id,"complete",lease,{"conversationId":str(request.conversation_id),"text":dumped["text"],"card":card})
+                    card=dumped.get("cardIntent")
+                    if card and card.get("messageType") == "CLARIFICATION_CARD":
+                        resume_kind = "ARTIST_IDENTITY" if card.get("cardType") == "ARTIST_IDENTITY" else "GENERAL_CLARIFICATION"
+                        snapshot = {
+                            "resumeKind": resume_kind,
+                            "originalRequest": task["input"],
+                            "preferenceText": card.get("payload", {}).get("preferenceText", request.user_message),
+                            "poolSize": card.get("payload", {}).get("poolSize", 32),
+                        }
+                        await callback(client,run_id,"waiting",lease,{"conversationId":str(request.conversation_id),"text":dumped["text"],"card":card,"snapshot":snapshot})
+                    else:
+                        dumped["memorySummary"] = await conversation_runtime.build_memory_summary(request, result)
+                        dumped["memorySummaryThroughSequence"] = result.memory_summary_through_sequence
+                        await callback(client,run_id,"complete",lease,{"conversationId":str(request.conversation_id),"text":dumped["text"],"card":card,"memorySummary":dumped["memorySummary"],"memorySummaryThroughSequence":dumped.get("memorySummaryThroughSequence")})
                 elif run_type=="CANDIDATE_POOL":
                     await callback(client,run_id,"complete-candidate",lease,{"size":request.size,"seedArtistIds":[str(x) for x in request.seed_artist_ids],"resultJson":json.dumps(dumped,ensure_ascii=False)})
                 else:

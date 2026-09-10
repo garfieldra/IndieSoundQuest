@@ -12,6 +12,7 @@ from app.conversation_graph import (
     _unique_song_drafts,
 )
 from app.schemas import CandidateItem, CandidatePoolResult, ConversationAgentRequest
+from app.schemas import ConversationResumeRequest
 
 
 class FakeWeb:
@@ -153,6 +154,77 @@ async def test_ordinary_preference_and_recommendation_never_auto_propose_world_c
     assert result is not None
     assert result.action not in {"propose_tournament", "build_candidate_pool"}
     assert result.card_intent is None or result.card_intent.card_type == "PUBLIC_MUSIC_SOURCES"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_short_request_becomes_resumable_general_clarification():
+    result = await run("随便")
+    assert result is not None
+    assert result.action == "clarify"
+    assert result.card_intent is not None
+    assert result.card_intent.card_type == "GENERAL_CLARIFICATION"
+    assert result.card_intent.payload["allowFreeText"] is True
+
+
+@pytest.mark.asyncio
+async def test_general_clarification_answer_resumes_same_run():
+    runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge())
+    runtime.model = None
+    run_id = uuid4()
+    original = ConversationAgentRequest(
+        requestId=run_id, agentRunId=run_id, conversationId=uuid4(), guestId="guest",
+        userMessage="随便", summary="用户正在寻找新的音乐起点。",
+        recentMessages=[{"role": "USER", "content": "随便"}],
+    )
+    request = ConversationResumeRequest(
+        requestId=run_id, agentRunId=run_id, conversationId=original.conversation_id,
+        guestId="guest", resumeKind="GENERAL_CLARIFICATION",
+        answer="我想听适合雨夜散步、克制但不阴郁的华语歌",
+        originalRequest=original.model_dump(by_alias=True, mode="json"),
+    )
+    result = await runtime.resume(request)
+    assert result.action == "recommend_music"
+    assert result.memory_summary is None
+    assert result.memory_summary_through_sequence is None
+
+
+@pytest.mark.asyncio
+async def test_medium_term_memory_incrementally_compresses_only_supplied_old_segment():
+    runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge())
+    runtime.model = None
+    request_id = uuid4()
+    request = ConversationAgentRequest(
+        requestId=request_id, agentRunId=request_id, conversationId=uuid4(), guestId="guest",
+        userMessage="不要太悲伤，保留一点律动", summary="用户喜欢夜晚散步时听的华语独立音乐。",
+        recentMessages=[{"role": "USER", "content": "想要更冷一点"}],
+        summaryThroughSequence=8,
+        memoryCompressionMessages=[
+            {"role": "USER", "content": "不喜欢过度煽情的编曲", "sequenceNumber": 9},
+            {"role": "ASSISTANT", "content": "后续会保留克制感", "sequenceNumber": 10},
+        ],
+        memoryCompressionThroughSequence=10,
+    )
+    result = await run("普通音乐回答测试")
+    summary = await runtime.build_memory_summary(request, result)
+    assert "华语独立音乐" in summary
+    assert "过度煽情" in summary
+    assert "不要太悲伤" not in summary
+    assert result.memory_summary_through_sequence == 10
+
+
+@pytest.mark.asyncio
+async def test_medium_term_memory_does_not_change_without_compression_segment():
+    runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge())
+    runtime.model = None
+    request_id = uuid4()
+    request = ConversationAgentRequest(
+        requestId=request_id, agentRunId=request_id, conversationId=uuid4(), guestId="guest",
+        userMessage="再推荐一些", summary="已有摘要", recentMessages=[],
+        summaryThroughSequence=6,
+    )
+    result = await run("普通音乐回答测试")
+    assert await runtime.build_memory_summary(request, result) is None
+    assert result.memory_summary_through_sequence is None
 
 
 @pytest.mark.asyncio

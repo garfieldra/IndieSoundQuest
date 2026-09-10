@@ -15,7 +15,7 @@ from .report_graph import build_report_graph
 from .report_llm import ReportGenerator
 from .report_schemas import TournamentReportRequest
 from .llm import DeepSeekCandidateSelector
-from .schemas import CandidatePoolRequest, ConversationAgentRequest, ConversationResumeRequest
+from .schemas import CandidatePoolRequest, ConversationAgentRequest, ConversationResumeRequest, MemoryCompressionRequest, MemoryCompressionResponse
 from .settings import settings
 from .tools import DomesticContentResearchTool, KnowledgeSearchTool, MusicCatalogTool, SpotifyCatalogTool, TournamentFactsTool, WebSearchTool
 from .registry import skill_registry, tool_registry
@@ -144,6 +144,11 @@ async def live(): return {"status":"UP"}
 @app.get("/health/ready")
 async def ready(): return {"status":"UP", "catalog":"configured", "modelProvider": settings.llm_provider, "webSearch": bool(settings.tavily_api_key), "spotifyDiscovery": settings.spotify_discovery_enabled and spotify_catalog.enabled, "toolRegistry": tool_registry.summaries(), "skills": skill_registry.summaries(), "domesticResearch": {"zhihu": settings.zhihu_research_enabled, "bilibili": settings.bilibili_research_enabled, "douban": settings.douban_research_enabled}}
 
+@app.post("/internal/v1/memory:compress", response_model=MemoryCompressionResponse, dependencies=[Depends(verify_caller)])
+async def compress_memory(request: MemoryCompressionRequest):
+    summary = await conversation_runtime.compress_memory(request.previous_summary, request.messages)
+    return MemoryCompressionResponse(summary=summary, through_sequence=request.through_sequence)
+
 @app.post("/internal/v1/workflows/conversation:stream", dependencies=[Depends(verify_caller)])
 async def conversation(request: ConversationAgentRequest, x_request_id: str = Header()):
     if str(request.request_id) != x_request_id: raise HTTPException(400, "X-Request-Id must match requestId")
@@ -163,6 +168,8 @@ async def conversation(request: ConversationAgentRequest, x_request_id: str = He
                         last_plan = plan; yield plan
                 if state.get("result"): result = state["result"]
             if result is None: raise RuntimeError("conversation result missing")
+            if not (result.card_intent and result.card_intent.message_type == "CLARIFICATION_CARD"):
+                result.memory_summary = await conversation_runtime.build_memory_summary(request, result)
             logger.info("conversation ReAct completed request_id=%s trace=%s", request.request_id, result.trace_summary)
             yield f"event: result\ndata: {result.model_dump_json(by_alias=True)}\n\n"
         except Exception:
@@ -174,11 +181,13 @@ async def conversation(request: ConversationAgentRequest, x_request_id: str = He
 async def conversation_resume(request: ConversationResumeRequest, x_request_id: str = Header()):
     if str(request.request_id) != x_request_id: raise HTTPException(400, "X-Request-Id must match requestId")
     async def events():
-        yield _progress(request.request_id, "build_candidate_pool", 0)
+        initial_action = "build_candidate_pool" if request.resume_kind == "ARTIST_IDENTITY" else "clarify"
+        yield _progress(request.request_id, initial_action, 0)
         try:
-            confirmed = request.confirmed_artists
-            result = await conversation_runtime.run_candidate_pool(request.guest_id, request.preference_text, request.pool_size, confirmed)
-            yield f"event: progress\ndata: {json.dumps({'runId': str(request.request_id), 'phase': 'build_candidate_pool', 'status': 'running', 'message': '正在根据确认结果继续构建候选池', 'elapsedMs': 0}, ensure_ascii=False)}\n\n"
+            result = await conversation_runtime.resume(request)
+            phase = "build_candidate_pool" if request.resume_kind == "ARTIST_IDENTITY" else "resume_conversation"
+            message = "正在根据确认结果继续构建候选池" if request.resume_kind == "ARTIST_IDENTITY" else "已收到补充信息，正在继续本轮探索"
+            yield f"event: progress\ndata: {json.dumps({'runId': str(request.request_id), 'phase': phase, 'status': 'running', 'message': message, 'elapsedMs': 0}, ensure_ascii=False)}\n\n"
             logger.info("conversation resume completed request_id=%s trace=%s", request.request_id, result.trace_summary)
             yield f"event: result\ndata: {result.model_dump_json(by_alias=True)}\n\n"
         except Exception:

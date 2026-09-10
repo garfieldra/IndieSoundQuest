@@ -30,8 +30,12 @@ class ConversationAgentRequest(ApiModel):
     conversation_id: UUID
     guest_id: str = Field(min_length=1, max_length=80)
     user_message: str = Field(min_length=1, max_length=2000)
-    summary: str = Field(default="", max_length=4000)
-    recent_messages: list[dict] = Field(default_factory=list, max_length=12)
+    summary: str = Field(default="", max_length=12000)
+    summary_through_sequence: int = Field(default=0, ge=0)
+    memory_compression_messages: list[dict] = Field(default_factory=list, max_length=1000)
+    memory_compression_through_sequence: int = Field(default=0, ge=0)
+    memory_compression_reason: str | None = Field(default=None, max_length=40)
+    recent_messages: list[dict] = Field(default_factory=list, max_length=1000)
     recent_cards: list[dict] = Field(default_factory=list, max_length=6)
     confirmed_memories: list[str] = Field(default_factory=list, max_length=20)
     recent_feedback: list[str] = Field(default_factory=list, max_length=12)
@@ -44,7 +48,10 @@ class ConversationResumeRequest(ApiModel):
     agent_run_id: UUID
     conversation_id: UUID
     guest_id: str = Field(min_length=1, max_length=80)
-    preference_text: str = Field(min_length=3, max_length=2000)
+    resume_kind: Literal["ARTIST_IDENTITY", "GENERAL_CLARIFICATION"] = "ARTIST_IDENTITY"
+    preference_text: str = Field(default="", max_length=2000)
+    answer: str = Field(default="", max_length=2000)
+    original_request: dict = Field(default_factory=dict)
     pool_size: Literal[16, 32] = 32
     confirmed_artists: list["ConfirmedArtist"] = Field(default_factory=list, max_length=8)
 
@@ -60,6 +67,20 @@ class ConversationAgentResult(ApiModel):
     card_intent: ConversationCardIntent | None = None
     action: str = Field(min_length=1, max_length=40)
     trace_summary: dict = Field(default_factory=dict)
+    memory_summary: str | None = Field(default=None, max_length=12000)
+    memory_summary_through_sequence: int | None = Field(default=None, ge=0)
+
+
+class MemoryCompressionRequest(ApiModel):
+    conversation_id: UUID
+    previous_summary: str = Field(default="", max_length=12000)
+    messages: list[dict] = Field(min_length=1, max_length=1000)
+    through_sequence: int = Field(ge=1)
+
+
+class MemoryCompressionResponse(ApiModel):
+    summary: str = Field(min_length=1, max_length=12000)
+    through_sequence: int = Field(ge=1)
 
 
 class ConfirmedArtist(ApiModel):
