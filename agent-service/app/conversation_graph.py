@@ -397,8 +397,8 @@ reason 要具体说明它与用户偏好的声音、情绪、文本、场景或�
                 card_intent=_public_source_card(sources), action="recommend_music",
                 trace_summary={"webSourceCount": len(sources), "verifiedSongCount": 0, "modelDegraded": True},
             )
-        songs = [item for item in draft.songs if item.source_url in source_urls]
-        artists = [item for item in draft.artists if item.source_url in source_urls]
+        songs = _unique_song_drafts([item for item in draft.songs if item.source_url in source_urls])
+        artists = _unique_artist_drafts([item for item in draft.artists if item.source_url in source_urls])
         if _requests_fresh_set(request.user_message):
             prior_song_keys = {
                 _music_key(str(item.get("title") or "") + "|" + str(item.get("artistName") or ""))
@@ -458,6 +458,7 @@ reason 要具体说明它与用户偏好的声音、情绪、文本、场景或�
                 card_intent=_public_source_card(sources), action="recommend_music",
                 trace_summary={"webSourceCount": len(sources), "verifiedSongCount": 0, "unresolvedSongCount": len(songs)},
             )
+        verified_songs = list({item["recordingId"]: item for item in verified_songs}.values())
         payload = {
             "title": "这轮音乐探索的推荐方向", "summary": draft.summary,
             "songs": verified_songs[:7], "artists": artist_items[:3],
@@ -611,6 +612,20 @@ def _public_source_items(sources: list[dict], limit: int = 6) -> list[dict]:
 
 def _music_key(value: str) -> str:
     return re.sub(r"[^\w\u3400-\u9fff]", "", value.casefold())
+
+
+def _unique_song_drafts(items: list[RecommendedSongDraft]) -> list[RecommendedSongDraft]:
+    unique: dict[str, RecommendedSongDraft] = {}
+    for item in items:
+        unique.setdefault(_music_key(f"{item.artist_name}|{item.title}"), item)
+    return list(unique.values())
+
+
+def _unique_artist_drafts(items: list[RecommendedArtistDraft]) -> list[RecommendedArtistDraft]:
+    unique: dict[str, RecommendedArtistDraft] = {}
+    for item in items:
+        unique.setdefault(_music_key(item.artist_name), item)
+    return list(unique.values())
 
 
 def _netease_search_url(title: str, artist_name: str) -> str:

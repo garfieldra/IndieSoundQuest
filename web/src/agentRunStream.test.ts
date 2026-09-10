@@ -14,4 +14,11 @@ describe('AgentRun public events', () => {
   it('does not expose unrelated event payloads as progress', () => {
     expect(publicProgress({ sequenceNumber: 5, type: 'RESULT', payloadJson: '{}' }, {})).toBeNull()
   })
+
+  it('projects cancellation into a visible terminal message', () => {
+    expect(publicProgress(
+      { sequenceNumber: 6, type: 'CANCELLED', payloadJson: '{}' },
+      { phase: 'cancelled', message: '已停止本轮任务' },
+    )).toMatchObject({ phase: 'cancelled', message: '已停止本轮任务' })
+  })
 })

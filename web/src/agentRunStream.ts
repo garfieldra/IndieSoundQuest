@@ -12,7 +12,7 @@ type Callbacks = {
 const terminal = new Set(['COMPLETED', 'WAITING_FOR_USER', 'FAILED', 'CANCELLED', 'EXPIRED'])
 
 export function publicProgress(event: AgentRunEvent, data: Record<string, unknown>): AgentRunProgress | null {
-  if (!['PROGRESS', 'RETRY', 'TOOL_STARTED', 'TOOL_COMPLETED', 'TOOL_DEGRADED'].includes(event.type)) return null
+  if (!['PROGRESS', 'RETRY', 'TOOL_STARTED', 'TOOL_COMPLETED', 'TOOL_DEGRADED', 'CANCELLED'].includes(event.type)) return null
   return {
     phase: String(data.phase || data.toolKey || event.type.toLowerCase()),
     status: String(data.status || '').trim() || undefined,
@@ -74,7 +74,7 @@ export function followAgentRun<T>(runId: string, callbacks: Callbacks = {}, time
           const snapshot = await response.json() as { runStatus: string; events: AgentRunEvent[] }
           snapshot.events.forEach(consume)
           if (terminal.has(snapshot.runStatus)) {
-            if (snapshot.runStatus === 'FAILED' || snapshot.runStatus === 'CANCELLED' || snapshot.runStatus === 'EXPIRED') finish(undefined, new Error('Agent 任务失败'))
+            if (snapshot.runStatus === 'FAILED' || snapshot.runStatus === 'EXPIRED') finish(undefined, new Error('Agent 任务失败'))
             else finish({ status: snapshot.runStatus, result })
             return
           }
@@ -92,7 +92,7 @@ export function followAgentRun<T>(runId: string, callbacks: Callbacks = {}, time
       source.addEventListener('run_status', raw => {
         const value = JSON.parse((raw as MessageEvent).data) as { status: string }
         if (!terminal.has(value.status)) return
-        if (value.status === 'FAILED' || value.status === 'CANCELLED' || value.status === 'EXPIRED') finish(undefined, new Error('Agent 任务失败'))
+        if (value.status === 'FAILED' || value.status === 'EXPIRED') finish(undefined, new Error('Agent 任务失败'))
         else finish({ status: value.status, result })
       })
       source.onerror = () => {

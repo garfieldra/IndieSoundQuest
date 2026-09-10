@@ -133,6 +133,12 @@ public class ConversationApplicationService {
   }
 
   @Transactional
+  public void cancelRun(UUID id, UUID guestId, UUID runId) {
+    owned(id, guestId);
+    messages.findByConversationIdAndAgentRunId(id, runId).ifPresent(message -> { message.cancel(); messages.save(message); });
+  }
+
+  @Transactional
   public ConversationMessage card(UUID id, UUID guestId, UUID clientId, ConversationMessageType type, String cardType, String payload) {
     owned(id, guestId);
     var existing = messages.findByConversationIdAndClientMessageId(id, clientId);

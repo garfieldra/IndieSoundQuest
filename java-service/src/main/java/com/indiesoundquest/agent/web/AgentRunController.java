@@ -52,6 +52,9 @@ public class AgentRunController {
 
   private boolean isStreamTerminal(AgentRunStatus status){return status==AgentRunStatus.COMPLETED||status==AgentRunStatus.WAITING_FOR_USER||status==AgentRunStatus.FAILED||status==AgentRunStatus.CANCELLED||status==AgentRunStatus.EXPIRED;}
 
+  @PostMapping("/{id}/cancel")
+  ResponseEntity<Void> cancel(@PathVariable UUID id,HttpServletRequest request){var guest=((GuestSession)request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();var run=agentRuns.cancel(id,guest);if(run.getConversationId()!=null)conversations.cancelRun(run.getConversationId(),guest,id);return ResponseEntity.noContent().build();}
+
   @PostMapping(value = "/{id}/answers", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
   StreamingResponseBody answers(@PathVariable UUID id, @RequestHeader("Idempotency-Key") UUID key, @Valid @RequestBody AnswersBody body, HttpServletRequest request) {
     var guest = ((GuestSession) request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();

@@ -63,6 +63,7 @@ export function ConversationApp() {
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameDraft, setRenameDraft] = useState('')
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null)
+  const [currentRunId, setCurrentRunId] = useState<string | null>(null)
   const timelineRef = useRef<HTMLElement>(null)
   const resumingRunId = useRef<string | null>(null)
   const runStartedAt = useRef<number | null>(null)
@@ -80,45 +81,46 @@ export function ConversationApp() {
     if (!conversationId) return
     const loaded = await api<Message[]>(`/conversations/${conversationId}/messages`)
     setMessages(loaded)
-    const waitingRun = loaded.find(message => message.type === 'AGENT_RUN' && message.status === 'RUNNING' && message.agentRunId)
-    if (waitingRun?.agentRunId) await replayRunEvents(waitingRun.agentRunId)
+    const latestRun = [...loaded].reverse().find(message => message.type === 'AGENT_RUN' && message.agentRunId)
+    if (latestRun?.agentRunId) await replayRunEvents(latestRun.agentRunId)
   }
   async function replayRunEvents(runId: string) {
     try {
       const payload = await api<{ runStatus: string; events: RunEvent[] }>(`/agent-runs/${runId}/events`)
       const replayProgress: Progress[] = []
-      let replayPlan: Plan | null = null
+      const replayPlans: Plan[] = []
       let cursor = 0
       for (const event of payload.events) {
         cursor = Math.max(cursor, event.sequenceNumber)
         const data = JSON.parse(event.payloadJson) as Record<string, unknown>
         const item = publicProgress(event, data)
         if (item) replayProgress.push(item)
-        if (event.type === 'PLAN_UPDATED') replayPlan = data as unknown as Plan
+        if (event.type === 'PLAN_UPDATED') replayPlans.push(data as unknown as Plan)
       }
       if (replayProgress.length) setProgress(replayProgress)
-      if (replayPlan) recordPlan(replayPlan)
+      if (replayPlans.length) { setPlanHistory(replayPlans.slice(-8)); setPlan(replayPlans[replayPlans.length - 1]) }
       if (payload.runStatus === 'RUNNING' || payload.runStatus === 'QUEUED') {
+        setCurrentRunId(runId)
         setCollapsed(false)
         if (resumingRunId.current !== runId) {
           resumingRunId.current = runId; setPending(true)
           void followAgentRun(runId, { onProgress: item => setProgress(previous => [...previous, item]), onPlan: recordPlan }, 15 * 60_000, cursor)
             .then(() => refreshMessages())
             .catch(error => setNotice(friendlyError(error)))
-            .finally(() => { resumingRunId.current = null; setPending(false); setCollapsed(true) })
+            .finally(() => { resumingRunId.current = null; setCurrentRunId(null); setPending(false); setCollapsed(true) })
         }
-      } else if (payload.runStatus === 'WAITING_FOR_USER') setCollapsed(false)
+      } else { setCurrentRunId(null); if (payload.runStatus === 'WAITING_FOR_USER') setCollapsed(false); else setCollapsed(true) }
     } catch { /* replay is best-effort */ }
   }
   async function boot() {
     try { const list = await api<Conversation[]>('/conversations'); setConversations(list); if (list[0]) await open(list[0]); else await createConversation() } catch (error) { setNotice(friendlyError(error)) }
   }
   async function createConversation() {
-    try { const created = await api<Conversation>('/conversations', { method: 'POST' }); setConversations(previous => [created, ...previous]); setCurrent(created); setMessages([]); setNotice('') } catch (error) { setNotice(friendlyError(error)) }
+    try { const created = await api<Conversation>('/conversations', { method: 'POST' }); setConversations(previous => [created, ...previous]); setCurrent(created); setMessages([]); setProgress([]); setPlan(null); setPlanHistory([]); setCurrentRunId(null); setNotice(''); setMobileSidebarOpen(false) } catch (error) { setNotice(friendlyError(error)) }
   }
   async function open(conversation: Conversation) {
     if (pending || candidateRun) return
-    try { await refreshMessages(conversation.id); setCurrent(conversation); setProgress([]); setPlan(null); setPlanHistory([]); setNotice(''); setMobileSidebarOpen(false); setConversationMenuId(null) } catch (error) { setNotice(friendlyError(error)) }
+    try { setProgress([]); setPlan(null); setPlanHistory([]); await refreshMessages(conversation.id); setCurrent(conversation); setNotice(''); setMobileSidebarOpen(false); setConversationMenuId(null) } catch (error) { setNotice(friendlyError(error)) }
   }
   async function renameConversation(conversation: Conversation) {
     const title = renameDraft.trim()
@@ -147,14 +149,26 @@ export function ConversationApp() {
     await refreshMessages()
   }
   async function send(event: FormEvent) {
-    event.preventDefault(); const content = draft.trim(); if (!content || !current || pending || candidateRun) return
+    event.preventDefault(); await sendContent(draft.trim())
+  }
+  async function sendContent(content: string) {
+    if (!content || !current || pending || candidateRun) return
     const clientId = crypto.randomUUID(); const optimistic: Message = { id: clientId, role: 'USER', type: 'USER_TEXT', content, status: 'COMPLETED', sequenceNumber: Date.now(), createdAt: new Date().toISOString() }
     setMessages(previous => [...previous, optimistic]); setDraft(''); setPending(true); setProgress([]); setPlan(null); setPlanHistory([]); setCollapsed(false); setNotice('')
     try {
       const queued = await enqueueAgentRun(`/conversations/${current.id}/messages`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': clientId }, body: JSON.stringify({ content }) })
+      setCurrentRunId(queued.runId)
       await followAgentRun(queued.runId, { onProgress: item => setProgress(previous => [...previous, item]), onPlan: recordPlan })
       await refreshMessages(); const refreshed = await api<Conversation[]>('/conversations'); setConversations(refreshed); setCurrent(refreshed.find(item => item.id === current.id) ?? current)
-    } catch (error) { setMessages(previous => previous.filter(item => item.id !== clientId)); setDraft(content); setNotice(friendlyError(error)) } finally { setPending(false); setCollapsed(true) }
+    } catch (error) { setMessages(previous => previous.filter(item => item.id !== clientId)); setDraft(content); setNotice(friendlyError(error)) } finally { setCurrentRunId(null); setPending(false); setCollapsed(true) }
+  }
+  async function stopCurrentRun() {
+    if (!currentRunId) return
+    try { await apiVoid(`/agent-runs/${currentRunId}/cancel`, { method: 'POST' }); setNotice('已停止本轮任务。'); await refreshMessages() } catch (error) { setNotice(friendlyError(error)) }
+  }
+  function regenerateLastAnswer() {
+    const lastUser = [...messages].reverse().find(message => message.role === 'USER' && message.type === 'USER_TEXT' && message.content?.trim())
+    if (lastUser?.content) void sendContent(lastUser.content)
   }
   function startCandidateRun(size: 16 | 32, preferenceText: string) {
     if (!preferenceText.trim()) { setNotice('先描述一下你想放进世界杯的音乐偏好。'); return }
@@ -165,9 +179,10 @@ export function ConversationApp() {
     setPending(true); setProgress([]); setPlan(null); setPlanHistory([]); setCollapsed(false); setNotice('')
     try {
       const queued = await enqueueAgentRun(`/conversations/${current.id}/exploration-report`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() } })
+      setCurrentRunId(queued.runId)
       await followAgentRun(queued.runId, { onProgress: item => setProgress(previous => [...previous, item]), onPlan: recordPlan })
       await refreshMessages(); const refreshed = await api<Conversation[]>('/conversations'); setConversations(refreshed); setCurrent(refreshed.find(item => item.id === current.id) ?? current)
-    } catch (error) { setNotice(friendlyError(error)) } finally { setPending(false); setCollapsed(true) }
+    } catch (error) { setNotice(friendlyError(error)) } finally { setCurrentRunId(null); setPending(false); setCollapsed(true) }
   }
   const displayMessages = useMemo(() => messages.filter(message => message.type !== 'AGENT_RUN'), [messages])
   const runActive = pending || Boolean(candidateRun)
@@ -205,9 +220,9 @@ export function ConversationApp() {
           return <article className={`conversation-message ${message.role === 'USER' ? 'user' : 'agent'}`} key={message.id}>{message.role !== 'USER' && <span className="message-agent-mark"><BrandMark /></span>}<MessageBody content={message.content || ''} /></article>
         })}
         {candidateRun && <CandidateGenerationCard size={candidateRun.size} preferenceText={candidateRun.preferenceText} onProgress={(item) => setProgress(previous => [...previous, item])} onPlan={recordPlan} onCompleted={async payload => { await persistCard('CANDIDATE_POOL_CARD', 'CANDIDATE_POOL', payload); setCandidateRun(null); setCollapsed(true) }} onFailed={message => { setNotice(message); setCandidateRun(null); setCollapsed(true) }} />}
-        {hasRunState && <AgentActivity progress={progress} collapsed={collapsed} active={runActive} onToggle={() => setCollapsed(value => !value)} />}
+        {hasRunState && <AgentActivity progress={progress} collapsed={collapsed} active={runActive} canStop={Boolean(currentRunId)} canRegenerate={messages.some(message => message.role === 'USER' && message.type === 'USER_TEXT')} onToggle={() => setCollapsed(value => !value)} onStop={() => void stopCurrentRun()} onRegenerate={regenerateLastAnswer} />}
       </section>
-      <form className="conversation-composer" onSubmit={event => void send(event)}><div className="composer-frame"><textarea value={draft} onChange={event => setDraft(event.target.value)} placeholder="和 IndieSoundQuest 聊聊音乐……" maxLength={2000} disabled={!current || runActive} /><div className="composer-toolbar"><span>可以追问、推荐、比较，也可以明确要求一场歌曲世界杯</span><button type="submit" aria-label="发送消息" title="发送" disabled={!draft.trim() || !current || runActive}>{pending ? <span className="composer-spinner" /> : <SendIcon />}</button></div></div><small>Agent 可能会出错，请核对重要的音乐资料与链接。</small></form>
+      <form className="conversation-composer" onSubmit={event => void send(event)}><div className="composer-frame"><textarea value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="和 IndieSoundQuest 聊聊音乐……" maxLength={2000} disabled={!current || runActive} /><div className="composer-toolbar"><span>Enter 发送 · Shift + Enter 换行</span><button type="submit" aria-label="发送消息" title="发送" disabled={!draft.trim() || !current || runActive}>{pending ? <span className="composer-spinner" /> : <SendIcon />}</button></div></div><small>Agent 可能会出错，请核对重要的音乐资料与链接。</small></form>
     </section>
     <aside className="conversation-agent-panel"><AgentPlanPanel plans={planHistory.length ? planHistory : (plan ? [plan] : [])} active={runActive} latest={progress[progress.length - 1]} elapsedMs={runElapsedMs} /></aside>
   </main>
@@ -224,7 +239,7 @@ export function findWaitingRunId(messages: Message[], cardIndex: number) {
   }
   return null
 }
-function AgentActivity({ progress, collapsed, active, onToggle }: { progress: Progress[]; collapsed: boolean; active: boolean; onToggle: () => void }) { const latest = progress[progress.length - 1]; return <section className={`agent-activity ${collapsed ? 'collapsed' : ''}`}><button type="button" onClick={onToggle}><span className={`agent-activity-indicator ${active ? 'active' : ''}`}>{active ? <span className="agent-thinking-wave" aria-hidden="true"><i /><i /><i /><i /><i /></span> : <BrandMark />}</span><span><strong>{active ? 'IndieSoundQuest 正在工作' : '本轮处理已完成'}</strong><small>{latest?.message || (active ? '正在准备下一步' : '过程记录已收起')}</small></span><span className="agent-activity-toggle">{collapsed ? '查看过程' : '收起'}</span></button>{!collapsed && progress.length > 0 && <ol>{progress.map((item, index) => <li key={`${item.phase}-${index}`} className={item.status}><i /><span>{item.message}</span>{progressMetricsText(item) && <small>{progressMetricsText(item)}</small>}</li>)}</ol>}</section> }
+function AgentActivity({ progress, collapsed, active, canStop, canRegenerate, onToggle, onStop, onRegenerate }: { progress: Progress[]; collapsed: boolean; active: boolean; canStop: boolean; canRegenerate: boolean; onToggle: () => void; onStop: () => void; onRegenerate: () => void }) { const latest = progress[progress.length - 1]; return <section className={`agent-activity ${collapsed ? 'collapsed' : ''}`}><button type="button" onClick={onToggle}><span className={`agent-activity-indicator ${active ? 'active' : ''}`}>{active ? <span className="agent-thinking-wave" aria-hidden="true"><i /><i /><i /><i /><i /></span> : <BrandMark />}</span><span><strong>{active ? 'IndieSoundQuest 正在工作' : '本轮处理已完成'}</strong><small>{latest?.message || (active ? '正在准备下一步' : '过程记录已收起')}</small></span><span className="agent-activity-toggle">{collapsed ? '查看过程' : '收起'}</span></button>{!collapsed && progress.length > 0 && <ol>{progress.map((item, index) => <li key={`${item.phase}-${index}`} className={item.status}><i /><span>{item.message}</span>{progressMetricsText(item) && <small>{progressMetricsText(item)}</small>}</li>)}</ol>}{((active && canStop) || (!active && canRegenerate)) && <div className="agent-activity-actions">{active && canStop ? <button type="button" onClick={onStop}>停止生成</button> : <button type="button" onClick={onRegenerate}>重新生成</button>}</div>}</section> }
 
 function AgentPlanPanel({ plans, active, latest, elapsedMs }: { plans: Plan[]; active: boolean; latest?: Progress; elapsedMs: number }) { const newest = plans[plans.length - 1]; const [selectedRevision, setSelectedRevision] = useState<number | null>(null); const shown = plans.find(item => item.revision === selectedRevision) || newest; const viewingHistory = Boolean(shown && newest && shown.revision !== newest.revision); return <div className="agent-plan-panel"><header><p className="eyebrow">执行计划</p><span className={active ? 'running' : ''}>{active ? `运行中 · ${formatElapsed(elapsedMs)}` : newest ? '已完成' : '空闲'}</span></header>{shown ? <>{plans.length > 1 && <div className="plan-revisions"><span>计划版本</span>{plans.map(item => <button type="button" className={item.revision === shown.revision ? 'active' : ''} key={item.revision} onClick={() => setSelectedRevision(item.revision)}>v{item.revision}</button>)}{viewingHistory && <button type="button" onClick={() => setSelectedRevision(null)}>回到最新</button>}</div>}<h2>{shown.summary || '本轮音乐探索'}</h2>{shown.changeSummary && <p>{shown.changeSummary}</p>}<ol>{shown.items.map(item => <li key={item.id} className={item.status}><i /><span><strong>{item.title}</strong><small>{item.detail}</small></span></li>)}</ol>{latest && !viewingHistory && <footer><small>当前状态</small><span>{latest.message}</span></footer>}</> : <div className="agent-plan-empty"><span className="plan-empty-mark"><BrandMark /></span><strong>等待新的任务</strong><p>开始对话后，这里会显示 Agent 的实时计划、步骤状态与计划调整。</p></div>}</div> }
 
@@ -279,6 +294,10 @@ function MusicRecommendationsCard({ payload, conversationId }: { payload?: strin
   try { value = JSON.parse(payload || '{}') } catch { /* degraded card */ }
   const [feedback, setFeedback] = useState<Record<string, string>>({})
   const listening = useListeningPreview()
+  const seenSongs = new Set<string>()
+  const displaySongs = (value.songs || []).filter(item => { const key = `${item.recordingId || ''}|${item.artistName || ''}|${item.title || ''}`.toLocaleLowerCase().replace(/[^\p{L}\p{N}|]/gu, ''); if (seenSongs.has(key)) return false; seenSongs.add(key); return true })
+  const seenArtists = new Set<string>()
+  const displayArtists = (value.artists || []).filter(item => { const key = (item.artistId || item.artistName || '').toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, ''); if (seenArtists.has(key)) return false; seenArtists.add(key); return true })
   const sendFeedback = async (kind: 'SONG' | 'ARTIST', key: string, targetRef: object, preference: 'LIKE' | 'DISLIKE') => {
     if (!conversationId || feedback[key]) return
     try {
@@ -291,13 +310,13 @@ function MusicRecommendationsCard({ payload, conversationId }: { payload?: strin
     <h2>{value.title || '这轮值得继续听的方向'}</h2>
     {value.appliedInstruction && <small className="recommendation-refinement">已应用你的调整：{value.appliedInstruction}</small>}
     {value.summary && <p>{value.summary}</p>}
-    {value.songs?.length ? <><h3>歌曲</h3><ol className="music-recommendation-list">{value.songs.map((item, index) => {
+    {displaySongs.length ? <><h3>歌曲</h3><ol className="music-recommendation-list">{displaySongs.map((item, index) => {
       const feedbackKey = `song-${item.recordingId || index}`
       const playback = item.recordingId ? listening.stateFor(item.recordingId) : null
       const content = <><MusicCover url={item.coverUrl} title={item.title} /><span><strong>{item.title}</strong><small>{item.artistName}{item.albumTitle ? ` · ${item.albumTitle}` : ''}</small><em>{item.reason}</em>{playback && <span className={`recommendation-playback ${playback.phase}`}>{playbackLabel(playback.phase)}</span>}</span></>
       return <li key={`${feedbackKey}-${index}`}>{item.recordingId ? <button className="music-recommendation-main" type="button" onMouseEnter={() => void listening.prefetch(item.recordingId!)} onFocus={() => void listening.prefetch(item.recordingId!)} onClick={() => void listening.toggle(item.recordingId!)}>{content}</button> : <div className="music-recommendation-main">{content}</div>}<div className="music-recommendation-actions"><small>{item.verificationStatus === 'MUSICBRAINZ_VERIFIED' ? 'MusicBrainz 已核验' : '公开资料发现'}</small>{item.searchUrl && <a href={item.searchUrl} target="_blank" rel="noreferrer">去平台</a>}<button onClick={() => void sendFeedback('SONG', feedbackKey, { recordingId: item.recordingId, title: item.title, artistName: item.artistName }, 'LIKE')}>喜欢</button><button onClick={() => void sendFeedback('SONG', feedbackKey, { recordingId: item.recordingId, title: item.title, artistName: item.artistName }, 'DISLIKE')}>不适合</button>{feedback[feedbackKey] && <small>已记录</small>}</div></li>
     })}</ol></> : null}
-    {value.artists?.length ? <><h3>艺人</h3><ol className="music-artist-list">{value.artists.map((item, index) => { const key=`artist-${item.artistId || item.artistName || index}`; return <li key={key}><a href={item.searchUrl || item.sourceUrl} target="_blank" rel="noreferrer"><strong>{item.artistName}</strong><small>{item.reason}</small></a><div className="music-recommendation-actions"><small>{item.verificationStatus === 'MUSICBRAINZ_VERIFIED' ? 'MusicBrainz 已核验' : '公开资料发现'}</small><button onClick={() => void sendFeedback('ARTIST', key, { artistId: item.artistId, artistName: item.artistName }, 'LIKE')}>喜欢</button><button onClick={() => void sendFeedback('ARTIST', key, { artistId: item.artistId, artistName: item.artistName }, 'DISLIKE')}>不适合</button>{feedback[key] && <small>已记录</small>}</div></li> })}</ol></> : null}
+    {displayArtists.length ? <><h3>艺人</h3><ol className="music-artist-list">{displayArtists.map((item, index) => { const key=`artist-${item.artistId || item.artistName || index}`; return <li key={key}><a href={item.searchUrl || item.sourceUrl} target="_blank" rel="noreferrer"><strong>{item.artistName}</strong><small>{item.reason}</small></a><div className="music-recommendation-actions"><small>{item.verificationStatus === 'MUSICBRAINZ_VERIFIED' ? 'MusicBrainz 已核验' : '公开资料发现'}</small><button onClick={() => void sendFeedback('ARTIST', key, { artistId: item.artistId, artistName: item.artistName }, 'LIKE')}>喜欢</button><button onClick={() => void sendFeedback('ARTIST', key, { artistId: item.artistId, artistName: item.artistName }, 'DISLIKE')}>不适合</button>{feedback[key] && <small>已记录</small>}</div></li> })}</ol></> : null}
     {value.sources?.length ? <details className="music-recommendation-sources"><summary>查看推荐依据</summary>{value.sources.map((item, index) => <a key={`${item.url}-${index}`} href={item.url} target="_blank" rel="noreferrer">{item.title || '公开资料'}</a>)}</details> : null}
   </section>
 }

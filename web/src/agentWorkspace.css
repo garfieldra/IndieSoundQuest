@@ -133,6 +133,9 @@
 .agent-activity > ol li.degraded i { background: #b77a45; }
 .agent-activity > ol li small { color: #9a968f; font-size: .66rem; white-space: nowrap; }
 .agent-activity.collapsed > button { padding-top: 9px; padding-bottom: 9px; }
+.agent-activity-actions { padding: 0 13px 11px 52px; display: flex; }
+.agent-activity-actions button { padding: 5px 8px; border: 1px solid #d6d2ca; border-radius: 7px; background: transparent; color: #77726b; font-size: .66rem; }
+.agent-activity-actions button:hover { border-color: #aaa59c; background: #e8e5df; color: #393631; }
 
 @keyframes status-pulse { 50% { opacity: .45; } }
 @keyframes activity-glow { 50% { box-shadow: 0 0 0 4px #e5ddd5; } }
@@ -146,4 +149,5 @@
   .agent-activity > ol { padding-left: 17px; }
   .agent-activity > ol li { grid-template-columns: 11px minmax(0, 1fr); }
   .agent-activity > ol li small { grid-column: 2; }
+  .agent-activity-actions { padding-left: 17px; }
 }

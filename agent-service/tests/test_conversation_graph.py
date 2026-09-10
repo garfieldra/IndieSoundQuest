@@ -2,7 +2,15 @@ from uuid import uuid4
 
 import pytest
 
-from app.conversation_graph import ConversationDecision, ConversationReActRuntime, MusicRecommendationDraft
+from app.conversation_graph import (
+    ConversationDecision,
+    ConversationReActRuntime,
+    MusicRecommendationDraft,
+    RecommendedArtistDraft,
+    RecommendedSongDraft,
+    _unique_artist_drafts,
+    _unique_song_drafts,
+)
 from app.schemas import CandidateItem, CandidatePoolResult, ConversationAgentRequest
 
 
@@ -14,6 +22,14 @@ class FakeWeb:
 class FakeKnowledge:
     async def search_verified(self, query: str, recording_ids: list[str]):
         return []
+
+
+def test_recommendation_deduplication_normalizes_song_and_artist_names():
+    source = "https://example.com/music"
+    songs = [RecommendedSongDraft(title="灰色", artist_name="徐佳瑩", reason="一段足够长的推荐理由", source_url=source), RecommendedSongDraft(title="灰 色", artist_name="徐 佳 瑩", reason="另一段足够长的推荐理由", source_url=source)]
+    artists = [RecommendedArtistDraft(artist_name="魏如萱", reason="一段足够长的推荐理由", source_url=source), RecommendedArtistDraft(artist_name="魏 如 萱", reason="另一段足够长的推荐理由", source_url=source)]
+    assert len(_unique_song_drafts(songs)) == 1
+    assert len(_unique_artist_drafts(artists)) == 1
 
 
 class FakeCandidateGraph:
