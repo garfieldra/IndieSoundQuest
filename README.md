@@ -8,13 +8,11 @@ IndieSoundQuest 不要求用户先填写标签或进入固定流程。用户可�
 
 [在线体验](https://indiesoundquest.cn/)
 
+## 界面预览
+
+前端采用三栏 Agent 工作台：左侧管理持久化会话，中间承载对话、工具摘要与结果卡片，右侧展示会随 ReAct 决策滚动调整的计划。模型运行时只公开可展示的步骤与耗时，不暴露思维链。
+
 ![IndieSoundQuest 对话式音乐探索界面](./docs/assets/home.png)
-
-## 多轮交互演示
-
-下面的真实演示包含首轮偏好理解、Agent 运行状态、推荐生成，以及“更冷一点、换一批”这类依赖上一轮结果的增量追问。
-
-![IndieSoundQuest 多轮音乐探索演示](./docs/assets/conversation-demo.gif)
 
 ## 为什么做这个项目
 

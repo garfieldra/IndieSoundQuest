@@ -33,6 +33,10 @@
 }
 
 .agent-plan-panel > p { margin: 0 0 17px; color: #85817a; font-size: .75rem; line-height: 1.65; }
+.plan-revisions { margin: 0 0 14px; display: flex; align-items: center; flex-wrap: wrap; gap: 5px; }
+.plan-revisions > span { margin-right: 3px; color: #97928a; font-size: .63rem; }
+.plan-revisions button { padding: 3px 6px; border: 1px solid #ddd9d2; border-radius: 6px; background: transparent; color: #8a857d; font-size: .61rem; }
+.plan-revisions button:hover, .plan-revisions button.active { border-color: #aaa59c; background: #e8e6e0; color: #4d4943; }
 .agent-plan-panel > ol { margin: 4px 0 0; padding: 0; list-style: none; }
 .agent-plan-panel > ol li { position: relative; min-height: 58px; display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 9px; }
 .agent-plan-panel > ol li:not(:last-child)::after { content: ""; position: absolute; top: 20px; bottom: 0; left: 6px; width: 1px; background: #d9d6cf; }
@@ -110,8 +114,13 @@
   background: #3a3834;
 }
 
-.agent-activity-indicator.active { animation: activity-glow 1.8s ease-in-out infinite; }
+.agent-activity-indicator.active { animation: activity-glow 2.1s ease-in-out infinite; }
 .agent-activity-indicator svg { width: 17px; height: 17px; }
+.agent-thinking-wave { height: 16px; display: flex; align-items: center; gap: 2px; }
+.agent-thinking-wave i { width: 1.5px; height: 5px; border-radius: 2px; background: #fff; animation: thinking-wave 1.05s ease-in-out infinite; }
+.agent-thinking-wave i:nth-child(2), .agent-thinking-wave i:nth-child(4) { animation-delay: -.18s; }
+.agent-thinking-wave i:nth-child(3) { animation-delay: -.36s; }
+.agent-thinking-wave i:nth-child(5) { animation-delay: -.54s; }
 .agent-activity > button > span:nth-child(2) { min-width: 0; display: grid; gap: 2px; }
 .agent-activity > button strong { color: #494641; font-size: .76rem; font-weight: 620; }
 .agent-activity > button small { overflow: hidden; color: #88847d; font-size: .69rem; text-overflow: ellipsis; white-space: nowrap; }
@@ -127,6 +136,11 @@
 
 @keyframes status-pulse { 50% { opacity: .45; } }
 @keyframes activity-glow { 50% { box-shadow: 0 0 0 4px #e5ddd5; } }
+@keyframes thinking-wave { 0%, 100% { height: 4px; opacity: .58; } 50% { height: 15px; opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-activity-indicator.active, .agent-thinking-wave i, .composer-spinner { animation: none; }
+}
 
 @media (max-width: 680px) {
   .agent-activity > ol { padding-left: 17px; }
