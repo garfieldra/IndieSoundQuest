@@ -1,6 +1,28 @@
-.tournament-launch-card{max-width:680px;border:1px solid #cfbdae;border-radius:14px;padding:22px;background:linear-gradient(135deg,#fffaf4,#f1e5d8)}
-.tournament-launch-card h2{font-size:1.45rem;margin:8px 0}
-.tournament-launch-card p:not(.eyebrow){color:#685d55;line-height:1.65;margin:0}
-.tournament-launch-card div{display:flex;gap:9px;flex-wrap:wrap;margin-top:17px}
-.tournament-launch-card button{border:0;border-radius:7px;background:#9c493a;color:#fff;padding:11px 14px;font-weight:700}
-.tournament-launch-card button+button{background:#4a3b33}
+.tournament-launch-card {
+  max-width: 740px;
+  padding: 22px;
+  border: 1px solid #dfdcd5;
+  border-radius: 16px;
+  background: #fffefb;
+  box-shadow: 0 1px 2px #403a3008;
+}
+
+.tournament-launch-card .eyebrow { color: #9a5145; font-size: .64rem; letter-spacing: .1em; }
+.tournament-launch-card h2 { margin: 8px 0 10px; color: #302e2a; font: 560 1.25rem/1.35 "Songti SC", "STSong", serif; letter-spacing: -.02em; }
+.tournament-launch-card p:not(.eyebrow) { margin: 0; color: #6f6b64; font-size: .85rem; line-height: 1.7; }
+.tournament-launch-card > div:last-child { margin-top: 17px; display: flex; flex-wrap: wrap; gap: 8px; }
+.tournament-launch-card button {
+  padding: 8px 11px;
+  border: 1px solid #d7d3cc;
+  border-radius: 9px;
+  background: #f7f5f1;
+  color: #514d47;
+  font-size: .77rem;
+  font-weight: 580;
+  transition: background .16s ease, border-color .16s ease, color .16s ease;
+}
+
+.tournament-launch-card button:hover { border-color: #b8b3aa; background: #eeece7; color: #24221f; }
+.tournament-launch-card button:first-child:last-child,
+.tournament-launch-card > div:last-child button:first-child { border-color: #373531; background: #373531; color: #fff; }
+.tournament-launch-card button:disabled { opacity: .45; cursor: wait; }
