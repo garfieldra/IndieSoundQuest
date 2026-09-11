@@ -26,6 +26,21 @@ class ConversationDecision(BaseModel):
     clarification_options: list[str] = Field(default_factory=list, max_length=8)
 
 
+class MusicPreferenceProfile(BaseModel):
+    named_artists: list[str] = Field(default_factory=list, max_length=8)
+    genres: list[str] = Field(default_factory=list, max_length=8)
+    sonic_traits: list[str] = Field(default_factory=list, max_length=8)
+    moods: list[str] = Field(default_factory=list, max_length=8)
+    scenes: list[str] = Field(default_factory=list, max_length=6)
+    languages_regions: list[str] = Field(default_factory=list, max_length=6)
+    eras: list[str] = Field(default_factory=list, max_length=5)
+    lyrical_themes: list[str] = Field(default_factory=list, max_length=8)
+    familiarity: Literal["representative", "deep_cuts", "mixed"] = "mixed"
+    exclusions: list[str] = Field(default_factory=list, max_length=8)
+    discovery_axes: list[str] = Field(default_factory=list, max_length=6)
+    evidence_spans: list[str] = Field(default_factory=list, max_length=8)
+
+
 class ConversationState(TypedDict, total=False):
     request: ConversationAgentRequest
     decision: ConversationDecision
@@ -34,6 +49,11 @@ class ConversationState(TypedDict, total=False):
     web_sources: list[dict]
     knowledge: list[dict]
     iteration: int
+    preference_profile: dict
+    entity_resolutions: list[dict]
+    entity_ambiguities: list[dict]
+    research_assessment: dict
+    search_attempts: int
     result: ConversationAgentResult
 
 
@@ -79,6 +99,74 @@ class ConversationReActRuntime:
         )
         self.graph = self._build().compile(checkpointer=MemorySaver())
 
+    async def analyze_preference(self, request: ConversationAgentRequest) -> MusicPreferenceProfile:
+        literal_artists = _explicit_artist_mentions(request.user_message)
+        if self.model is None:
+            return _fallback_preference_profile(request, literal_artists)
+        prompt = f"""你是音乐偏好解析工具，不输出思维链。把本轮请求和必要的近期上下文整理为结构化 MusicPreferenceProfile。
+当前消息：{request.user_message}
+会话摘要：{request.summary}
+最近消息：{request.recent_messages[-12:]}
+字面提取的艺人：{json.dumps(literal_artists, ensure_ascii=False)}
+要求：namedArtists 只能保留用户实际点名的艺人；声音、情绪、歌词主题和 discoveryAxes 可以根据点名艺人的公开常识作保守推断，但不得写成人格或教育背景事实。evidenceSpans 必须来自用户原话。"""
+        try:
+            profile = await self.model.with_structured_output(MusicPreferenceProfile, method="function_calling").ainvoke(prompt)
+            if not isinstance(profile, MusicPreferenceProfile):
+                raise TypeError("invalid preference profile")
+        except Exception:
+            return _fallback_preference_profile(request, literal_artists)
+        profile.named_artists = list(dict.fromkeys([*literal_artists, *[item for item in profile.named_artists if item in request.user_message]]))[:8]
+        return profile
+
+    async def resolve_entities(
+        self, mentions: list[str], confirmed_artists: list[ConfirmedArtist] | None = None
+    ) -> tuple[list[dict], list[dict]]:
+        if not mentions or self.catalog is None:
+            return [], []
+        confirmed = {_music_key(item.mention): item for item in (confirmed_artists or [])}
+        pre_resolved = [{
+            "mention": mention, "status": "RESOLVED", "mbid": str(confirmed[_music_key(mention)].mbid),
+            "name": confirmed[_music_key(mention)].name, "confirmedByUser": True,
+        } for mention in mentions if _music_key(mention) in confirmed]
+        unresolved_mentions = [mention for mention in mentions if _music_key(mention) not in confirmed]
+        if not unresolved_mentions:
+            return pre_resolved, []
+        try:
+            raw = await self.catalog.resolve_artist_candidates(unresolved_mentions)
+        except Exception:
+            return [], []
+        resolved: list[dict] = list(pre_resolved)
+        ambiguities: list[dict] = []
+        resolved_mbids: set[str] = {str(item.get("mbid") or "") for item in pre_resolved if item.get("mbid")}
+        for item in raw:
+            candidates = list(item.get("candidates") or [])
+            mention = str(item.get("mention") or "")
+            if not candidates:
+                resolved.append({"mention": mention, "status": "UNRESOLVED", "reason": item.get("reason")})
+                continue
+            top = candidates[0]
+            top_score = int(top.get("score") or 0)
+            runner_score = int(candidates[1].get("score") or 0) if len(candidates) > 1 else 0
+            confident = top_score >= 95 and (len(candidates) == 1 or top_score - runner_score >= 8)
+            if confident:
+                mbid = str(top.get("mbid") or "")
+                resolved.append({
+                    "mention": mention, "status": "RESOLVED", "mbid": mbid,
+                    "name": str(top.get("name") or mention), "duplicateIdentity": bool(mbid and mbid in resolved_mbids),
+                })
+                if mbid:
+                    resolved_mbids.add(mbid)
+            else:
+                ambiguities.append({
+                    "mention": mention,
+                    "candidates": [{
+                        "mbid": str(candidate.get("mbid") or ""), "name": str(candidate.get("name") or ""),
+                        "country": candidate.get("country"), "type": candidate.get("type"),
+                        "disambiguation": candidate.get("disambiguation"), "score": int(candidate.get("score") or 0),
+                    } for candidate in candidates if int(candidate.get("score") or 0) >= max(80, top_score - 7)],
+                })
+        return resolved, ambiguities
+
     async def decide(self, state: ConversationState) -> ConversationDecision:
         request = state["request"]
         forced = getattr(request, "forced_action", None)
@@ -91,6 +179,9 @@ class ConversationReActRuntime:
                 "respond": "结合当前对话整理音乐回应",
             }
             return ConversationDecision(action=forced, public_summary=summaries[forced])
+        ambiguities = state.get("entity_ambiguities", [])
+        if ambiguities and not any(item["action"] == "clarify" for item in state.get("action_history", [])):
+            return _entity_clarification_decision(ambiguities)
         if self.model is None:
             return _fallback_decision(state)
         observation_summary = {
@@ -98,6 +189,9 @@ class ConversationReActRuntime:
             "webSourceCount": len(state.get("web_sources", [])),
             "knowledgeCount": len(state.get("knowledge", [])),
             "iteration": state.get("iteration", 0),
+            "researchAssessment": state.get("research_assessment", {}),
+            "entityResolutions": state.get("entity_resolutions", []),
+            "preferenceProfile": state.get("preference_profile", {}),
         }
         prompt = f"""你是 IndieSoundQuest 对话运行时的 ReAct 决策器，不输出思维链。
 你是统一音乐探索 Agent。世界杯是可选 Skill，不是产品主流程；候选池构建、赛事分析和报告撰写是可调用的复合 Tool，而不是独立 Agent。
@@ -130,6 +224,15 @@ class ConversationReActRuntime:
         # free to choose research and answer tools, while this product boundary
         # prevents the optional Skill from taking over the conversation.
         if decision.action in {"propose_tournament", "build_candidate_pool"} and not _explicit_tournament_request(request.user_message):
+            if _recommendation_intent(request):
+                assessment = state.get("research_assessment", {})
+                if (not state.get("web_sources") or (assessment and not assessment.get("ready", True))) and state.get("search_attempts", 0) < 3:
+                    return ConversationDecision(
+                        action="search_web",
+                        public_summary=str(assessment.get("nextStep") or "先检索可核对的音乐推荐资料"),
+                        query=_research_gap_query(request, assessment) if assessment else request.user_message[:300],
+                    )
+                return ConversationDecision(action="recommend_music", public_summary="提取并核验具体歌曲与艺人推荐")
             return ConversationDecision(action="respond", public_summary="结合当前对话继续音乐探索")
         if _recommendation_intent(request) and not state.get("web_sources") and decision.action == "respond":
             return ConversationDecision(action="search_web", public_summary="检索符合本轮调整要求的新线索", query=request.user_message[:300])
@@ -143,10 +246,23 @@ class ConversationReActRuntime:
         # prevent a model routing wobble from collapsing the requested cards
         # into a generic prose response.
         if "search_web" in previous and _recommendation_intent(request) and decision.action == "respond":
+            assessment = state.get("research_assessment", {})
+            if assessment and not assessment.get("ready", True) and state.get("search_attempts", 0) < 3:
+                return ConversationDecision(
+                    action="search_web", public_summary=str(assessment.get("nextStep") or "继续补足推荐证据"),
+                    query=_research_gap_query(request, assessment),
+                )
             return ConversationDecision(action="recommend_music", public_summary="提取并核验具体歌曲与艺人推荐")
-        if decision.action == "search_web" and "search_web" in previous:
+        if decision.action == "recommend_music" and _recommendation_intent(request):
+            assessment = state.get("research_assessment", {})
+            if assessment and not assessment.get("ready", True) and state.get("search_attempts", 0) < 3:
+                return ConversationDecision(
+                    action="search_web", public_summary=str(assessment.get("nextStep") or "继续补足尚未覆盖的音乐资料"),
+                    query=_research_gap_query(request, assessment),
+                )
+        if decision.action == "search_web" and "search_web" in previous and state.get("search_attempts", 0) >= 3:
             if _recommendation_intent(request):
-                return ConversationDecision(action="recommend_music", public_summary="提取并核验具体歌曲与艺人推荐")
+                return ConversationDecision(action="recommend_music", public_summary="研究预算已满足，提取并核验具体推荐")
             return ConversationDecision(action="respond", public_summary="公开资料已经足够，开始整理回答")
         if decision.action == "search_knowledge" and "search_knowledge" in previous:
             return ConversationDecision(action="respond", public_summary="补充资料已经足够，开始整理回答")
@@ -230,14 +346,29 @@ class ConversationReActRuntime:
 
     def _build(self):
         async def initialize(state: ConversationState):
+            request = state["request"]
+            profile = await self.analyze_preference(request)
+            resolutions, ambiguities = await self.resolve_entities(profile.named_artists, request.confirmed_artists)
+            history = [
+                {"action": "understand_preference", "summary": "结合本轮消息与会话上下文理解需求"},
+                {"action": "analyze_preference", "summary": _preference_plan_summary(profile)},
+            ]
+            if profile.named_artists:
+                history.append({
+                    "action": "resolve_named_entities",
+                    "summary": f"已核验 {len([item for item in resolutions if item.get('status') == 'RESOLVED'])} 个艺人身份；{len(ambiguities)} 项需要确认",
+                })
             return {
-                "action_history": [{"action": "understand_preference", "summary": "结合本轮消息与会话上下文理解需求"}],
+                "action_history": history,
                 "observations": [], "web_sources": [], "knowledge": [], "iteration": 0,
+                "preference_profile": profile.model_dump(by_alias=True),
+                "entity_resolutions": resolutions, "entity_ambiguities": ambiguities,
+                "research_assessment": {}, "search_attempts": 0,
             }
 
         async def supervisor(state: ConversationState):
             decision = await self.decide(state)
-            if state.get("iteration", 0) >= 5:
+            if state.get("iteration", 0) >= 7:
                 decision = ConversationDecision(action="respond", public_summary="运行预算已满足，整理最终回应")
             return {
                 "decision": decision,
@@ -252,10 +383,31 @@ class ConversationReActRuntime:
                 query = state["decision"].query or request.user_message
                 if _recommendation_followup(request):
                     query = _followup_search_query(request, query)
-                sources = await self.web.search(query, "conversation_research")
+                assessment = state.get("research_assessment", {})
+                missing = list(assessment.get("missingArtists") or [])
+                confirmed_focus = [
+                    f"{item.get('name')} {item.get('mention')}" for item in state.get("entity_resolutions", [])
+                    if item.get("confirmedByUser") and item.get("name") and item.get("mention")
+                ]
+                queries = _recommendation_search_queries(
+                    request, query, missing or confirmed_focus or None, state.get("preference_profile", {})
+                )
+                if len(queries) > 1 and hasattr(self.web, "search_many"):
+                    new_sources = await self.web.search_many(queries)
+                else:
+                    new_sources = await self.web.search(query, "conversation_research")
+                sources = _merge_web_sources(state.get("web_sources", []), new_sources, prefer_incoming=state.get("search_attempts", 0) > 0)
+                research = _assess_research(request, state.get("preference_profile", {}), sources)
                 return {
                     "web_sources": sources,
-                    "observations": state["observations"] + [{"action": action, "status": "success", "outputCount": len(sources)}],
+                    "research_assessment": research,
+                    "search_attempts": state.get("search_attempts", 0) + 1,
+                    "observations": state["observations"] + [{
+                        "action": action, "status": "success", "outputCount": len(sources),
+                        "newOutputCount": len(new_sources), "queryCount": len(queries),
+                        "namedArtistCount": len(_explicit_artist_mentions(request.user_message)),
+                        "missingArtists": research.get("missingArtists", []), "ready": research.get("ready", False),
+                    }],
                 }
             if action == "search_knowledge":
                 cards = await self.knowledge.search_verified(state["decision"].query or request.user_message, [])
@@ -305,6 +457,7 @@ class ConversationReActRuntime:
             elif action == "clarify":
                 decision = state["decision"]
                 question = decision.clarification_question or text
+                ambiguities = state.get("entity_ambiguities", [])
                 card = ConversationCardIntent(
                     message_type="CLARIFICATION_CARD",
                     card_type="GENERAL_CLARIFICATION",
@@ -312,6 +465,8 @@ class ConversationReActRuntime:
                         "question": question,
                         "reason": decision.clarification_reason or "这个信息会实质影响下一步的结果。",
                         "options": decision.clarification_options,
+                        "entityCandidates": ambiguities,
+                        "clarifications": ambiguities,
                         "allowFreeText": True,
                     },
                 )
@@ -326,6 +481,8 @@ class ConversationReActRuntime:
                         "actions": [item["action"] for item in state["action_history"]],
                         "webSourceCount": len(state.get("web_sources", [])),
                         "knowledgeCount": len(state.get("knowledge", [])),
+                        "preferenceProfile": state.get("preference_profile", {}),
+                        "researchAssessment": state.get("research_assessment", {}),
                     },
                 ),
                 "observations": state["observations"] + [{"action": action, "status": "success"}],
@@ -386,8 +543,9 @@ class ConversationReActRuntime:
             "agentRunId": str(request.agent_run_id),
             "conversationId": str(request.conversation_id),
             "guestId": request.guest_id,
-            "userMessage": f"针对上一轮必要澄清，用户回答：{request.answer}",
+            "userMessage": f"{str(original.get('userMessage') or request.preference_text)}；针对上一轮必要澄清，用户确认：{request.answer}",
             "forcedAction": None,
+            "confirmedArtists": [item.model_dump(by_alias=True) for item in request.confirmed_artists],
         })
         context = list(original.get("recentMessages") or [])
         context.append({"role": "USER", "content": request.answer})
@@ -420,7 +578,31 @@ class ConversationReActRuntime:
     async def _recommend_music_result(self, state: ConversationState) -> dict:
         request = state["request"]
         sources = list(state.get("web_sources", []))
-        result = await self.recommend_music(request, sources)
+        result = await self.recommend_music(
+            request, sources, state.get("preference_profile", {}), state.get("entity_resolutions", [])
+        )
+        gaps = _recommendation_result_gaps(
+            request, result, state.get("preference_profile", {}), state.get("entity_resolutions", [])
+        )
+        # The fallback path has no model capable of revising the draft. Retrying it
+        # only burns graph iterations and eventually changes a valid degraded
+        # recommendation into a generic response. Adaptive gap repair is therefore
+        # reserved for real model-backed runs.
+        model_degraded = bool(result.trace_summary.get("modelDegraded"))
+        if gaps and self.model is not None and not model_degraded and state.get("search_attempts", 0) < 3:
+            research = {
+                **state.get("research_assessment", {}), "ready": False,
+                "resultGaps": gaps,
+                "nextStep": "已检查初稿，正在针对" + "、".join(gaps) + "补充新的歌曲来源",
+                "nextQuery": _profile_search_query(request, state.get("preference_profile", {}), state.get("search_attempts", 0) + 1),
+            }
+            return {
+                "research_assessment": research,
+                "observations": state["observations"] + [{
+                    "action": "recommend_music", "status": "incomplete", "resultGaps": gaps,
+                    "verifiedCount": int(result.trace_summary.get("verifiedSongCount", 0)),
+                }],
+            }
         return {
             "result": result,
             "observations": state["observations"] + [{
@@ -430,7 +612,14 @@ class ConversationReActRuntime:
             }],
         }
 
-    async def recommend_music(self, request: ConversationAgentRequest, sources: list[dict]) -> ConversationAgentResult:
+    async def recommend_music(
+        self, request: ConversationAgentRequest, sources: list[dict],
+        preference_profile: dict | None = None, entity_resolutions: list[dict] | None = None,
+    ) -> ConversationAgentResult:
+        preference_profile = preference_profile or _fallback_preference_profile(
+            request, _explicit_artist_mentions(request.user_message)
+        ).model_dump(by_alias=True)
+        named_artists = list(preference_profile.get("named_artists") or preference_profile.get("namedArtists") or _explicit_artist_mentions(request.user_message))
         source_urls = {str(item.get("sourceUrl") or "") for item in sources if item.get("sourceUrl")}
         prior_cards = _recommendation_payloads(request)
         for card in prior_cards:
@@ -446,16 +635,21 @@ class ConversationReActRuntime:
         compact = [{
             "url": item.get("sourceUrl"), "title": item.get("sourceTitle"),
             "summary": str(item.get("summary") or "")[:900],
-        } for item in sources[:10]]
+            "searchQuery": item.get("searchQuery"),
+        } for item in sources[:24]]
         prompt = f"""你是 IndieSoundQuest 的普通音乐推荐复合工具，不输出思维链。
 用户请求：{request.user_message}
+用户本轮明确写出的艺人：{json.dumps(named_artists, ensure_ascii=False)}
+结构化音乐偏好：{json.dumps(preference_profile, ensure_ascii=False)}
+已解析艺人身份：{json.dumps(entity_resolutions or [], ensure_ascii=False)}
 会话摘要：{request.summary}
 最近对话：{request.recent_messages}
 上一轮推荐上下文：{json.dumps(_recent_card_context(request), ensure_ascii=False)}
 公开资料：{json.dumps(compact, ensure_ascii=False)}
-请先给出 8–10 首可供身份核验的歌曲候选和 3–4 位艺人候选；下游会从中筛选 5–7 首已核验歌曲和 2–3 位艺人展示。资料确实不足时可以更少，不能硬凑。
+请先给出 8–12 首可供身份核验的歌曲候选和 3–5 位艺人候选；下游会从中筛选 5–7 首已核验歌曲和 2–3 位艺人展示。资料确实不足时可以更少，不能硬凑。
+如果用户明确写出一位艺人并要求推荐其歌曲，在公开资料允许时至少给出 5 首该艺人的具体歌曲候选，不能只返回艺人卡。如果用户明确写出多位艺人，必须把这些艺人视作并列的偏好证据，而不是只围绕搜索结果最多的一位展开；歌曲候选至少覆盖其中 {min(5, len(named_artists)) if named_artists else 0} 位，并另外保留相近艺人的探索空间。不得把某一查询结果偏多误写成“其他艺人无资料”。
 把本轮话语视为对上一轮推荐的增量约束：正确理解“更冷一点”“换一批”“不要这些艺人”“保留某首”等指代。歌曲名、艺人名及 sourceUrl 必须来自给定公开资料或上一轮已持久化推荐，禁止凭记忆编造；sourceUrl 必须逐字复制。
-reason 要具体说明它与用户偏好的声音、情绪、文本、场景或创作脉络关系。summary 概括推荐逻辑并明确证据边界。
+reason 要具体映射到结构化偏好中的声音、情绪、文本、场景或创作脉络，不能只写“符合你的偏好”。summary 概括推荐逻辑并明确哪些是用户原话、哪些是保守推断以及证据边界。
 返回 MusicRecommendationDraft。"""
         draft = None
         # Provider retries do not cover malformed tool arguments. Give the
@@ -464,8 +658,14 @@ reason 要具体说明它与用户偏好的声音、情绪、文本、场景或�
         structured_model = self.model.with_structured_output(MusicRecommendationDraft, method="function_calling")
         for attempt in range(2):
             try:
-                repair = "" if attempt == 0 else "\n上一次结构化结果无效。请缩短 reason，并严格满足字段类型、列表上限和 sourceUrl 原样复制要求。"
+                repair = "" if attempt == 0 else "\n上一次结果结构无效或过度集中于单一艺人。请缩短 reason，严格满足字段类型与 sourceUrl 原样复制要求，并重新检查用户明确列出的每位艺人及其对应查询来源。"
                 draft = await structured_model.ainvoke(prompt + repair)
+                required_coverage = min(5, len(named_artists))
+                single_artist_song_shortfall = len(named_artists) == 1 and sum(
+                    1 for item in draft.songs if _artist_key_covered(_music_key(named_artists[0]), {_music_key(item.artist_name)})
+                ) < 5
+                if named_artists and (_draft_named_artist_coverage(draft, named_artists) < required_coverage or single_artist_song_shortfall) and attempt == 0:
+                    continue
                 break
             except Exception:
                 continue
@@ -509,6 +709,8 @@ reason 要具体说明它与用户偏好的声音、情绪、文本、场景或�
             artist_name = str(resolved.get("artistName") or suggestion.artist_name)
             verified_songs.append({
                 "recordingId": str(resolved["recordingId"]),
+                "artistId": str(resolved.get("artistId") or ""),
+                "artistMbid": str(resolved.get("artistMbid") or ""),
                 "title": str(resolved.get("title") or suggestion.title),
                 "artistName": artist_name,
                 "albumTitle": str(resolved.get("albumTitle") or ""),
@@ -521,6 +723,11 @@ reason 要具体说明它与用户偏好的声音、情绪、文本、场景或�
             verified_artists[_music_key(artist_name)] = {
                 "artistId": str(resolved.get("artistId") or ""), "artistName": artist_name,
             }
+        canonical_artists = list(dict.fromkeys(
+            str(item.get("name") or "") for item in (entity_resolutions or [])
+            if item.get("status") == "RESOLVED" and item.get("name")
+        ))
+        verified_songs = await self._supplement_named_artist_tracks(canonical_artists or named_artists, verified_songs, sources)
         artist_items = []
         for suggestion in artists:
             identity = verified_artists.get(_music_key(suggestion.artist_name), {})
@@ -536,11 +743,17 @@ reason 要具体说明它与用户偏好的声音、情绪、文本、场景或�
                 card_intent=_public_source_card(sources), action="recommend_music",
                 trace_summary={"webSourceCount": len(sources), "verifiedSongCount": 0, "unresolvedSongCount": len(songs)},
             )
-        verified_songs = list({item["recordingId"]: item for item in verified_songs}.values())
+        verified_songs = _diverse_song_order(list({item["recordingId"]: item for item in verified_songs}.values()))
+        visible_song_count = min(7, len(verified_songs))
+        final_summary = (
+            f"已从公开资料候选中核验并展示 {visible_song_count} 首歌曲。{draft.summary}"
+            if visible_song_count else draft.summary
+        )
         payload = {
-            "title": "这轮音乐探索的推荐方向", "summary": draft.summary,
+            "title": "这轮音乐探索的推荐方向", "summary": final_summary,
             "songs": verified_songs[:7], "artists": artist_items[:3],
             "sources": _public_source_items(sources, limit=5),
+            "preferenceProfile": preference_profile,
         }
         if prior_cards and _recommendation_followup(request):
             payload.update({
@@ -549,14 +762,104 @@ reason 要具体说明它与用户偏好的声音、情绪、文本、场景或�
                 "appliedInstruction": request.user_message[:240],
             })
         return ConversationAgentResult(
-            text=draft.summary,
+            text=final_summary,
             card_intent=ConversationCardIntent(message_type="RECOMMENDATION_CARD", card_type="MUSIC_RECOMMENDATIONS", payload=payload),
             action="recommend_music",
             trace_summary={
                 "webSourceCount": len(sources), "proposedSongCount": len(songs),
                 "verifiedSongCount": len(verified_songs), "artistCount": len(artist_items),
+                "preferenceDimensions": _active_preference_dimensions(preference_profile),
             },
         )
+
+    async def _supplement_named_artist_tracks(
+        self, mentions: list[str], verified_songs: list[dict], sources: list[dict]
+    ) -> list[dict]:
+        """Repair a collapsed multi-artist result with MusicBrainz-verified facts.
+
+        This is a postcondition guard for an explicit user contract, not a fixed
+        discovery workflow: it runs only when the Supervisor chose recommendation,
+        multiple literal artists were supplied, and verified output lost coverage.
+        """
+        if self.catalog is None or not mentions:
+            return verified_songs
+        target_coverage = min(5, len(mentions))
+        covered = {_music_key(str(item.get("artistName") or "")) for item in verified_songs}
+        covered_artist_mbids = {str(item.get("artistMbid") or "") for item in verified_songs if item.get("artistMbid")}
+        if len(mentions) == 1:
+            missing = list(mentions) if len(verified_songs) < 3 else []
+        else:
+            missing = [mention for mention in mentions if not _artist_key_covered(_music_key(mention), covered)]
+        if not missing or (len(mentions) > 1 and len(mentions) - len(missing) >= target_coverage):
+            return verified_songs
+        try:
+            resolutions = await self.catalog.resolve_artist_candidates(missing)
+        except Exception:
+            return verified_songs
+        seeds: list[dict] = []
+        seen_mbids: set[str] = set()
+        for resolution in resolutions:
+            candidates = resolution.get("candidates") or []
+            if not candidates:
+                continue
+            top = candidates[0]
+            score = int(top.get("score") or 0)
+            runner_up = int(candidates[1].get("score") or 0) if len(candidates) > 1 else 0
+            if score < 95 or (runner_up >= score - 5 and _music_key(str(top.get("name") or "")) != _music_key(str(resolution.get("mention") or ""))):
+                continue
+            # Stage names and real names can resolve to the same MusicBrainz
+            # artist (for example 张悬 and 安溥). Do not manufacture another
+            # coverage slot or extra card for the same actual artist.
+            if _artist_key_covered(_music_key(str(top.get("name") or "")), covered):
+                continue
+            if str(top.get("mbid") or "") in covered_artist_mbids:
+                continue
+            if top.get("mbid") and top.get("name") and str(top["mbid"]) not in seen_mbids:
+                seen_mbids.add(str(top["mbid"]))
+                seeds.append({"mbid": str(top["mbid"]), "name": str(top["name"]), "mention": str(resolution.get("mention") or top["name"])})
+        if not seeds:
+            return verified_songs
+        try:
+            # Browse enough of the catalogue to find titles actually mentioned
+            # by public sources. MusicBrainz browse order is not a popularity
+            # ranking and its first item can be an obscure recording.
+            discovered = await self.catalog.discover_artist_recordings(seeds, per_artist_limit=32)
+        except Exception:
+            return verified_songs
+        existing_ids = {str(item.get("recordingId") or "") for item in verified_songs}
+        supplements: list[dict] = []
+        for seed in seeds:
+            catalog_url = f"https://musicbrainz.org/artist/{seed['mbid']}"
+            candidates = [
+                item for item in discovered
+                if item.get("recordingId")
+                and str(item.get("recordingId")) not in existing_ids
+                and str(item.get("sourceUrl") or "") == catalog_url
+            ]
+            desired = max(1, 3 - len(verified_songs)) if len(mentions) == 1 else 1
+            for _ in range(desired):
+                candidate, evidence_url = _select_evidence_backed_recording(seed, candidates, sources)
+                if candidate is None:
+                    break
+                candidates.remove(candidate)
+                title = str(candidate.get("title") or "")
+                artist_name = str(candidate.get("artistName") or seed["name"])
+                if not title:
+                    continue
+                supplements.append({
+                    "recordingId": str(candidate["recordingId"]), "artistId": str(candidate.get("artistId") or ""),
+                    "artistMbid": str(seed["mbid"]), "title": title,
+                    "artistName": artist_name, "albumTitle": str(candidate.get("albumTitle") or ""),
+                    "coverUrl": str(candidate.get("coverUrl") or ""),
+                    "reason": f"你在本轮明确提到{seed['mention']}；这首作品已通过公开目录与 MusicBrainz 身份核验。",
+                    "sourceUrl": evidence_url or catalog_url, "searchUrl": _netease_search_url(title, artist_name),
+                    "verificationStatus": "MUSICBRAINZ_VERIFIED",
+                })
+                existing_ids.add(str(candidate["recordingId"]))
+                covered.add(_music_key(artist_name))
+        # Put coverage repairs before the model-ranked tail so the seven-card
+        # presentation limit cannot silently discard every repaired artist.
+        return supplements + verified_songs
 
 
 def _fallback_decision(state: ConversationState) -> ConversationDecision:
@@ -593,6 +896,290 @@ def _fallback_decision(state: ConversationState) -> ConversationDecision:
 
 def _recommendation_request(text: str) -> bool:
     return bool(re.search(r"推荐|相似|相近|类似|适合|歌单|听什么|探索方向|共同点", text, re.I))
+
+
+def _explicit_artist_mentions(text: str) -> list[str]:
+    """Best-effort literal extraction used only to guarantee search coverage.
+
+    The model remains responsible for semantic intent.  Values returned here
+    must occur in the user's text and are never treated as resolved identities.
+    """
+    match = re.search(r"(?:我最喜欢|我喜欢|最喜欢|喜欢|常听|爱听)\s*([^。！？；\n]{1,240})", text, re.I)
+    if not match:
+        direct = re.search(
+            r"(?:给我推荐|推荐给我|推荐|想听|听听)(?:一下|几首|一些|点)?\s*([^。！？；，,\n]{2,60}?)\s*的(?:歌曲|歌|作品)",
+            text, re.I,
+        )
+        if not direct:
+            return []
+        value = direct.group(1).strip()
+        return [value] if value and value in text else []
+    clause = re.split(
+        r"[,，](?=(?:根据|想|希望|要|请|可以|适合|用于|并|但|然后|探索|寻找|做|来|推荐|分析))",
+        match.group(1), maxsplit=1,
+    )[0]
+    clause = re.split(r"(?:的歌曲|的歌)(?:\s|$)", clause, maxsplit=1)[0]
+    values = re.split(r"[、,，/]|(?:和|与|及)", clause)
+    non_artist_terms = {"克制", "温柔", "忧郁", "明亮", "治愈", "孤独", "浪漫", "热烈", "安静", "冷峻", "中文", "华语", "独立音乐", "民谣", "摇滚", "电子", "爵士", "流行", "说唱"}
+    mentions: list[str] = []
+    for value in values:
+        cleaned = re.sub(r"(?:等)?(?:歌手|艺人|樂隊|乐队)$", "", value.strip(), flags=re.I).strip()
+        if 1 < len(cleaned) <= 60 and cleaned not in non_artist_terms and cleaned in text:
+            mentions.append(cleaned)
+    return list(dict.fromkeys(mentions))[:8]
+
+
+def _recommendation_search_queries(
+    request: ConversationAgentRequest, planned_query: str, focus_artists: list[str] | None = None,
+    preference_profile: dict | None = None,
+) -> list[dict]:
+    mentions = focus_artists or _explicit_artist_mentions(request.user_message)
+    if not mentions:
+        direct = f"{request.user_message} 具体歌曲 歌手 专辑"
+        axes = list((preference_profile or {}).get("discovery_axes") or (preference_profile or {}).get("discoveryAxes") or [])
+        language = " ".join((preference_profile or {}).get("languages_regions") or (preference_profile or {}).get("languagesRegions") or [])
+        queries = [
+            {"query": direct[:300], "purpose": "explicit_preference_coverage"},
+            {"query": planned_query, "purpose": "conversation_research"},
+        ]
+        queries.extend({
+            "query": f"{language} {axis} 推荐 具体歌曲 歌手 专辑"[:300],
+            "purpose": "preference_axis_coverage",
+        } for axis in axes[:3])
+        unique: list[dict] = []
+        seen: set[str] = set()
+        for item in queries:
+            value = str(item["query"]).strip()
+            if value and value not in seen:
+                seen.add(value); unique.append(item)
+        return unique[:5]
+    queries = [
+        {"query": f'"{artist}" 代表作 歌曲 专辑 曲目', "purpose": "explicit_artist_coverage"}
+        for artist in mentions
+    ]
+    if len(queries) < 8:
+        queries.append({"query": planned_query, "purpose": "conversation_research"})
+    return queries[:8]
+
+
+def _fallback_preference_profile(
+    request: ConversationAgentRequest, literal_artists: list[str]
+) -> MusicPreferenceProfile:
+    text = " ".join([
+        request.summary, *(str(item.get("content") or "") for item in request.recent_messages[-12:]), request.user_message,
+    ])
+    mappings = {
+        "genres": ["民谣", "摇滚", "电子", "爵士", "流行", "说唱", "R&B", "灵魂乐", "后摇", "古典"],
+        "moods": ["克制", "温柔", "忧郁", "明亮", "治愈", "孤独", "浪漫", "热烈", "安静", "冷峻", "松弛"],
+        "scenes": ["深夜", "写代码", "通勤", "散步", "学习", "工作", "开车", "睡前", "运动"],
+        "languages_regions": ["华语", "中文", "台语", "粤语", "英语", "欧美", "日本", "韩国"],
+        "eras": ["八十年代", "九十年代", "千禧年", "00年代", "10年代", "近年"],
+        "lyrical_themes": ["城市", "成长", "亲密关系", "自我", "社会观察", "家庭", "青春", "孤独"],
+    }
+    values = {key: [term for term in terms if term.casefold() in text.casefold()] for key, terms in mappings.items()}
+    familiarity = "deep_cuts" if re.search(r"冷门|小众|深挖|非热门|不要代表作", text) else "representative" if re.search(r"代表作|入门|热门", text) else "mixed"
+    axes = [*values["genres"][:2], *values["moods"][:2], *values["scenes"][:1]]
+    if literal_artists:
+        axes.extend(f"从{artist}的相邻创作脉络展开" for artist in literal_artists[:3])
+    return MusicPreferenceProfile(
+        named_artists=literal_artists, familiarity=familiarity,
+        evidence_spans=[request.user_message[:240]], discovery_axes=list(dict.fromkeys(axes))[:6],
+        **values,
+    )
+
+
+def _active_preference_dimensions(profile: dict) -> list[str]:
+    names = []
+    for key in ("named_artists", "namedArtists", "genres", "sonic_traits", "sonicTraits", "moods", "scenes", "languages_regions", "languagesRegions", "eras", "lyrical_themes", "lyricalThemes"):
+        if profile.get(key):
+            names.append(key)
+    return list(dict.fromkeys(names))
+
+
+def _preference_plan_summary(profile: MusicPreferenceProfile) -> str:
+    dimensions = [
+        *profile.named_artists[:3], *profile.genres[:2], *profile.sonic_traits[:2],
+        *profile.moods[:2], *profile.scenes[:1],
+    ]
+    return "已提取本轮偏好维度" + ("：" + "、".join(dict.fromkeys(dimensions)) if dimensions else "，将从用户原话继续判断")
+
+
+def _merge_web_sources(existing: list[dict], incoming: list[dict], prefer_incoming: bool = False) -> list[dict]:
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for item in ([*incoming, *existing] if prefer_incoming else [*existing, *incoming]):
+        url = str(item.get("sourceUrl") or "")
+        key = url or _music_key(str(item.get("sourceTitle") or "") + str(item.get("summary") or ""))
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(item)
+    return merged[:80]
+
+
+def _assess_research(request: ConversationAgentRequest, profile: dict, sources: list[dict]) -> dict:
+    artists = list(profile.get("named_artists") or profile.get("namedArtists") or _explicit_artist_mentions(request.user_message))
+    coverage: dict[str, int] = {}
+    for artist in artists:
+        key = _music_key(artist)
+        coverage[artist] = sum(
+            1 for item in sources
+            if key and key in _music_key(" ".join(str(item.get(field) or "") for field in ("searchQuery", "sourceTitle", "summary")))
+        )
+    missing = [artist for artist, count in coverage.items() if count == 0]
+    if artists:
+        ready = not missing and len(sources) >= min(5, len(artists) * 2)
+        next_step = "继续补足" + "、".join(missing) + "的公开歌曲资料" if missing else "公开资料已覆盖明确艺人，可以进入歌曲提取与核验"
+    else:
+        axes = list(profile.get("discovery_axes") or profile.get("discoveryAxes") or [])
+        ready = len(sources) >= 6
+        next_step = "沿着" + "、".join(axes[:3]) + "继续扩展搜索切面" if axes else "继续补充与本轮场景和声音要求相关的音乐资料"
+    return {
+        "ready": ready, "sourceCount": len(sources), "artistCoverage": coverage,
+        "missingArtists": missing, "activeDimensions": _active_preference_dimensions(profile),
+        "nextStep": next_step,
+    }
+
+
+def _research_gap_query(request: ConversationAgentRequest, assessment: dict) -> str:
+    missing = list(assessment.get("missingArtists") or [])
+    if missing:
+        return "；".join(f'"{artist}" 代表作 歌曲 专辑 曲目' for artist in missing)[:300]
+    return str(assessment.get("nextQuery") or f"{request.user_message} 具体歌曲 专辑 曲目 推荐")[:300]
+
+
+def _profile_search_query(request: ConversationAgentRequest, profile: dict, attempt: int) -> str:
+    languages = " ".join(profile.get("languages_regions") or profile.get("languagesRegions") or [])
+    genres = " ".join((profile.get("genres") or [])[:3])
+    traits = " ".join((profile.get("sonic_traits") or profile.get("sonicTraits") or [])[:3])
+    moods = " ".join((profile.get("moods") or [])[:2])
+    scenes = " ".join((profile.get("scenes") or [])[:2])
+    suffix = "代表歌曲 曲目 专辑 乐评" if attempt % 2 else "具体歌名 音乐人 歌单"
+    return " ".join(value for value in [languages, genres, traits, moods, scenes, suffix] if value)[:300] or request.user_message[:300]
+
+
+def _recommendation_result_gaps(
+    request: ConversationAgentRequest, result: ConversationAgentResult, profile: dict,
+    entity_resolutions: list[dict] | None = None,
+) -> list[str]:
+    if not result.card_intent or result.card_intent.card_type != "MUSIC_RECOMMENDATIONS":
+        return ["具体歌曲结果"] if _recommendation_intent(request) else []
+    songs = list(result.card_intent.payload.get("songs") or [])
+    gaps: list[str] = []
+    if len(songs) < 3:
+        gaps.append("至少三首可核验歌曲")
+    named = list(profile.get("named_artists") or profile.get("namedArtists") or [])
+    if len(named) > 1:
+        expected_mbids = {
+            str(item.get("mbid") or "") for item in (entity_resolutions or [])
+            if item.get("status") == "RESOLVED" and item.get("mbid")
+        }
+        represented_mbids = {str(item.get("artistMbid") or "") for item in songs if item.get("artistMbid")}
+        represented_names = {_music_key(str(item.get("artistName") or "")) for item in songs}
+        coverage = len(expected_mbids & represented_mbids) if expected_mbids else sum(
+            1 for artist in named if _artist_key_covered(_music_key(artist), represented_names)
+        )
+        target = min(5, len(expected_mbids) if expected_mbids else len(named))
+        if coverage < target:
+            gaps.append("明确艺人的均衡覆盖")
+    languages = " ".join(profile.get("languages_regions") or profile.get("languagesRegions") or [])
+    if re.search(r"华语|中文|台语|粤语", languages) and songs:
+        cjk_count = sum(bool(re.search(r"[\u3400-\u9fff]", str(item.get("title") or "") + str(item.get("artistName") or ""))) for item in songs)
+        if cjk_count < max(2, (len(songs) + 1) // 2):
+            gaps.append("华语音乐方向")
+    return gaps
+
+
+def _entity_clarification_decision(ambiguities: list[dict]) -> ConversationDecision:
+    first = ambiguities[0]
+    mention = str(first.get("mention") or "这位艺人")
+    options = [
+        " · ".join(value for value in [str(item.get("name") or ""), str(item.get("country") or ""), str(item.get("disambiguation") or "")] if value)
+        for item in first.get("candidates", [])
+    ]
+    return ConversationDecision(
+        action="clarify", public_summary=f"发现“{mention}”可能对应多个艺人，等待确认",
+        clarification_question=f"你提到的“{mention}”具体是哪一位？",
+        clarification_reason="不同身份会得到完全不同的歌曲结果，需要先确认再继续。",
+        clarification_options=options,
+    )
+
+
+def _artist_key_covered(mention_key: str, covered_keys: set[str]) -> bool:
+    return any(mention_key == value or mention_key in value or value in mention_key for value in covered_keys if value)
+
+
+def _draft_named_artist_coverage(draft: MusicRecommendationDraft, mentions: list[str]) -> int:
+    # An artist-only suggestion cannot satisfy a request for recommended music.
+    # Coverage is therefore measured on concrete song candidates only.
+    represented = {_music_key(item.artist_name) for item in draft.songs}
+    return sum(1 for mention in mentions if _artist_key_covered(_music_key(mention), represented))
+
+
+def _diverse_song_order(items: list[dict]) -> list[dict]:
+    """Keep one verified song per artist before additional tracks."""
+    first_by_artist: dict[str, dict] = {}
+    remainder: list[dict] = []
+    for item in items:
+        key = _music_key(str(item.get("artistName") or ""))
+        if key and key not in first_by_artist:
+            first_by_artist[key] = item
+        else:
+            remainder.append(item)
+    return [*first_by_artist.values(), *remainder]
+
+
+def _select_evidence_backed_recording(
+    seed: dict, candidates: list[dict], sources: list[dict]
+) -> tuple[dict | None, str]:
+    """Choose a catalogue recording by public evidence, never browse order.
+
+    Search results issued for this explicit artist are preferred. A title that
+    occurs in their title/snippet/excerpt is strong evidence; metadata quality
+    only breaks ties. If snippets do not expose a track list, prefer a useful
+    catalogue entry over a short generic one-word title.
+    """
+    if not candidates:
+        return None, ""
+    mention_keys = {
+        _music_key(str(seed.get("mention") or "")),
+        _music_key(str(seed.get("name") or "")),
+    }
+    relevant_sources: list[dict] = []
+    for source in sources:
+        query_key = _music_key(str(source.get("searchQuery") or ""))
+        if any(key and key in query_key for key in mention_keys):
+            relevant_sources.append(source)
+    evidence_sources = relevant_sources or sources
+
+    def evidence(candidate: dict) -> tuple[int, int, str]:
+        title = str(candidate.get("title") or "").strip()
+        title_key = _music_key(title)
+        matched_url = ""
+        evidence_score = 0
+        if len(title_key) >= 2:
+            for source in evidence_sources:
+                haystack = _music_key(" ".join(str(source.get(field) or "") for field in ("sourceTitle", "summary", "pageExcerpt")))
+                if title_key in haystack:
+                    evidence_score = 100
+                    matched_url = str(source.get("sourceUrl") or "")
+                    break
+        quality = 0
+        if candidate.get("albumTitle"):
+            quality += 8
+        if candidate.get("coverUrl"):
+            quality += 4
+        if re.search(r"[\u3400-\u9fff]", title):
+            quality += 4
+        if 3 <= len(title_key) <= 24:
+            quality += 2
+        if re.fullmatch(r"[A-Za-z]{1,5}", title):
+            quality -= 12
+        return evidence_score, quality, matched_url
+
+    ranked = [(evidence(item), item) for item in candidates]
+    ranked.sort(key=lambda pair: (pair[0][0], pair[0][1]), reverse=True)
+    best_evidence, best = ranked[0]
+    return best, best_evidence[2]
 
 
 def _recommendation_payloads(request: ConversationAgentRequest) -> list[dict]:

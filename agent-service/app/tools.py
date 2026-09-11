@@ -124,7 +124,7 @@ class WebSearchTool:
     async def search_many(self, queries: list[dict]) -> list[dict]:
         unique: list[dict] = []
         seen: set[str] = set()
-        for item in queries[:5]:
+        for item in queries[:8]:
             query = str(item.get("query", "")).strip()
             if query and query not in seen:
                 seen.add(query)
@@ -133,9 +133,15 @@ class WebSearchTool:
             *(self.search(item["query"], item["purpose"]) for item in unique),
             return_exceptions=True,
         )
+        # Preserve coverage across independent search angles.  Concatenating
+        # provider results made the first artist consume the entire downstream
+        # evidence window even when later searches had succeeded.
+        successful = [group for group in groups if isinstance(group, list)]
         results: list[dict] = []
-        for group in groups:
-            if isinstance(group, list): results.extend(group)
+        for index in range(max((len(group) for group in successful), default=0)):
+            for group in successful:
+                if index < len(group):
+                    results.append(group[index])
         return _deduplicate_sources(results)
 
     async def enrich_public_sources(self, sources: list[dict], limit: int = 2) -> list[dict]:

@@ -90,6 +90,27 @@
   background: #f2f0eb;
   overflow: hidden;
 }
+.agent-turn-timer {
+  min-height: 18px;
+  padding: 0 13px 7px 14px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #8d8981;
+  font-size: .66rem;
+  letter-spacing: .01em;
+}
+.agent-turn-timer > i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #aaa69e;
+}
+.agent-turn-timer.active > i {
+  background: #a64b3c;
+  box-shadow: 0 0 0 3px #ead8d2;
+  animation: activity-glow 2.1s ease-in-out infinite;
+}
 
 .agent-activity > button {
   width: 100%;

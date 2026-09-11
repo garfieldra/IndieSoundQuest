@@ -17,6 +17,14 @@ class ConversationMemoryPolicyTest {
   }
 
   @Test
+  void progressUsesTheThresholdThatIsCloserToBeingReached() {
+    assertEquals(20, ConversationApplicationService.memoryProgressPercent(2, 170_000));
+    assertEquals(50, ConversationApplicationService.memoryProgressPercent(10, 1));
+    assertEquals(100, ConversationApplicationService.memoryProgressPercent(21, 1));
+    assertEquals(100, ConversationApplicationService.memoryProgressPercent(1, 900_000));
+  }
+
+  @Test
   void keepsTheLatestSixCompleteTurns() {
     UUID conversationId = UUID.randomUUID();
     List<ConversationMessage> messages = new ArrayList<>();

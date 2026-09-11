@@ -11,6 +11,7 @@ services:
         condition: service_healthy
     environment:
       VITE_API_BASE_URL: /api
+      VITE_API_PROXY_TARGET: http://java-service:8080
     networks:
       - public
       - internal

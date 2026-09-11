@@ -41,6 +41,7 @@ class ConversationAgentRequest(ApiModel):
     recent_feedback: list[str] = Field(default_factory=list, max_length=12)
     forced_action: str | None = Field(default=None, max_length=40)
     pool_size: Literal[16, 32] | None = None
+    confirmed_artists: list["ConfirmedArtist"] = Field(default_factory=list, max_length=8)
 
 
 class ConversationResumeRequest(ApiModel):

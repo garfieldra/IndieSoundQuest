@@ -49,6 +49,7 @@ conversation_runtime = ConversationReActRuntime(web_search, KnowledgeSearchTool(
 
 _ACTION_PROGRESS = {
     "understand_preference": ("understand_preference", "正在理解你的音乐偏好"),
+    "analyze_preference": ("analyze_preference", "正在整理声音、情绪与聆听场景"),
     "resolve_named_entities": ("resolve_artist", "正在核验你提到的艺人"),
     "search_web": ("discover_web", "正在从公开音乐资料中寻找线索"),
     "search_spotify": ("discover_spotify", "正在从 Spotify 目录补充国际音乐线索"),
@@ -77,6 +78,7 @@ def _progress(request_id, action: str, elapsed_ms: int, metrics: dict | None = N
 
 _PLAN_ACTIONS = {
     "understand_preference": ("理解音乐偏好", "结合本轮输入与已有上下文确定探索边界"),
+    "analyze_preference": ("建立本轮偏好画像", "提取艺人、声音、情绪、场景与探索切面"),
     "resolve_named_entities": ("核验艺人身份", "检查用户提到的艺人及可能歧义"),
     "request_clarification": ("等待用户确认", "存在会影响候选正确性的身份歧义"),
     "search_catalog": ("检查规范歌曲目录", "读取已核验曲目作为可用补充"),

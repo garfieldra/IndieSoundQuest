@@ -8,6 +8,13 @@ from app.conversation_graph import (
     MusicRecommendationDraft,
     RecommendedArtistDraft,
     RecommendedSongDraft,
+    _assess_research,
+    _diverse_song_order,
+    _draft_named_artist_coverage,
+    _explicit_artist_mentions,
+    _fallback_preference_profile,
+    _recommendation_search_queries,
+    _select_evidence_backed_recording,
     _unique_artist_drafts,
     _unique_song_drafts,
 )
@@ -23,6 +30,85 @@ class FakeWeb:
 class FakeKnowledge:
     async def search_verified(self, query: str, recording_ids: list[str]):
         return []
+
+
+def test_multi_artist_recommendation_builds_one_parallel_search_per_explicit_artist():
+    text = "我最喜欢安溥、张悬、徐佳莹、郑宜农、艾怡良、TizzyBac等歌手，根据我的偏好推荐音乐。"
+    request_id = uuid4()
+    request = ConversationAgentRequest(
+        requestId=request_id, agentRunId=request_id, conversationId=uuid4(), guestId="guest",
+        userMessage=text,
+    )
+    assert _explicit_artist_mentions(text) == ["安溥", "张悬", "徐佳莹", "郑宜农", "艾怡良", "TizzyBac"]
+    queries = _recommendation_search_queries(request, text)
+    assert len(queries) == 7
+    assert [item["query"].split('"')[1] for item in queries[:6]] == ["安溥", "张悬", "徐佳莹", "郑宜农", "艾怡良", "TizzyBac"]
+
+
+def test_single_artist_song_request_is_extracted_and_gets_anchored_search():
+    text = "给我推荐几首asen的歌曲。"
+    request_id = uuid4()
+    request = ConversationAgentRequest(
+        requestId=request_id, agentRunId=request_id, conversationId=uuid4(), guestId="guest",
+        userMessage=text,
+    )
+    assert _explicit_artist_mentions(text) == ["asen"]
+    queries = _recommendation_search_queries(request, "alt-J 相似音乐")
+    assert queries[0]["query"] == '"asen" 代表作 歌曲 专辑 曲目'
+    assert queries[1]["query"] == "alt-J 相似音乐"
+
+
+def test_scene_request_builds_structured_fallback_profile_and_research_gate():
+    request_id = uuid4()
+    request = ConversationAgentRequest(
+        requestId=request_id, agentRunId=request_id, conversationId=uuid4(), guestId="guest",
+        userMessage="推荐一些适合深夜写代码、克制但有节奏感的华语音乐。",
+    )
+    profile = _fallback_preference_profile(request, [])
+    assert profile.scenes == ["深夜", "写代码"]
+    assert profile.moods == ["克制"]
+    assert profile.languages_regions == ["华语"]
+    assessment = _assess_research(request, profile.model_dump(), [{"sourceUrl": f"https://example.com/{i}"} for i in range(5)])
+    assert assessment["ready"] is False
+    assessment = _assess_research(request, profile.model_dump(), [{"sourceUrl": f"https://example.com/{i}"} for i in range(6)])
+    assert assessment["ready"] is True
+
+
+def test_verified_song_order_preserves_artist_diversity_before_second_tracks():
+    songs = [
+        {"recordingId": "1", "artistName": "Tizzy Bac", "title": "A"},
+        {"recordingId": "2", "artistName": "Tizzy Bac", "title": "B"},
+        {"recordingId": "3", "artistName": "安溥", "title": "C"},
+        {"recordingId": "4", "artistName": "徐佳莹", "title": "D"},
+    ]
+    ordered = _diverse_song_order(songs)
+    assert [item["recordingId"] for item in ordered] == ["1", "3", "4", "2"]
+
+
+def test_named_artist_coverage_requires_concrete_song_candidates():
+    draft = MusicRecommendationDraft(
+        summary="这是一段足够长的多艺人推荐摘要，用于确认艺人卡不能替代歌曲候选覆盖。",
+        songs=[RecommendedSongDraft(title="测试歌曲", artist_name="安溥", reason="一段足够具体且长度合规的推荐理由", source_url="https://example.com/song")],
+        artists=[RecommendedArtistDraft(artist_name="徐佳莹", reason="一段足够具体且长度合规的推荐理由", source_url="https://example.com/artist")],
+    )
+    assert _draft_named_artist_coverage(draft, ["安溥", "徐佳莹"]) == 1
+
+
+def test_catalog_supplement_prefers_title_supported_by_artist_search_evidence():
+    seed = {"mention": "徐佳莹", "name": "徐佳瑩"}
+    candidates = [
+        {"recordingId": "1", "title": "Hell", "artistName": "徐佳瑩"},
+        {"recordingId": "2", "title": "失落沙洲", "artistName": "徐佳瑩", "albumTitle": "LaLa首张创作专辑"},
+    ]
+    sources = [{
+        "searchQuery": '"徐佳莹" 代表作 歌曲 专辑 曲目',
+        "sourceTitle": "徐佳莹代表作",
+        "summary": "代表作品包括失落沙洲、身骑白马等歌曲。",
+        "sourceUrl": "https://example.com/lala",
+    }]
+    selected, source_url = _select_evidence_backed_recording(seed, candidates, sources)
+    assert selected["title"] == "失落沙洲"
+    assert source_url == "https://example.com/lala"
 
 
 def test_recommendation_deduplication_normalizes_song_and_artist_names():
@@ -83,6 +169,14 @@ class FakeRespondingRouter:
 
     async def ainvoke(self, _prompt):
         return ConversationDecision(action="respond", public_summary="直接整理文字回答")
+
+
+class FakeTournamentRouter:
+    def with_structured_output(self, _schema, **_kwargs):
+        return self
+
+    async def ainvoke(self, _prompt):
+        return ConversationDecision(action="propose_tournament", public_summary="错误地建议世界杯")
 
 
 class FakeRevisionModel:
@@ -289,6 +383,23 @@ async def test_explicit_recommendation_routes_to_card_tool_after_web_evidence():
         "web_sources": await FakeWeb().search("test"), "knowledge": [], "iteration": 1,
     })
     assert decision.action == "recommend_music"
+
+
+@pytest.mark.asyncio
+async def test_recommendation_retries_empty_research_when_model_wobbles_to_tournament():
+    runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge())
+    runtime.model = FakeTournamentRouter()
+    request_id = uuid4()
+    request = ConversationAgentRequest(
+        requestId=request_id, agentRunId=request_id, conversationId=uuid4(), guestId="guest",
+        userMessage="推荐一些适合深夜写代码、克制但有节奏感的华语音乐。",
+    )
+    decision = await runtime.decide({
+        "request": request, "action_history": [{"action": "search_web"}],
+        "web_sources": [], "knowledge": [], "iteration": 1, "search_attempts": 1,
+        "research_assessment": {"ready": False, "sourceCount": 0, "nextStep": "继续补充公开资料"},
+    })
+    assert decision.action == "search_web"
 
 
 @pytest.mark.asyncio

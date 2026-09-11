@@ -355,13 +355,19 @@ public class ConversationApplicationService {
     fields.put("memoryCompressionMessages", segment);
     fields.put("memoryCompressionThroughSequence", through);
     if (reason != null) fields.put("memoryCompressionReason", reason);
-    int percent = Math.min(100, (int)Math.round(estimatedTokens * 100.0 / EMERGENCY_COMPRESSION_TOKENS));
+    int percent = memoryProgressPercent(unsummarizedTurns, estimatedTokens);
     var status = new MemoryStatus(estimatedTokens, EMERGENCY_COMPRESSION_TOKENS, WORKING_CONTEXT_BUDGET_TOKENS, PROVIDER_CONTEXT_WINDOW_TOKENS, percent, unsummarizedTurns, AUTO_COMPRESSION_TURNS, RETAINED_RECENT_TURNS, thresholdReached, compressibleCount > 0, conversation.getSummaryVersion(), conversation.getSummaryThroughSequence(), conversation.getSummaryUpdatedAt());
     return new MemoryPlan(segment, through, fields, status);
   }
 
   static boolean shouldCompress(int turns, int estimatedTokens) {
     return turns >= AUTO_COMPRESSION_TURNS || estimatedTokens >= EMERGENCY_COMPRESSION_TOKENS;
+  }
+
+  static int memoryProgressPercent(int turns, int estimatedTokens) {
+    int turnPercent = (int)Math.round(Math.max(0, turns) * 100.0 / AUTO_COMPRESSION_TURNS);
+    int tokenPercent = (int)Math.round(Math.max(0, estimatedTokens) * 100.0 / EMERGENCY_COMPRESSION_TOKENS);
+    return Math.min(100, Math.max(turnPercent, tokenPercent));
   }
 
   static int retainedStartForTurns(List<ConversationMessage> messages, int turnsToKeep) {

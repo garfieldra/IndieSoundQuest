@@ -320,6 +320,29 @@
   line-height: 1.78;
 }
 
+.conversation-message-shell { position: relative; }
+.conversation-message-shell > time {
+  position: absolute;
+  z-index: 3;
+  top: -7px;
+  right: 7px;
+  padding: 4px 7px;
+  transform: translateY(-100%);
+  border: 1px solid #dedad2;
+  border-radius: 7px;
+  background: #faf9f6;
+  color: #817c74;
+  box-shadow: 0 5px 18px #3b332616;
+  font-size: .65rem;
+  line-height: 1;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .14s ease, transform .14s ease;
+}
+.conversation-message-shell:hover > time,
+.conversation-message-shell:focus-within > time { transform: translateY(calc(-100% - 2px)); opacity: 1; }
+
 .conversation-message.user {
   align-self: flex-end;
   width: auto;
@@ -394,10 +417,9 @@
 .composer-toolbar .memory-compress-button { width: 28px; height: 28px; border: 1px solid #dedbd4; border-radius: 9px; background: transparent; color: #6f6a62; cursor: pointer; }
 .composer-toolbar .memory-compress-button:hover:not(:disabled) { border-color: #bdb8af; background: #f0eee9; color: #302e2a; }
 .composer-toolbar .memory-compress-button:disabled { color: #bbb7b0; cursor: default; opacity: .64; }
-.memory-meter { width: 112px; display: grid; gap: 3px; }
+.memory-meter { width: 112px; display: grid; }
 .memory-meter > span { height: 3px; overflow: hidden; border-radius: 999px; background: #e4e1db; }
 .memory-meter > span i { display: block; height: 100%; border-radius: inherit; background: #8e887f; transition: width .25s ease; }
-.memory-meter small { color: #918c84; font-size: .6rem; white-space: nowrap; }
 .memory-spinner { width: 11px; height: 11px; border: 1.4px solid #aaa59c66; border-top-color: #656159; border-radius: 50%; animation: composer-spin .8s linear infinite; }
 .composer-toolbar button svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .conversation-composer > small { display: block; margin: 7px auto 0; color: #aaa69f; font-size: .62rem; text-align: center; }

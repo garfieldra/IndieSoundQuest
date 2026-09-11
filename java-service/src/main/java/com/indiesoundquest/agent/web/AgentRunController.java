@@ -76,7 +76,7 @@ public class AgentRunController {
         var payload = new LinkedHashMap<String, Object>();
         payload.put("requestId", id); payload.put("agentRunId", id); payload.put("conversationId", conversationId); payload.put("guestId", guest.toString());
         payload.put("resumeKind", resumeKind); payload.put("preferenceText", snapshot.path("preferenceText").asText()); payload.put("poolSize", snapshot.path("poolSize").asInt(32)); payload.put("confirmedArtists", confirmed);
-        payload.put("answer", Optional.ofNullable(body.answer()).orElse(""));
+        payload.put("answer", publicAnswer);
         if (snapshot.has("originalRequest")) payload.put("originalRequest", json.convertValue(snapshot.path("originalRequest"), Map.class));
         var result = agent.resume(payload, id, event -> {
           try {

@@ -350,16 +350,16 @@ public class MusicBrainzCatalogService {
     static SearchOutcome unresolved(String reason) { return new SearchOutcome(Optional.empty(), reason); }
   }
   public record Resolution(String title, String artistName, String sourceUrl, String status,
-                           UUID recordingId, UUID artistId, String recordingMbid, String albumTitle, String coverUrl,
+                           UUID recordingId, UUID artistId, String artistMbid, String recordingMbid, String albumTitle, String coverUrl,
                            String coverStatus, String catalogSource, String trustState, int score, boolean imported, String reason) {
     static Resolution resolved(Hint hint, Recording recording, int score, boolean imported) {
       return new Resolution(recording.getTitle(), recording.getArtist().getName(), hint.sourceUrl(), "RESOLVED",
-          recording.getId(), recording.getArtist().getId(), recording.getMusicbrainzMbid(), recording.getAlbumTitle(), Optional.ofNullable(recording.getCoverUrl()).orElse(""),
+          recording.getId(), recording.getArtist().getId(), recording.getArtist().getMusicbrainzMbid(), recording.getMusicbrainzMbid(), recording.getAlbumTitle(), Optional.ofNullable(recording.getCoverUrl()).orElse(""),
           Optional.ofNullable(recording.getCoverStatus()).orElse("UNAVAILABLE"), recording.getCatalogSource(), "CATALOG_IMPORTED", score, imported, null);
     }
     static Resolution unresolved(Hint hint, String reason) {
       var trustState = "AMBIGUOUS_MATCH".equals(reason) ? "MB_AMBIGUOUS" : "REJECTED";
-      return new Resolution(hint.title(), hint.artistName(), hint.sourceUrl(), "UNRESOLVED", null, null, null,
+      return new Resolution(hint.title(), hint.artistName(), hint.sourceUrl(), "UNRESOLVED", null, null, null, null,
           null, null, null, null, trustState, 0, false, reason);
     }
   }
