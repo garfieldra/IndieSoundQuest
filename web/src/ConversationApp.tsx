@@ -17,6 +17,7 @@ type CardItem = Pick<CandidateItem, 'recordingId' | 'title' | 'artistName' | 'co
 type CardPayload = { size?: 16 | 32; status?: string; summary?: string; preferenceText?: string; items?: CardItem[] }
 type Tournament = { id: string; status: string; size: number; completedVoteCount: number; currentMatch: { id: string; leftEntryId: string; rightEntryId: string } | null; entries: { id: string; title: string; artistName: string; coverUrl?: string }[] }
 type Report = { runId?: string; status: string; reportId?: string; version?: number; report?: { summary?: string; preferenceDimensions?: { label?: string; summary?: string }[]; songRecommendations?: { title?: string; artistName?: string; reason?: string; searchUrl?: string }[]; artistRecommendations?: { artistName?: string; reason?: string; searchUrl?: string }[]; personalityEasterEgg?: string } }
+type RunFollowUp = { id: string; clientMessageId: string; content: string; status: 'WAITING' | 'DISPATCHED' | 'INTERVENED' | 'CANCELLED'; nextRunId?: string | null; createdAt: string }
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api/v1${path}`, { credentials: 'include', ...options })
@@ -27,6 +28,13 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
 async function apiVoid(path: string, options: RequestInit = {}): Promise<void> {
   const response = await fetch(`/api/v1${path}`, { credentials: 'include', ...options })
   if (!response.ok) throw new Error(`请求失败（${response.status}）`)
+}
+
+async function runFollowUp(runId: string): Promise<RunFollowUp | null> {
+  const response = await fetch(`/api/v1/agent-runs/${runId}/next-message`, { credentials: 'include' })
+  if (response.status === 204 || response.status === 404) return null
+  if (!response.ok) throw new Error(`请求失败（${response.status}）`)
+  return response.json() as Promise<RunFollowUp>
 }
 
 function friendlyError(error: unknown) {
@@ -65,6 +73,8 @@ export function ConversationApp() {
   const [renameDraft, setRenameDraft] = useState('')
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null)
   const [currentRunId, setCurrentRunId] = useState<string | null>(null)
+  const [queuedFollowUp, setQueuedFollowUp] = useState<RunFollowUp | null>(null)
+  const [interventionUsed, setInterventionUsed] = useState(false)
   const [streamingResponse, setStreamingResponse] = useState('')
   const [conversationSearch, setConversationSearch] = useState('')
   const [showArchived, setShowArchived] = useState(false)
@@ -90,13 +100,13 @@ export function ConversationApp() {
     const loaded = await api<Message[]>(`/conversations/${conversationId}/messages`)
     setMessages(loaded)
     const latestRun = [...loaded].reverse().find(message => message.type === 'AGENT_RUN' && message.agentRunId)
-    if (latestRun?.agentRunId) await replayRunEvents(latestRun.agentRunId)
+    if (latestRun?.agentRunId) await replayRunEvents(latestRun.agentRunId, conversationId)
   }
   async function refreshMemory(conversationId = current?.id) {
     if (!conversationId) return
     setMemory(await api<MemoryStatus>(`/conversations/${conversationId}/memory`))
   }
-  async function replayRunEvents(runId: string) {
+  async function replayRunEvents(runId: string, conversationId?: string) {
     try {
       const payload = await api<{ runStatus: string; events: RunEvent[] }>(`/agent-runs/${runId}/events`)
       const replayProgress: Progress[] = []
@@ -111,7 +121,11 @@ export function ConversationApp() {
         if (event.type === 'PLAN_UPDATED') replayPlans.push(data as unknown as Plan)
         const projected = projectResponseStream(replayResponse, event, data)
         if (projected !== null) replayResponse = projected
+        if (event.type === 'INTERVENTION_ACCEPTED' || event.type === 'FOLLOW_UP_INTERVENED') setInterventionUsed(true)
       }
+      const followUp = await runFollowUp(runId)
+      setQueuedFollowUp(followUp?.status === 'WAITING' ? followUp : null)
+      if (followUp?.status === 'INTERVENED') setInterventionUsed(true)
       if (replayProgress.length) setProgress(replayProgress)
       if (replayPlans.length) { setPlanHistory(replayPlans.slice(-8)); setPlan(replayPlans[replayPlans.length - 1]) }
       if (payload.runStatus === 'RUNNING' || payload.runStatus === 'QUEUED') {
@@ -120,10 +134,9 @@ export function ConversationApp() {
         setCollapsed(false)
         if (resumingRunId.current !== runId) {
           resumingRunId.current = runId; setPending(true)
-          void followAgentRun(runId, { onProgress: item => setProgress(previous => [...previous, item]), onPlan: recordPlan, onResponseStarted: () => setStreamingResponse(''), onResponseDelta: (_delta, accumulated) => setStreamingResponse(accumulated) }, 15 * 60_000, cursor)
-            .then(() => refreshMessages())
+          void followConversationRunChain(runId, cursor, conversationId)
             .catch(error => setNotice(friendlyError(error)))
-            .finally(() => { resumingRunId.current = null; setStreamingResponse(''); setCurrentRunId(null); setPending(false); setCollapsed(true) })
+            .finally(() => { resumingRunId.current = null; setStreamingResponse(''); setCurrentRunId(null); setQueuedFollowUp(null); setInterventionUsed(false); setPending(false); setCollapsed(true) })
         }
       } else { setStreamingResponse(''); setCurrentRunId(null); if (payload.runStatus === 'WAITING_FOR_USER') setCollapsed(false); else setCollapsed(true) }
     } catch { /* replay is best-effort */ }
@@ -132,11 +145,11 @@ export function ConversationApp() {
     try { const list = await api<Conversation[]>('/conversations'); setConversations(list); if (list[0]) await open(list[0]); else await createConversation() } catch (error) { setNotice(friendlyError(error)) }
   }
   async function createConversation() {
-    try { const created = await api<Conversation>('/conversations', { method: 'POST' }); setConversations(previous => [created, ...previous]); setCurrent(created); setMessages([]); setProgress([]); setPlan(null); setPlanHistory([]); setStreamingResponse(''); setCurrentRunId(null); setNotice(''); setMobileSidebarOpen(false); await refreshMemory(created.id) } catch (error) { setNotice(friendlyError(error)) }
+    try { const created = await api<Conversation>('/conversations', { method: 'POST' }); setConversations(previous => [created, ...previous]); setCurrent(created); setMessages([]); setProgress([]); setPlan(null); setPlanHistory([]); setStreamingResponse(''); setCurrentRunId(null); setQueuedFollowUp(null); setInterventionUsed(false); setNotice(''); setMobileSidebarOpen(false); await refreshMemory(created.id) } catch (error) { setNotice(friendlyError(error)) }
   }
   async function open(conversation: Conversation) {
     if (pending || candidateRun) return
-    try { setProgress([]); setPlan(null); setPlanHistory([]); setStreamingResponse(''); await Promise.all([refreshMessages(conversation.id), refreshMemory(conversation.id)]); setCurrent(conversation); setNotice(''); setMobileSidebarOpen(false); setConversationMenuId(null) } catch (error) { setNotice(friendlyError(error)) }
+    try { setProgress([]); setPlan(null); setPlanHistory([]); setStreamingResponse(''); setQueuedFollowUp(null); setInterventionUsed(false); await Promise.all([refreshMessages(conversation.id), refreshMemory(conversation.id)]); setCurrent(conversation); setNotice(''); setMobileSidebarOpen(false); setConversationMenuId(null) } catch (error) { setNotice(friendlyError(error)) }
   }
   async function renameConversation(conversation: Conversation) {
     const title = renameDraft.trim()
@@ -174,28 +187,53 @@ export function ConversationApp() {
   async function send(event: FormEvent) {
     event.preventDefault(); await sendContent(draft.trim())
   }
-  async function steerCurrentRun(content: string) {
-    if (!currentRunId) return
-    const clientId = crypto.randomUUID()
-    const optimistic: Message = { id: clientId, role: 'USER', type: 'USER_TEXT', content, status: 'COMPLETED', sequenceNumber: Date.now(), createdAt: new Date().toISOString() }
-    setMessages(previous => [...previous, optimistic]); setDraft(''); setCollapsed(false); setNotice('')
+  async function queueNextMessage(content: string) {
+    if (!currentRunId || queuedFollowUp || interventionUsed) return
+    const clientId = crypto.randomUUID(); setNotice('')
     try {
-      await api(`/agent-runs/${currentRunId}/interventions`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': clientId }, body: JSON.stringify({ content }) })
+      const queued = await api<RunFollowUp>(`/agent-runs/${currentRunId}/next-message`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': clientId }, body: JSON.stringify({ content }) })
+      setQueuedFollowUp(queued); setDraft('')
     } catch (error) {
-      setMessages(previous => previous.filter(item => item.id !== clientId)); setDraft(content); setNotice(friendlyError(error))
+      setDraft(content); setNotice(friendlyError(error))
+    }
+  }
+
+  async function interveneQueuedMessage() {
+    if (!currentRunId || !queuedFollowUp || queuedFollowUp.status !== 'WAITING') return
+    const optimistic: Message = { id: queuedFollowUp.clientMessageId, role: 'USER', type: 'USER_TEXT', content: queuedFollowUp.content, status: 'COMPLETED', sequenceNumber: Date.now(), createdAt: queuedFollowUp.createdAt }
+    setNotice('')
+    try {
+      await api(`/agent-runs/${currentRunId}/next-message:intervene`, { method: 'POST' })
+      setMessages(previous => previous.some(item => item.id === optimistic.id) ? previous : [...previous, optimistic])
+      setQueuedFollowUp(null); setInterventionUsed(true); setCollapsed(false)
+    } catch (error) { setNotice(friendlyError(error)) }
+  }
+
+  async function followConversationRunChain(initialRunId: string, initialCursor = 0, conversationId = current?.id) {
+    let runId: string | null = initialRunId
+    let cursor = initialCursor
+    while (runId) {
+      setCurrentRunId(runId)
+      await followAgentRun(runId, { onProgress: item => setProgress(previous => [...previous, item]), onPlan: recordPlan, onResponseStarted: () => setStreamingResponse(''), onResponseDelta: (_delta, accumulated) => setStreamingResponse(accumulated) }, 15 * 60_000, cursor)
+      const loaded = conversationId ? await api<Message[]>(`/conversations/${conversationId}/messages`) : []
+      if (loaded.length) setMessages(loaded)
+      const followUp = await runFollowUp(runId)
+      if (followUp?.status === 'DISPATCHED' && followUp.nextRunId) {
+        runId = followUp.nextRunId; cursor = 0; setQueuedFollowUp(null); setInterventionUsed(false); setProgress([]); setPlan(null); setPlanHistory([]); setStreamingResponse(''); setCollapsed(false)
+      } else runId = null
     }
   }
   async function sendContent(content: string) {
     if (!content || !current || candidateRun) return
-    if (pending) { if (currentRunId) await steerCurrentRun(content); return }
+    if (pending) { await queueNextMessage(content); return }
     const clientId = crypto.randomUUID(); const optimistic: Message = { id: clientId, role: 'USER', type: 'USER_TEXT', content, status: 'COMPLETED', sequenceNumber: Date.now(), createdAt: new Date().toISOString() }
     setMessages(previous => [...previous, optimistic]); setDraft(''); setPending(true); setProgress([]); setPlan(null); setPlanHistory([]); setStreamingResponse(''); setCollapsed(false); setNotice('')
     try {
       const queued = await enqueueAgentRun(`/conversations/${current.id}/messages`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': clientId }, body: JSON.stringify({ content }) })
       setCurrentRunId(queued.runId)
-      await followAgentRun(queued.runId, { onProgress: item => setProgress(previous => [...previous, item]), onPlan: recordPlan, onResponseStarted: () => setStreamingResponse(''), onResponseDelta: (_delta, accumulated) => setStreamingResponse(accumulated) })
+      await followConversationRunChain(queued.runId)
       await Promise.all([refreshMessages(), refreshMemory()]); const refreshed = await api<Conversation[]>('/conversations'); setConversations(refreshed); setCurrent(refreshed.find(item => item.id === current.id) ?? current)
-    } catch (error) { setMessages(previous => previous.filter(item => item.id !== clientId)); setDraft(content); setNotice(friendlyError(error)) } finally { setStreamingResponse(''); setCurrentRunId(null); setPending(false); setCollapsed(true) }
+    } catch (error) { setMessages(previous => previous.filter(item => item.id !== clientId)); setDraft(content); setNotice(friendlyError(error)) } finally { setStreamingResponse(''); setCurrentRunId(null); setQueuedFollowUp(null); setInterventionUsed(false); setPending(false); setCollapsed(true) }
   }
   async function compressConversationMemory() {
     if (!current || runActive || compressingMemory || !memory?.manualCompressionAvailable) return
@@ -234,6 +272,8 @@ export function ConversationApp() {
   const visibleConversations = useMemo(() => conversations.filter(item => (showArchived ? item.status === 'ARCHIVED' : item.status === 'ACTIVE') && item.title.toLocaleLowerCase().includes(conversationSearch.trim().toLocaleLowerCase())), [conversations, showArchived, conversationSearch])
   const runActive = pending || Boolean(candidateRun)
   const hasRunState = runActive || Boolean(plan) || progress.length > 0
+  const composerLocked = !current || Boolean(candidateRun) || (runActive && (!currentRunId || Boolean(queuedFollowUp) || interventionUsed))
+  const composerAction = composerPrimaryAction(runActive, Boolean(draft.trim()), Boolean(currentRunId))
   useEffect(() => {
     if (runActive && !wasRunActive.current) { runStartedAt.current = Date.now(); setRunElapsedMs(0) }
     wasRunActive.current = runActive
@@ -272,10 +312,10 @@ export function ConversationApp() {
         })}
         {candidateRun && <CandidateGenerationCard size={candidateRun.size} preferenceText={candidateRun.preferenceText} onProgress={(item) => setProgress(previous => [...previous, item])} onPlan={recordPlan} onRunId={setCurrentRunId} onCompleted={async payload => { await persistCard('CANDIDATE_POOL_CARD', 'CANDIDATE_POOL', payload); setCandidateRun(null); setCollapsed(true) }} onFailed={message => { setNotice(message); setCandidateRun(null); setCollapsed(true) }} />}
         {streamingResponse && <article className="conversation-message agent streaming-response"><span className="message-agent-mark"><BrandMark /></span><MessageBody content={streamingResponse} /><i className="streaming-response-caret" aria-hidden="true" /></article>}
-        {hasRunState && <AgentActivity progress={progress} collapsed={collapsed} active={runActive} elapsedMs={runElapsedMs} canStop={Boolean(currentRunId)} canRegenerate={messages.some(message => message.role === 'USER' && message.type === 'USER_TEXT')} onToggle={() => setCollapsed(value => !value)} onStop={() => void stopCurrentRun()} onRegenerate={() => setRegenerationOpen(value => !value)} />}
+        {hasRunState && <AgentActivity progress={progress} collapsed={collapsed} active={runActive} elapsedMs={runElapsedMs} canStop={false} canRegenerate={messages.some(message => message.role === 'USER' && message.type === 'USER_TEXT')} onToggle={() => setCollapsed(value => !value)} onStop={() => void stopCurrentRun()} onRegenerate={() => setRegenerationOpen(value => !value)} />}
         {regenerationOpen && !runActive && <section className="regeneration-panel"><strong>重新生成这轮回答</strong><p>可直接重试，也可以附加一个调整方向。</p><div>{['更冷门一些', '减少相同艺人', '换一批歌曲'].map(item => <button type="button" key={item} onClick={() => setRegenerationInstruction(item)}>{item}</button>)}</div><textarea value={regenerationInstruction} onChange={event => setRegenerationInstruction(event.target.value)} placeholder="例如：更冷门一些，减少相同艺人" /><footer><button type="button" onClick={() => setRegenerationOpen(false)}>取消</button><button type="button" className="primary" onClick={() => regenerateLastAnswer(regenerationInstruction)}>重新生成</button></footer></section>}
       </section>
-      <form className="conversation-composer" onSubmit={event => void send(event)}><div className="composer-frame"><textarea value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder={pending && currentRunId ? '继续补充信息，或调整当前方向……' : '和 IndieSoundQuest 聊聊音乐……'} maxLength={2000} disabled={!current || Boolean(candidateRun) || (runActive && !currentRunId)} /><div className="composer-toolbar"><div className="composer-memory"><button className="memory-compress-button" type="button" aria-label="整理较早的对话" title={memory?.manualCompressionAvailable ? '整理较早的对话' : '目前无需整理'} disabled={!memory?.manualCompressionAvailable || runActive || compressingMemory} onClick={() => void compressConversationMemory()}>{compressingMemory ? <span className="memory-spinner" /> : <MemoryIcon />}</button>{memory && <div className="memory-meter" title="当前对话的记忆占用；较长时会自动整理较早内容" role="progressbar" aria-label="对话记忆占用" aria-valuemin={0} aria-valuemax={100} aria-valuenow={memory.percent}><span><i style={{ width: `${memory.percent}%` }} /></span></div>}</div><button className="composer-send" type="submit" aria-label="发送消息" title="发送" disabled={!draft.trim() || !current || Boolean(candidateRun) || (runActive && !currentRunId)}>{pending && !currentRunId ? <span className="composer-spinner" /> : <SendIcon />}</button></div></div><small>{pending && currentRunId ? '运行中可以继续补充或调整方向。' : memory?.autoCompressionReady ? '稍后会自动整理较早的对话。' : '请核对重要的音乐资料与链接。'}</small></form>
+      <form className="conversation-composer" onSubmit={event => void send(event)}><div className="composer-frame"><textarea value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder={queuedFollowUp ? '已有一条消息等待发送' : interventionUsed ? '已调整本轮方向，请等待这一轮完成' : pending && currentRunId ? '输入下一条消息……' : '和 IndieSoundQuest 聊聊音乐……'} maxLength={2000} disabled={composerLocked} />{queuedFollowUp && <div className="composer-follow-up"><span><small>下一条消息</small><strong>{queuedFollowUp.content}</strong></span><button type="button" onClick={() => void interveneQueuedMessage()}>立即介入本轮</button></div>}<div className="composer-toolbar"><div className="composer-memory"><button className="memory-compress-button" type="button" aria-label="整理较早的对话" title={memory?.manualCompressionAvailable ? '整理较早的对话' : '目前无需整理'} disabled={!memory?.manualCompressionAvailable || runActive || compressingMemory} onClick={() => void compressConversationMemory()}>{compressingMemory ? <span className="memory-spinner" /> : <MemoryIcon />}</button>{memory && <div className="memory-meter" title="当前对话的记忆占用；较长时会自动整理较早内容" role="progressbar" aria-label="对话记忆占用" aria-valuemin={0} aria-valuemax={100} aria-valuenow={memory.percent}><span><i style={{ width: `${memory.percent}%` }} /></span></div>}</div><button className={`composer-send ${composerAction === 'stop' ? 'stop' : ''}`} type={composerAction === 'stop' ? 'button' : 'submit'} onClick={composerAction === 'stop' ? () => void stopCurrentRun() : undefined} aria-label={composerAction === 'stop' ? '停止生成' : '发送消息'} title={composerAction === 'stop' ? '停止生成' : '发送'} disabled={composerAction === 'disabled' || (composerAction === 'send' && composerLocked)}>{composerAction === 'stop' ? <StopIcon /> : pending && !currentRunId ? <span className="composer-spinner" /> : <SendIcon />}</button></div></div><small>{queuedFollowUp ? '本轮结束后会自动发送；需要改变当前结果时再选择立即介入。' : interventionUsed ? '本轮已经调整过一次，完成后可以继续对话。' : pending && currentRunId ? '直接发送会排到下一轮。' : memory?.autoCompressionReady ? '稍后会自动整理较早的对话。' : '请核对重要的音乐资料与链接。'}</small></form>
     </section>
     <aside className="conversation-agent-panel"><AgentPlanPanel plans={planHistory.length ? planHistory : (plan ? [plan] : [])} active={runActive} latest={progress[progress.length - 1]} /></aside>
   </main>
@@ -309,6 +349,12 @@ export function friendlyRuntimeCopy(value: string) {
     .trim()
 }
 
+export function composerPrimaryAction(runActive: boolean, hasText: boolean, canStop: boolean): 'send' | 'stop' | 'disabled' {
+  if (runActive && !hasText && canStop) return 'stop'
+  if (hasText) return 'send'
+  return 'disabled'
+}
+
 function formatElapsed(value: number) { const seconds = Math.max(0, Math.floor(value / 1000)); return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` }
 function formatMessageTime(value: string) { const date = new Date(value); return Number.isNaN(date.getTime()) ? '' : date.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) }
 function TimedMessage({ createdAt, children }: { createdAt: string; children: ReactNode }) { const label = formatMessageTime(createdAt); return <div className="conversation-message-shell">{label && <time dateTime={createdAt}>{label}</time>}{children}</div> }
@@ -320,6 +366,7 @@ function PlusIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d
 function MoreIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></svg> }
 function MenuIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg> }
 function SendIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4" /></svg> }
+function StopIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="6" y="6" width="8" height="8" rx="1.5" /></svg> }
 function ReportIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 3.5h6l3 3V16.5H6zM12 3.5v3h3M8.5 10h4M8.5 13h4" /></svg> }
 function MemoryIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 6.5C5 5.1 7.2 4 10 4s5 1.1 5 2.5S12.8 9 10 9 5 7.9 5 6.5Zm0 0v3C5 10.9 7.2 12 10 12s5-1.1 5-2.5v-3M5 9.5v3C5 13.9 7.2 15 10 15s5-1.1 5-2.5v-3" /></svg> }
 function MusicCover({ url, title }: { url?: string; title?: string }) { const [failed, setFailed] = useState(false); return url && !failed ? <img src={url} alt="" loading="lazy" onError={() => setFailed(true)} /> : <span className="music-cover-placeholder" aria-hidden="true">{(title || 'ISQ').slice(0, 2)}</span> }

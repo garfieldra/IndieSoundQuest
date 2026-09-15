@@ -422,11 +422,28 @@
 }
 
 .conversation-composer textarea::placeholder { color: #aaa69e; }
+.composer-follow-up {
+  margin: 1px 0 9px;
+  padding: 9px 10px;
+  border: 1px solid #dedad2;
+  border-radius: 11px;
+  background: #f3f1ec;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.composer-follow-up > span { min-width: 0; display: grid; gap: 2px; }
+.composer-follow-up small { color: #8b857d; font-size: .64rem; }
+.composer-follow-up strong { overflow: hidden; color: #48443e; font-size: .76rem; font-weight: 520; text-overflow: ellipsis; white-space: nowrap; }
+.composer-follow-up button { width: auto; height: 28px; padding: 0 9px; border: 1px solid #cfc9bf; border-radius: 8px; background: #faf9f6; color: #71463d; font-size: .68rem; white-space: nowrap; cursor: pointer; }
+.composer-follow-up button:hover { border-color: #a98278; background: #fff; }
 .composer-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .composer-memory { min-width: 0; display: flex; align-items: center; gap: 9px; }
 .composer-key-hint { overflow: hidden; color: #a09c95; font-size: .66rem; text-overflow: ellipsis; white-space: nowrap; }
 .composer-toolbar button { width: 32px; height: 32px; flex: none; padding: 0; border: 0; border-radius: 10px; display: grid; place-items: center; }
 .composer-toolbar .composer-send { background: #2d2b28; color: #fff; }
+.composer-toolbar .composer-send.stop svg { fill: currentColor; stroke: none; }
 .composer-toolbar .composer-send:disabled { background: #dedbd5; color: #a6a29a; cursor: default; }
 .composer-toolbar .memory-compress-button { width: 28px; height: 28px; border: 1px solid #dedbd4; border-radius: 9px; background: transparent; color: #6f6a62; cursor: pointer; }
 .composer-toolbar .memory-compress-button:hover:not(:disabled) { border-color: #bdb8af; background: #f0eee9; color: #302e2a; }

@@ -2,6 +2,7 @@ package com.indiesoundquest.agent.web;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.indiesoundquest.agent.application.AgentRunApplicationService;
+import com.indiesoundquest.agent.application.AgentRunFollowUpApplicationService;
 import com.indiesoundquest.agent.domain.*;
 import com.indiesoundquest.conversation.application.ConversationAgentGateway;
 import com.indiesoundquest.conversation.application.ConversationApplicationService;
@@ -26,6 +27,7 @@ import org.slf4j.LoggerFactory;
 public class AgentRunController {
   private static final Logger log = LoggerFactory.getLogger(AgentRunController.class);
   private final AgentRunApplicationService agentRuns;
+  private final AgentRunFollowUpApplicationService followUps;
   private final ConversationApplicationService conversations;
   private final ConversationAgentGateway agent;
   private final RedisRateLimitService rateLimit;
@@ -33,11 +35,13 @@ public class AgentRunController {
 
   public AgentRunController(
       AgentRunApplicationService agentRuns,
+      AgentRunFollowUpApplicationService followUps,
       ConversationApplicationService conversations,
       ConversationAgentGateway agent,
       RedisRateLimitService rateLimit,
       ObjectMapper json) {
     this.agentRuns = agentRuns;
+    this.followUps = followUps;
     this.conversations = conversations;
     this.agent = agent;
     this.rateLimit = rateLimit;
@@ -65,8 +69,35 @@ public class AgentRunController {
     return ResponseEntity.accepted().body(InterventionView.of(intervention));
   }
 
+  @PostMapping("/{id}/next-message")
+  ResponseEntity<FollowUpView> queueNextMessage(@PathVariable UUID id,@RequestHeader("Idempotency-Key") UUID key,@Valid @RequestBody InterventionBody body,HttpServletRequest request){
+    var guest=((GuestSession)request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();rateLimit.assertAgentRunAnswerAllowed(guest);
+    return ResponseEntity.accepted().body(FollowUpView.of(followUps.queue(id,guest,key,body.content().trim())));
+  }
+
+  @GetMapping("/{id}/next-message")
+  ResponseEntity<FollowUpView> nextMessage(@PathVariable UUID id,HttpServletRequest request){
+    var guest=((GuestSession)request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();
+    return followUps.owned(id,guest).map(value->ResponseEntity.ok(FollowUpView.of(value))).orElseGet(()->ResponseEntity.noContent().build());
+  }
+
+  @PostMapping("/{id}/next-message:intervene")
+  @Transactional
+  ResponseEntity<InterventionView> interveneWithQueuedMessage(@PathVariable UUID id,HttpServletRequest request){
+    var guest=((GuestSession)request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();rateLimit.assertAgentRunAnswerAllowed(guest);
+    var existing=followUps.owned(id,guest).orElseThrow(NoSuchElementException::new);
+    if(existing.getStatus()==AgentRunFollowUpStatus.INTERVENED){
+      return ResponseEntity.ok(InterventionView.of(agentRuns.intervention(id,existing.getClientMessageId()).orElseThrow()));
+    }
+    var queued=followUps.waitingForIntervention(id,guest);
+    var intervention=agentRuns.submitIntervention(id,guest,queued.getClientMessageId(),queued.getContent());
+    conversations.appendRunIntervention(queued.getConversationId(),guest,queued.getClientMessageId(),queued.getContent());
+    followUps.markIntervened(queued);
+    return ResponseEntity.accepted().body(InterventionView.of(intervention));
+  }
+
   @PostMapping("/{id}/cancel")
-  ResponseEntity<Void> cancel(@PathVariable UUID id,HttpServletRequest request){var guest=((GuestSession)request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();var run=agentRuns.cancel(id,guest);if(run.getConversationId()!=null)conversations.cancelRun(run.getConversationId(),guest,id);return ResponseEntity.noContent().build();}
+  ResponseEntity<Void> cancel(@PathVariable UUID id,HttpServletRequest request){var guest=((GuestSession)request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();var run=agentRuns.cancel(id,guest);if(run.getConversationId()!=null)conversations.cancelRun(run.getConversationId(),guest,id);followUps.dispatch(id);return ResponseEntity.noContent().build();}
 
   @PostMapping(value = "/{id}/answers", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
   StreamingResponseBody answers(@PathVariable UUID id, @RequestHeader("Idempotency-Key") UUID key, @Valid @RequestBody AnswersBody body, HttpServletRequest request) {
@@ -118,6 +149,7 @@ public class AgentRunController {
   record Selection(@NotBlank @Size(max = 120) String mention, @NotNull UUID mbid, @NotBlank @Size(max = 160) String name) {}
   record InterventionBody(@NotBlank @Size(max=2000) String content) {}
   record InterventionView(UUID id,long sequenceNumber,String status,java.time.Instant createdAt){static InterventionView of(AgentRunIntervention value){return new InterventionView(value.getId(),value.getSequenceNumber(),value.getStatus().name(),value.getCreatedAt());}}
+  record FollowUpView(UUID id,UUID clientMessageId,String content,String status,UUID nextRunId,java.time.Instant createdAt){static FollowUpView of(AgentRunFollowUp value){return new FollowUpView(value.getId(),value.getClientMessageId(),value.getContent(),value.getStatus().name(),value.getNextRunId(),value.getCreatedAt());}}
 
   record EventView(long sequenceNumber, String type, String payloadJson, java.time.Instant createdAt) {
     static EventView of(AgentRunEvent event) {
@@ -126,4 +158,7 @@ public class AgentRunController {
   }
 
   record EventsView(String runStatus, List<EventView> events) {}
+
+  @ExceptionHandler(IllegalStateException.class)
+  ResponseEntity<Map<String,String>> conflict(IllegalStateException error){return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("code",error.getMessage()==null?"AGENT_RUN_CONFLICT":error.getMessage()));}
 }

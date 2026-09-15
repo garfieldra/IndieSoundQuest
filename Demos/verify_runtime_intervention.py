@@ -15,8 +15,7 @@ INITIAL_PROMPT = (
     "请深入分析张悬《宝贝》的歌词、编曲和创作背景，"
     "查阅公开资料后给出有证据边界的回答。"
 )
-FIRST_DIRECTION = "先减少歌词主题篇幅，把重心移到创作背景。"
-LATEST_DIRECTION = "最新调整：重点核对制作人与录音版本；不要给歌曲推荐，最终回答请明确回应这项调整。"
+DIRECTION = "重点核对制作人与录音版本；不要给歌曲推荐，最终回答请明确回应这项调整。"
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "EXPIRED", "WAITING_FOR_USER"}
 
 
@@ -24,9 +23,9 @@ def _snapshot(client: httpx.Client, run_id: str) -> dict:
     return client.get(f"/api/v1/agent-runs/{run_id}/events").raise_for_status().json()
 
 
-def _submit(client: httpx.Client, run_id: str, key: str, content: str) -> dict:
+def _queue(client: httpx.Client, run_id: str, key: str, content: str) -> dict:
     return client.post(
-        f"/api/v1/agent-runs/{run_id}/interventions",
+        f"/api/v1/agent-runs/{run_id}/next-message",
         headers={"Idempotency-Key": key},
         json={"content": content},
     ).raise_for_status().json()
@@ -55,14 +54,22 @@ def main() -> None:
         else:
             raise TimeoutError("Agent Run was not claimed in time")
 
-        first_key = str(uuid4())
-        first = _submit(client, run_id, first_key, FIRST_DIRECTION)
-        replay = _submit(client, run_id, first_key, FIRST_DIRECTION)
-        if first["id"] != replay["id"] or first["sequenceNumber"] != replay["sequenceNumber"]:
-            raise AssertionError("Intervention idempotency replay created a different record")
-        second = _submit(client, run_id, str(uuid4()), LATEST_DIRECTION)
-        if int(second["sequenceNumber"]) <= int(first["sequenceNumber"]):
-            raise AssertionError("Intervention sequence did not increase")
+        queued_key = str(uuid4())
+        queued = _queue(client, run_id, queued_key, DIRECTION)
+        replay = _queue(client, run_id, queued_key, DIRECTION)
+        if queued["id"] != replay["id"]:
+            raise AssertionError("Follow-up idempotency replay created a different record")
+        second = client.post(
+            f"/api/v1/agent-runs/{run_id}/next-message",
+            headers={"Idempotency-Key": str(uuid4())},
+            json={"content": "这条消息不应覆盖等待区。"},
+        )
+        if second.status_code != 409:
+            raise AssertionError(f"Run accepted a second waiting message: {second.status_code}")
+        intervention = client.post(f"/api/v1/agent-runs/{run_id}/next-message:intervene").raise_for_status().json()
+        replay_intervention = client.post(f"/api/v1/agent-runs/{run_id}/next-message:intervene").raise_for_status().json()
+        if intervention["id"] != replay_intervention["id"]:
+            raise AssertionError("Intervention conversion is not idempotent")
 
         deadline = time.monotonic() + 12 * 60
         while time.monotonic() < deadline:
@@ -85,14 +92,14 @@ def main() -> None:
         result_event = next(event for event in reversed(events) if event.get("type") == "RESULT")
         artifact = json.loads(result_event.get("payloadJson") or "{}")
         trace = artifact.get("traceSummary") or {}
-        if int(trace.get("appliedInterventionSequence") or 0) != int(second["sequenceNumber"]):
-            raise AssertionError(f"Final trace did not acknowledge latest intervention: {trace}")
+        if int(trace.get("appliedInterventionSequence") or 0) != int(intervention["sequenceNumber"]):
+            raise AssertionError(f"Final trace did not acknowledge the intervention: {trace}")
 
         messages = client.get(
             f"/api/v1/conversations/{conversation_id}/messages"
         ).raise_for_status().json()
         contents = [item.get("content") for item in messages if item.get("type") == "USER_TEXT"]
-        if contents.count(FIRST_DIRECTION) != 1 or contents.count(LATEST_DIRECTION) != 1:
+        if contents.count(DIRECTION) != 1:
             raise AssertionError(f"Durable intervention messages are missing or duplicated: {contents}")
         assistant_text = next(
             (item.get("content") or "" for item in reversed(messages) if item.get("type") == "AGENT_TEXT"),
@@ -109,8 +116,8 @@ def main() -> None:
 
         applied_event = next(event for event in events if event.get("type") == "INTERVENTION_APPLIED")
         applied_sequence = int(json.loads(applied_event.get("payloadJson") or "{}").get("interventionSequence") or 0)
-        if applied_sequence < int(second["sequenceNumber"]):
-            raise AssertionError("Worker applied only an older intervention")
+        if applied_sequence != int(intervention["sequenceNumber"]):
+            raise AssertionError("Worker did not apply the converted intervention")
 
         late = client.post(
             f"/api/v1/agent-runs/{run_id}/interventions",
@@ -124,7 +131,8 @@ def main() -> None:
             "status": snapshot["runStatus"],
             "conversationId": conversation_id,
             "runId": run_id,
-            "interventionSequences": [first["sequenceNumber"], second["sequenceNumber"]],
+            "interventionSequence": intervention["sequenceNumber"],
+            "secondWaitingMessageStatus": second.status_code,
             "eventTypes": event_types,
             "planRevisionCount": event_types.count("PLAN_UPDATED"),
             "lateInterventionStatus": late.status_code,

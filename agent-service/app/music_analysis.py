@@ -58,7 +58,7 @@ class MusicAnalysisPlan(BaseModel):
 
 class MusicAnalysisDraft(BaseModel):
     core_judgment: str = Field(min_length=24, max_length=600)
-    answer: str = Field(min_length=200, max_length=5000)
+    answer: str = Field(min_length=200)
     claims: list[EvidenceClaim] = Field(default_factory=list, min_length=1, max_length=10)
     uncertainties: list[str] = Field(default_factory=list, max_length=6)
     related_works: list[str] = Field(default_factory=list, max_length=3)
@@ -74,7 +74,7 @@ class EvidenceClaimReview(BaseModel):
 
 
 class MusicAnalysisReview(BaseModel):
-    revised_answer: str = Field(min_length=200, max_length=5000)
+    revised_answer: str = Field(min_length=200)
     revised_core_judgment: str | None = Field(default=None, min_length=24, max_length=600)
     items: list[EvidenceClaimReview] = Field(default_factory=list, min_length=1, max_length=10)
     conflicts: list[str] = Field(default_factory=list, max_length=6)
@@ -181,7 +181,18 @@ def deep_analysis_intent(request: ConversationAgentRequest) -> bool:
         r"(?:歌曲|作品|版本|专辑|时期).{0,60}(?:比较|对比|区别)",
         text, re.I,
     ))
-    if direct and not (broad_preference_request and not concrete_music_subject):
+    # Natural descriptive questions such as “《拥抱》是一首什么样的歌” ask
+    # for interpretation, not merely a catalog fact.  They must load the
+    # analysis Skill instead of spending research budget and then falling
+    # through to the deliberately lighter ordinary-response path.
+    descriptive = concrete_music_subject and bool(re.search(
+        r"(?:是|算|属于).{0,8}(?:一首|一种|怎样|什么样)|"
+        r"(?:是一首)?什么样(?:的)?(?:歌|歌曲|作品)|"
+        r"(?:这首歌|这首曲|这张专辑|《[^》]+》).{0,16}(?:怎么样|如何理解|怎么理解|讲了什么|在表达什么)|"
+        r"(?:介绍|讲讲|聊聊).{0,12}(?:这首歌|这首曲|这张专辑|《[^》]+》)",
+        text, re.I,
+    ))
+    if (direct or descriptive) and not (broad_preference_request and not concrete_music_subject):
         return True
     has_analysis_context = any(
         isinstance(card, dict) and card.get("cardType") == "MUSIC_ANALYSIS"

@@ -489,8 +489,8 @@ class ConversationReActRuntime:
             return "我会直接开始构建候选池：先在线发现相关作品，再以 MusicBrainz 核验歌曲身份；候选池完成后仍由你确认才会开赛。"
         if self.model is None:
             return _fallback_answer(state)
-        sources = [{"title": item.get("sourceTitle"), "summary": item.get("summary"), "url": item.get("sourceUrl")} for item in state.get("web_sources", [])[:5]]
-        knowledge = state.get("knowledge", [])[:4]
+        sources = [{"title": item.get("sourceTitle"), "summary": item.get("summary"), "url": item.get("sourceUrl")} for item in state.get("web_sources", [])[:10]]
+        knowledge = state.get("knowledge", [])[:6]
         prompt = f"""你是 IndieSoundQuest 的音乐探索 Agent。用中文自然、克制地回答，不输出思维链。
 不要虚构歌曲、艺人、歌词、链接或工具结果。外部资料为空时，不得声称已经查询。
 用户问题：{request.user_message}
@@ -499,10 +499,10 @@ class ConversationReActRuntime:
 近期推荐反馈：{request.recent_feedback}
 公开资料：{json.dumps(sources, ensure_ascii=False)}
 本地补充主题卡：{json.dumps(knowledge, ensure_ascii=False)}
-回答控制在 500 字内。普通对话只回答用户当前问题并给出自然的音乐探索方向；除非用户本轮明确要求世界杯、淘汰赛或两两对决，否则不得主动提及比赛、开赛或候选池。"""
+回答篇幅由用户问题的复杂度、已有证据和本轮研究投入共同决定，不设置统一字数上限。简单事实可以简洁；已经进行多轮检索、核验或精读时，必须把真正影响结论的证据、推理依据和边界充分写入正文，不能把长时间研究压缩成几句泛泛总结。普通对话只回答用户当前问题并给出自然的音乐探索方向；除非用户本轮明确要求世界杯、淘汰赛或两两对决，否则不得主动提及比赛、开赛或候选池。"""
         try:
             response = await self.model.ainvoke(prompt)
-            return str(response.content).strip()[:2000]
+            return str(response.content).strip()
         except Exception:
             return _fallback_answer(state)
 
@@ -572,7 +572,8 @@ class ConversationReActRuntime:
 本地主题卡（仅作补充，不得凌驾于在线资料）：{json.dumps(knowledge, ensure_ascii=False)}
 
 要求：
-- answer 约 900–1800 个中文字符，直接回答问题，自然组织为核心判断和 3–5 个有实质内容的段落；
+- answer 直接回答问题，篇幅由问题复杂度、所选分析维度、证据质量与用户要求动态决定，不设置统一字数上限；
+- 已经进行多轮检索、目录核验或来源精读时，必须把真正影响结论的研究成果转化为充分正文；每个与核心问题直接相关且有证据的 selectedDimension 都应得到实质展开，不得只用几个形容词概括；
 - 至少形成一条“可观察现象 → 听觉或文本效果 → 情绪/叙事作用 → 与问题的关系”的完整论证链；
 - 明确区分 FACT、OBSERVATION、INTERPRETATION、LISTENER_INFERENCE；
 - FACT 必须引用给定 ref；资料只支持背景而不支持声音细节时，要明确这是解释或听者推断；
@@ -584,7 +585,7 @@ class ConversationReActRuntime:
             try:
                 draft = await self._invoke_validated(MusicAnalysisDraft, prompt)
                 claims = sanitize_claims(draft.claims, allowed_refs)
-                text = draft.answer.strip()[:5000]
+                text = draft.answer.strip()
                 core_judgment = draft.core_judgment
                 uncertainties = draft.uncertainties
                 related_works = draft.related_works
@@ -605,15 +606,37 @@ Claim（claim_index 是数组下标）：{json.dumps([item.model_dump() for item
 - 只有部分支持时 verdict=partial，并用 revised_statement 缩小表述；
 - 完全不支持时 verdict=unsupported，revised_answer 必须删除该事实或明确改为无法核验；
 - 不得引入原 Claim 和资料之外的新事实；
-- revised_answer 保留原回答的自然结构和分析深度，只修复证据越界。
+- revised_answer 保留原回答的自然结构、分析维度和信息密度，只修复证据越界；不得借审校之名把长篇分析压成摘要。如果确需删除不受支持的事实，应以证据支持的解释或明确边界替代，而不是删除其余有依据的分析。
 返回 MusicAnalysisReview。"""
                     try:
                         review = await self._invoke_validated(MusicAnalysisReview, review_prompt)
+                        revised_text = review.revised_answer.strip()
+                        # A semantic review may narrow unsupported facts, but
+                        # it must not silently turn a researched analysis into
+                        # a short summary. If the provider over-compresses the
+                        # revision, retry once with an explicit depth-preserving
+                        # contract before accepting it.
+                        if _review_overcompressed(text, revised_text):
+                            retry_prompt = review_prompt + f"""
+
+上一版审校正文只有初稿信息量的很小一部分，属于过度压缩。请重新审校：
+- 保留所有有证据或已明确标为解释/听者推断的实质段落；
+- 只删除或收窄确实无法支持的事实；
+- revised_answer 不得退化为摘要，且应维持与初稿相当的分析深度；
+- 不设置统一字数上限。
+初稿字符数：{len(text)}；上一版审校字符数：{len(revised_text)}。
+"""
+                            review = await self._invoke_validated(MusicAnalysisReview, retry_prompt)
+                            revised_text = review.revised_answer.strip()
                         claims, review_meta = apply_claim_reviews(
                             claims, review.items, allowed_refs, source_quality,
                         )
                         review_meta["summary"] = review.review_summary
-                        text = review.revised_answer.strip()[:5000]
+                        review_meta["overcompressionDetected"] = _review_overcompressed(text, revised_text)
+                        # Evidence safety wins if the provider ignores the
+                        # depth-preservation retry, while the trace makes the
+                        # degraded result observable instead of hiding it.
+                        text = revised_text
                         core_judgment = review.revised_core_judgment or core_judgment
                         source_conflicts = review.conflicts
                         uncertainties = list(dict.fromkeys([*uncertainties, *review.conflicts]))[:8]
@@ -1937,6 +1960,13 @@ def _fallback_answer(state: ConversationState) -> str:
             return "我先从公开音乐资料里找到了几条可继续核对的线索：" + "；".join(titles) + "。相关页面已经整理在下方卡片中，你可以指定其中一条继续深挖。"
         return "我已经找到一些公开音乐资料，并把可核对的来源整理在下方。你可以继续指定想深入的艺人、歌曲或声音方向。"
     return "我已经结合这轮对话整理了你的音乐方向。你可以继续追问喜欢的作品、相近艺人、风格脉络或下一步试听方向。"
+
+
+def _review_overcompressed(draft: str, revised: str) -> bool:
+    """Detect destructive review shrinkage without imposing an answer ceiling."""
+    draft_size = len(draft.strip())
+    revised_size = len(revised.strip())
+    return draft_size >= 600 and revised_size < max(320, int(draft_size * 0.65))
 
 
 def _public_source_card(sources: list[dict]) -> ConversationCardIntent | None:

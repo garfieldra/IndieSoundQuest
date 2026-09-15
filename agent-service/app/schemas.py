@@ -65,10 +65,10 @@ class ConversationCardIntent(ApiModel):
 
 
 class ConversationAgentResult(ApiModel):
-    # Deep music analysis may need several evidence-backed paragraphs.  The
-    # ordinary response prompt remains concise; this is a wire-contract ceiling,
-    # not a requirement to make every answer long.
-    text: str = Field(min_length=1, max_length=6000)
+    # Answer depth is decided from the user's question and available evidence.
+    # Do not put a product-level character ceiling on the transport contract:
+    # provider/context safety budgets belong at the model/runtime boundary.
+    text: str = Field(min_length=1)
     card_intent: ConversationCardIntent | None = None
     action: str = Field(min_length=1, max_length=40)
     trace_summary: dict = Field(default_factory=dict)

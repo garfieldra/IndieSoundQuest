@@ -16,6 +16,7 @@ from app.conversation_graph import (
     _fallback_preference_profile,
     _next_analysis_query,
     _recommendation_search_queries,
+    _review_overcompressed,
     _select_evidence_backed_recording,
     _unique_artist_drafts,
     _unique_song_drafts,
@@ -627,6 +628,31 @@ def test_deep_analysis_selects_only_question_relevant_dimensions():
     assert "演唱表达" in workspace.selected_dimensions
     assert "编曲与音色" in workspace.selected_dimensions
     assert "节奏与律动" not in workspace.selected_dimensions
+
+
+def test_natural_descriptive_song_question_loads_deep_analysis_skill():
+    request = _analysis_request("五月天的《拥抱》是一首什么样的歌曲？")
+    assert deep_analysis_intent(request) is True
+
+
+def test_review_overcompression_guard_has_no_upper_answer_ceiling():
+    long_draft = "有证据的分析段落。" * 120
+    assert _review_overcompressed(long_draft, "被压缩成几句话。" * 12) is True
+    assert _review_overcompressed(long_draft, "保留分析深度。" * 110) is False
+
+
+@pytest.mark.asyncio
+async def test_ordinary_answer_is_not_cut_by_legacy_product_limit():
+    class LongAnswerModel:
+        async def ainvoke(self, prompt):
+            assert "500 字内" not in prompt
+            return SimpleNamespace(content="长回答正文。" * 1200)
+
+    runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge())
+    runtime.model = LongAnswerModel()
+    request = _analysis_request("请介绍一下这个音乐流派的发展。")
+    text = await runtime.answer({"request": request, "web_sources": [], "knowledge": []}, "respond")
+    assert len(text) > 6000
 
 
 def test_preference_report_request_does_not_load_deep_analysis_skill():
