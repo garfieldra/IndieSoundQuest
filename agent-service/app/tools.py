@@ -4,7 +4,7 @@ import ipaddress
 import re
 import socket
 import time
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from uuid import UUID
 import httpx
 from .research import ResearchPurpose, ResearchSource, deduplicate_research_sources
@@ -58,6 +58,27 @@ class MusicCatalogTool:
             )
             response.raise_for_status()
             return response.json()["items"]
+
+    async def research_musicbrainz(
+        self, query: str, entity_type: str = "recording", mbid: str | None = None,
+        artist_name: str | None = None, title: str | None = None,
+    ) -> list[dict]:
+        """Read credits, versions and relationships through the Java catalog boundary."""
+        payload = {
+            "query": query.strip()[:300],
+            "entityType": entity_type,
+            "mbid": (mbid or "").strip() or None,
+            "artistName": (artist_name or "").strip()[:180] or None,
+            "title": (title or "").strip()[:180] or None,
+        }
+        async with httpx.AsyncClient(timeout=35) as client:
+            response = await client.post(
+                f"{self.base_url}/internal/v1/music-catalog/musicbrainz/research",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            response.raise_for_status()
+            return list(response.json().get("items", []))
 
 
 class WebSearchTool:
@@ -145,34 +166,152 @@ class WebSearchTool:
         return _deduplicate_sources(results)
 
     async def enrich_public_sources(self, sources: list[dict], limit: int = 2) -> list[dict]:
-        """Fetch a small, safe public excerpt only when Tavily snippets are insufficient."""
+        """Fetch bounded public excerpts, validating every redirect against SSRF."""
         enriched: list[dict] = []
         for source in sources[:limit]:
             url = source.get("sourceUrl", "")
-            if not await _is_safe_public_url(url):
-                continue
             try:
                 async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
-                    async with client.stream("GET", url, headers={"User-Agent": "IndieSoundQuest/0.1 public-evidence-fetch"}) as response:
-                        content_type = response.headers.get("content-type", "")
-                        content_length = int(response.headers.get("content-length", "0") or 0)
-                        if response.status_code != 200 or "html" not in content_type.lower() or content_length > self.MAX_PAGE_BYTES:
-                            continue
-                        chunks, total = [], 0
-                        async for chunk in response.aiter_bytes():
-                            total += len(chunk)
-                            if total > self.MAX_PAGE_BYTES:
-                                chunks = []
+                    current_url = url
+                    chunks: list[bytes] = []
+                    content_type = ""
+                    for _ in range(4):
+                        if not await _is_safe_public_url(current_url):
+                            break
+                        async with client.stream(
+                            "GET", current_url,
+                            headers={"User-Agent": "Mozilla/5.0 (compatible; IndieSoundQuest/0.1; public evidence reader)"},
+                        ) as response:
+                            if response.status_code in {301, 302, 303, 307, 308} and response.headers.get("location"):
+                                current_url = urljoin(current_url, response.headers["location"])
+                                continue
+                            content_type = response.headers.get("content-type", "")
+                            content_length = int(response.headers.get("content-length", "0") or 0)
+                            if response.status_code != 200 or "html" not in content_type.lower() or content_length > self.MAX_PAGE_BYTES:
                                 break
-                            chunks.append(chunk)
+                            total = 0
+                            async for chunk in response.aiter_bytes():
+                                total += len(chunk)
+                                if total > self.MAX_PAGE_BYTES:
+                                    chunks = []
+                                    break
+                                chunks.append(chunk)
+                            break
                 if not chunks:
                     continue
-                excerpt = _html_to_excerpt(b"".join(chunks).decode("utf-8", errors="replace"), self.MAX_EXCERPT_CHARS)
+                excerpt = _html_to_excerpt(_decode_document(b"".join(chunks), content_type), self.MAX_EXCERPT_CHARS)
                 if len(excerpt) >= 80:
-                    enriched.append(source | {"pageExcerpt": excerpt})
+                    enriched.append(source | {"pageExcerpt": excerpt, "resolvedSourceUrl": current_url})
             except (httpx.HTTPError, ValueError):
                 continue
         return enriched
+
+
+class WikimediaResearchTool:
+    """Read-only artist/work context from Wikimedia's public APIs."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+
+    async def search(self, query: str, limit: int = 4) -> list[dict]:
+        if not self.enabled or len(query.strip()) < 2:
+            return []
+        languages = ["zh"]
+        if not _contains_cjk(query):
+            languages.append("en")
+        groups = await asyncio.gather(
+            *(self._search_wikipedia(query, language, limit) for language in languages),
+            self._search_wikidata(query, limit),
+            return_exceptions=True,
+        )
+        merged: list[dict] = []
+        for group in groups:
+            if isinstance(group, list):
+                merged.extend(group)
+        return _deduplicate_sources(merged)[: max(1, min(limit * 2, 8))]
+
+    async def _search_wikipedia(self, query: str, language: str, limit: int) -> list[dict]:
+        endpoint = f"https://{language}.wikipedia.org/w/api.php"
+        params = {
+            "action": "query", "format": "json", "formatversion": "2",
+            "generator": "search", "gsrsearch": query.strip()[:240],
+            "gsrlimit": max(1, min(limit, 5)), "prop": "extracts|info",
+            "exintro": "1", "explaintext": "1", "inprop": "url",
+        }
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.get(endpoint, params=params, headers={"User-Agent": _research_user_agent()})
+            response.raise_for_status()
+        pages = response.json().get("query", {}).get("pages", [])
+        return [{
+            "kind": "wikimedia_source", "sourceUrl": item.get("fullurl"),
+            "sourceTitle": item.get("title", ""),
+            "summary": str(item.get("extract") or "")[:1_800],
+            "queryPurpose": "music_context", "searchQuery": query,
+            "searchProvider": f"wikipedia-{language}", "evidenceKind": "ENCYCLOPEDIA_CONTEXT",
+        } for item in pages if item.get("fullurl") and item.get("title")]
+
+    async def _search_wikidata(self, query: str, limit: int) -> list[dict]:
+        params = {
+            "action": "wbsearchentities", "format": "json", "language": "zh", "uselang": "zh",
+            "type": "item", "limit": max(1, min(limit, 5)), "search": query.strip()[:240],
+        }
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.get(
+                "https://www.wikidata.org/w/api.php", params=params,
+                headers={"User-Agent": _research_user_agent()},
+            )
+            response.raise_for_status()
+        return [{
+            "kind": "wikidata_entity", "sourceUrl": item.get("concepturi"),
+            "sourceTitle": f"{item.get('label', '')} · Wikidata",
+            "summary": str(item.get("description") or item.get("match", {}).get("text") or "")[:1_200],
+            "queryPurpose": "entity_disambiguation", "searchQuery": query,
+            "searchProvider": "wikidata", "wikidataId": item.get("id"),
+            "evidenceKind": "STRUCTURED_ENTITY_CONTEXT",
+        } for item in response.json().get("search", []) if item.get("concepturi")]
+
+
+class LastFmResearchTool:
+    """Optional Last.fm discovery signals; never treated as canonical identity."""
+
+    API_URL = "https://ws.audioscrobbler.com/2.0/"
+
+    def __init__(self, api_key: str | None = None):
+        self.api_key = (api_key or "").strip()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key)
+
+    async def discover(
+        self, *, artist_name: str, track_title: str | None = None,
+        mode: str = "similar_artists", limit: int = 10,
+    ) -> list[dict]:
+        if not self.enabled or len(artist_name.strip()) < 1:
+            return []
+        method = {
+            "similar_artists": "artist.getSimilar",
+            "top_tracks": "artist.getTopTracks",
+            "artist_tags": "artist.getTopTags",
+            "similar_tracks": "track.getSimilar",
+            "track_tags": "track.getTopTags",
+        }.get(mode, "artist.getSimilar")
+        params: dict[str, str | int] = {
+            "method": method, "api_key": self.api_key, "format": "json",
+            "artist": artist_name.strip()[:180], "limit": max(1, min(limit, 20)),
+            "autocorrect": "1",
+        }
+        if method.startswith("track."):
+            if not track_title or len(track_title.strip()) < 1:
+                return []
+            params["track"] = track_title.strip()[:180]
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.get(self.API_URL, params=params, headers={"User-Agent": _research_user_agent()})
+            response.raise_for_status()
+        payload = response.json()
+        if payload.get("error"):
+            return []
+        return _lastfm_sources(payload, method, artist_name, track_title)
 
 
 class SpotifyCatalogTool:
@@ -295,6 +434,60 @@ class DomesticContentResearchTool:
         return [name for name, config in self.providers.items() if config["enabled"] and config["baseUrl"]]
 
 
+def _research_user_agent() -> str:
+    return "IndieSoundQuest/0.1 (https://github.com/garfieldra/IndieSoundQuest)"
+
+
+def _lastfm_sources(payload: dict, method: str, artist_name: str, track_title: str | None) -> list[dict]:
+    if method == "artist.getSimilar":
+        items = payload.get("similarartists", {}).get("artist", [])
+        kind = "similar_artist"
+    elif method == "artist.getTopTracks":
+        items = payload.get("toptracks", {}).get("track", [])
+        kind = "top_track"
+    elif method == "track.getSimilar":
+        items = payload.get("similartracks", {}).get("track", [])
+        kind = "similar_track"
+    else:
+        items = payload.get("toptags", {}).get("tag", [])
+        kind = "listener_tag"
+    sources: list[dict] = []
+    for item in items[:20]:
+        if not isinstance(item, dict):
+            continue
+        item_artist = item.get("artist")
+        if isinstance(item_artist, dict):
+            item_artist = item_artist.get("name")
+        name = str(item.get("name") or "").strip()
+        item_artist = str(item_artist or artist_name).strip()
+        url = str(item.get("url") or "").strip()
+        if not url.startswith(("https://www.last.fm/", "http://www.last.fm/")):
+            continue
+        match = item.get("match")
+        playcount = item.get("playcount")
+        count = item.get("count")
+        if match not in (None, ""):
+            detail = f"相似度 {match}"
+        elif playcount not in (None, ""):
+            detail = f"收听计数 {playcount}"
+        elif count not in (None, ""):
+            detail = f"标签计数 {count}"
+        else:
+            detail = "Last.fm 听众关系信号"
+        title = f"{name} · {item_artist}" if kind in {"top_track", "similar_track"} else name
+        sources.append({
+            "kind": "lastfm_discovery_source", "sourceUrl": url,
+            "sourceTitle": title, "summary": f"Last.fm {kind}：{title}；{detail}"[:1_200],
+            "queryPurpose": "music_discovery", "searchQuery": " · ".join(
+                value for value in [artist_name, track_title or ""] if value
+            ),
+            "searchProvider": "lastfm", "evidenceKind": "LISTENER_SIMILARITY_SIGNAL",
+            "discoveryType": kind, "title": name if kind in {"top_track", "similar_track"} else None,
+            "artistName": item_artist,
+        })
+    return _deduplicate_sources(sources)
+
+
 def _deduplicate_sources(sources: list[dict]) -> list[dict]:
     unique: dict[str, dict] = {}
     for source in sources:
@@ -324,6 +517,23 @@ def _html_to_excerpt(document: str, limit: int) -> str:
     without_noncontent = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", " ", document)
     text = re.sub(r"(?s)<[^>]+>", " ", without_noncontent)
     return re.sub(r"\s+", " ", html.unescape(text)).strip()[:limit]
+
+
+def _decode_document(data: bytes, content_type: str) -> str:
+    declared = re.search(r"charset=([\w-]+)", content_type, re.I)
+    encodings = [declared.group(1)] if declared else []
+    encodings.extend(["utf-8", "gb18030"])
+    best = ""
+    for encoding in dict.fromkeys(encodings):
+        try:
+            value = data.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+        if not best or value.count("�") < best.count("�"):
+            best = value
+        if "�" not in value:
+            return value
+    return best or data.decode("utf-8", errors="replace")
 
 
 class KnowledgeSearchTool:

@@ -65,7 +65,7 @@ public class ConversationApplicationService {
     if("新的音乐探索".equals(c.getTitle()))c.rename(content.substring(0,Math.min(36,content.length())));c.touch();
     var runId=UUID.randomUUID();messages.save(ConversationMessage.run(id,runId,next+1));
     var transcript=messages.findByConversationIdOrderBySequenceNumberAsc(id);
-    var body=agentBody(runId,id,guestId,content,c.getSummary(),activeTextHistory(c,transcript),recentCards(transcript,3),null,null);
+    var body=agentBody(runId,id,guestId,content,c.getSummary(),activeTextHistory(c,transcript),recentCards(transcript,6),null,null);
     body.putAll(memoryPlan(c, transcript, false).agentFields());
     try{var payload=json.writeValueAsString(Map.of("runId",runId,"runType","CONVERSATION","input",body));agentRuns.createQueued(runId,guestId,id,AgentRunType.CONVERSATION,json.writeValueAsString(body));agentRuns.appendEvent(runId,AgentRunEventType.PROGRESS,"{\"phase\":\"queued\",\"message\":\"请求已进入 Agent 队列\"}");outbox.save(AsyncOutboxEvent.pendingAgentRun(runId,payload,runId.toString()));}
     catch(Exception e){throw new IllegalStateException("AGENT_RUN_ENQUEUE_FAILED",e);}
@@ -82,7 +82,7 @@ public class ConversationApplicationService {
     long next = messages.findTopByConversationIdOrderBySequenceNumberDesc(id).map(x -> x.getSequenceNumber() + 1).orElse(1L);
     messages.save(ConversationMessage.run(id, requestId, next));
     var transcript = messages.findByConversationIdOrderBySequenceNumberAsc(id);
-    var body = agentBody(requestId, id, guestId, "请根据当前对话整理一份音乐偏好探索报告。", conversation.getSummary(), activeTextHistory(conversation,transcript),recentCards(transcript,3), "generate_exploration_report", null);
+    var body = agentBody(requestId, id, guestId, "请根据当前对话整理一份音乐偏好探索报告。", conversation.getSummary(), activeTextHistory(conversation,transcript),recentCards(transcript,6), "generate_exploration_report", null);
     body.putAll(memoryPlan(conversation, transcript, false).agentFields());
     try {
       var payload = json.writeValueAsString(Map.of("runId", requestId, "runType", AgentRunType.EXPLORATION_REPORT.name(), "input", body));
@@ -149,6 +149,14 @@ public class ConversationApplicationService {
   }
 
   @Transactional
+  public ConversationMessage appendRunIntervention(UUID id,UUID guestId,UUID clientMessageId,String content){
+    var conversation=conversations.findLockedOwned(id,guestId,ConversationStatus.DELETED).orElseThrow(NoSuchElementException::new);
+    var replay=messages.findByConversationIdAndClientMessageId(id,clientMessageId);if(replay.isPresent())return replay.get();
+    long next=messages.findTopByConversationIdOrderBySequenceNumberDesc(id).map(value->value.getSequenceNumber()+1).orElse(1L);
+    var message=messages.save(ConversationMessage.user(id,clientMessageId,content,next));conversation.touch();conversations.save(conversation);return message;
+  }
+
+  @Transactional
   public ConversationMessage card(UUID id, UUID guestId, UUID clientId, ConversationMessageType type, String cardType, String payload) {
     owned(id, guestId);
     var existing = messages.findByConversationIdAndClientMessageId(id, clientId);
@@ -177,7 +185,7 @@ public class ConversationApplicationService {
     var run = messages.findByConversationIdAndAgentRunIdAndType(id, runId, ConversationMessageType.AGENT_RUN).orElseThrow(NoSuchElementException::new);
     run.complete();
     messages.save(run);
-    return persistAgentResult(id, runId, run.getSequenceNumber(), result);
+    return persistAgentResult(id, runId, result);
   }
 
   @Transactional
@@ -201,24 +209,26 @@ public class ConversationApplicationService {
   @Transactional
   public ConversationMessage completeWaitingForUser(UUID id, UUID runId, ConversationAgentGateway.Result result, Map<String, Object> snapshot) {
     var run = messages.findByConversationIdAndAgentRunIdAndType(id, runId, ConversationMessageType.AGENT_RUN).orElseThrow(NoSuchElementException::new);
-    var response = messages.save(ConversationMessage.assistant(id, runId, result.text(), run.getSequenceNumber() + 1));
+    long next = messages.findTopByConversationIdOrderBySequenceNumberDesc(id).map(value -> value.getSequenceNumber() + 1).orElse(1L);
+    var response = messages.save(ConversationMessage.assistant(id, runId, result.text(), next));
     if (result.card() != null) {
       var type = ConversationMessageType.valueOf(result.card().messageType());
-      messages.save(ConversationMessage.card(id, UUID.randomUUID(), type, result.card().cardType(), result.card().payloadJson(), run.getSequenceNumber() + 2));
+      messages.save(ConversationMessage.card(id, UUID.randomUUID(), type, result.card().cardType(), result.card().payloadJson(), next + 1));
     }
     agentRuns.markWaitingForUser(runId, snapshot);
     conversations.findById(id).ifPresent(c -> { c.touch(); conversations.save(c); });
     return response;
   }
 
-  private ConversationMessage persistAgentResult(UUID id, UUID runId, long runSequence, ConversationAgentGateway.Result result) {
-    var response = messages.save(ConversationMessage.assistant(id, runId, result.text(), runSequence + 1));
+  private ConversationMessage persistAgentResult(UUID id, UUID runId, ConversationAgentGateway.Result result) {
+    long next = messages.findTopByConversationIdOrderBySequenceNumberDesc(id).map(value -> value.getSequenceNumber() + 1).orElse(1L);
+    var response = messages.save(ConversationMessage.assistant(id, runId, result.text(), next));
     if (result.card() != null) {
       var type = ConversationMessageType.valueOf(result.card().messageType());
       if (type != ConversationMessageType.CLARIFICATION_CARD && type != ConversationMessageType.CANDIDATE_POOL_CARD && type != ConversationMessageType.TOURNAMENT_CARD && type != ConversationMessageType.REPORT_CARD && type != ConversationMessageType.RECOMMENDATION_CARD) {
         throw new IllegalArgumentException("unsupported Agent card type");
       }
-      messages.save(ConversationMessage.card(id, UUID.randomUUID(), type, result.card().cardType(), result.card().payloadJson(), runSequence + 2));
+      messages.save(ConversationMessage.card(id, UUID.randomUUID(), type, result.card().cardType(), result.card().payloadJson(), next + 1));
     }
     conversations.findById(id).ifPresent(c -> { applyMemorySummary(c,result); c.touch(); conversations.save(c); });
     return response;
@@ -244,7 +254,7 @@ public class ConversationApplicationService {
     }
     var transcript = messages(id, guestId);
     var conversation = owned(id, guestId);
-    var body = agentBody(turn.run().getAgentRunId(), id, guestId, content, conversation.getSummary(), activeTextHistory(conversation,transcript),recentCards(transcript,3), null, null);
+    var body = agentBody(turn.run().getAgentRunId(), id, guestId, content, conversation.getSummary(), activeTextHistory(conversation,transcript),recentCards(transcript,6), null, null);
     body.putAll(memoryPlan(conversation, transcript, false).agentFields());
     try {
       var result = agent.stream(body, turn.run().getAgentRunId(), event -> {

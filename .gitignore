@@ -3,6 +3,7 @@
 Demos/generated/
 .env.*
 !.env.example
+!.env.production.example
 
 # Frontend
 web/node_modules/

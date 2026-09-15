@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { CandidateItem, CandidatePoolResponse } from './candidatePool'
-import { enqueueAgentRun, followAgentRun, progressMetricsText, publicProgress, type AgentRunEvent, type AgentRunPlan, type AgentRunProgress } from './agentRunStream'
+import { enqueueAgentRun, followAgentRun, progressMetricsText, projectResponseStream, publicProgress, type AgentRunEvent, type AgentRunPlan, type AgentRunProgress } from './agentRunStream'
 import { playbackLabel, useListeningPreview } from './listening'
 import './conversation.css'
 import './agentWorkspace.css'
@@ -65,6 +65,7 @@ export function ConversationApp() {
   const [renameDraft, setRenameDraft] = useState('')
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null)
   const [currentRunId, setCurrentRunId] = useState<string | null>(null)
+  const [streamingResponse, setStreamingResponse] = useState('')
   const [conversationSearch, setConversationSearch] = useState('')
   const [showArchived, setShowArchived] = useState(false)
   const [regenerationOpen, setRegenerationOpen] = useState(false)
@@ -77,7 +78,7 @@ export function ConversationApp() {
   const wasRunActive = useRef(false)
 
   useEffect(() => { void boot() }, [])
-  useEffect(() => { timelineRef.current?.scrollTo({ top: timelineRef.current.scrollHeight, behavior: 'smooth' }) }, [messages, pending, candidateRun])
+  useEffect(() => { timelineRef.current?.scrollTo({ top: timelineRef.current.scrollHeight, behavior: 'smooth' }) }, [messages, pending, candidateRun, streamingResponse])
 
   function recordPlan(next: Plan) {
     setPlan(next)
@@ -100,6 +101,7 @@ export function ConversationApp() {
       const payload = await api<{ runStatus: string; events: RunEvent[] }>(`/agent-runs/${runId}/events`)
       const replayProgress: Progress[] = []
       const replayPlans: Plan[] = []
+      let replayResponse = ''
       let cursor = 0
       for (const event of payload.events) {
         cursor = Math.max(cursor, event.sequenceNumber)
@@ -107,31 +109,34 @@ export function ConversationApp() {
         const item = publicProgress(event, data)
         if (item) replayProgress.push(item)
         if (event.type === 'PLAN_UPDATED') replayPlans.push(data as unknown as Plan)
+        const projected = projectResponseStream(replayResponse, event, data)
+        if (projected !== null) replayResponse = projected
       }
       if (replayProgress.length) setProgress(replayProgress)
       if (replayPlans.length) { setPlanHistory(replayPlans.slice(-8)); setPlan(replayPlans[replayPlans.length - 1]) }
       if (payload.runStatus === 'RUNNING' || payload.runStatus === 'QUEUED') {
+        setStreamingResponse(replayResponse)
         setCurrentRunId(runId)
         setCollapsed(false)
         if (resumingRunId.current !== runId) {
           resumingRunId.current = runId; setPending(true)
-          void followAgentRun(runId, { onProgress: item => setProgress(previous => [...previous, item]), onPlan: recordPlan }, 15 * 60_000, cursor)
+          void followAgentRun(runId, { onProgress: item => setProgress(previous => [...previous, item]), onPlan: recordPlan, onResponseStarted: () => setStreamingResponse(''), onResponseDelta: (_delta, accumulated) => setStreamingResponse(accumulated) }, 15 * 60_000, cursor)
             .then(() => refreshMessages())
             .catch(error => setNotice(friendlyError(error)))
-            .finally(() => { resumingRunId.current = null; setCurrentRunId(null); setPending(false); setCollapsed(true) })
+            .finally(() => { resumingRunId.current = null; setStreamingResponse(''); setCurrentRunId(null); setPending(false); setCollapsed(true) })
         }
-      } else { setCurrentRunId(null); if (payload.runStatus === 'WAITING_FOR_USER') setCollapsed(false); else setCollapsed(true) }
+      } else { setStreamingResponse(''); setCurrentRunId(null); if (payload.runStatus === 'WAITING_FOR_USER') setCollapsed(false); else setCollapsed(true) }
     } catch { /* replay is best-effort */ }
   }
   async function boot() {
     try { const list = await api<Conversation[]>('/conversations'); setConversations(list); if (list[0]) await open(list[0]); else await createConversation() } catch (error) { setNotice(friendlyError(error)) }
   }
   async function createConversation() {
-    try { const created = await api<Conversation>('/conversations', { method: 'POST' }); setConversations(previous => [created, ...previous]); setCurrent(created); setMessages([]); setProgress([]); setPlan(null); setPlanHistory([]); setCurrentRunId(null); setNotice(''); setMobileSidebarOpen(false); await refreshMemory(created.id) } catch (error) { setNotice(friendlyError(error)) }
+    try { const created = await api<Conversation>('/conversations', { method: 'POST' }); setConversations(previous => [created, ...previous]); setCurrent(created); setMessages([]); setProgress([]); setPlan(null); setPlanHistory([]); setStreamingResponse(''); setCurrentRunId(null); setNotice(''); setMobileSidebarOpen(false); await refreshMemory(created.id) } catch (error) { setNotice(friendlyError(error)) }
   }
   async function open(conversation: Conversation) {
     if (pending || candidateRun) return
-    try { setProgress([]); setPlan(null); setPlanHistory([]); await Promise.all([refreshMessages(conversation.id), refreshMemory(conversation.id)]); setCurrent(conversation); setNotice(''); setMobileSidebarOpen(false); setConversationMenuId(null) } catch (error) { setNotice(friendlyError(error)) }
+    try { setProgress([]); setPlan(null); setPlanHistory([]); setStreamingResponse(''); await Promise.all([refreshMessages(conversation.id), refreshMemory(conversation.id)]); setCurrent(conversation); setNotice(''); setMobileSidebarOpen(false); setConversationMenuId(null) } catch (error) { setNotice(friendlyError(error)) }
   }
   async function renameConversation(conversation: Conversation) {
     const title = renameDraft.trim()
@@ -169,16 +174,28 @@ export function ConversationApp() {
   async function send(event: FormEvent) {
     event.preventDefault(); await sendContent(draft.trim())
   }
+  async function steerCurrentRun(content: string) {
+    if (!currentRunId) return
+    const clientId = crypto.randomUUID()
+    const optimistic: Message = { id: clientId, role: 'USER', type: 'USER_TEXT', content, status: 'COMPLETED', sequenceNumber: Date.now(), createdAt: new Date().toISOString() }
+    setMessages(previous => [...previous, optimistic]); setDraft(''); setCollapsed(false); setNotice('')
+    try {
+      await api(`/agent-runs/${currentRunId}/interventions`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': clientId }, body: JSON.stringify({ content }) })
+    } catch (error) {
+      setMessages(previous => previous.filter(item => item.id !== clientId)); setDraft(content); setNotice(friendlyError(error))
+    }
+  }
   async function sendContent(content: string) {
-    if (!content || !current || pending || candidateRun) return
+    if (!content || !current || candidateRun) return
+    if (pending) { if (currentRunId) await steerCurrentRun(content); return }
     const clientId = crypto.randomUUID(); const optimistic: Message = { id: clientId, role: 'USER', type: 'USER_TEXT', content, status: 'COMPLETED', sequenceNumber: Date.now(), createdAt: new Date().toISOString() }
-    setMessages(previous => [...previous, optimistic]); setDraft(''); setPending(true); setProgress([]); setPlan(null); setPlanHistory([]); setCollapsed(false); setNotice('')
+    setMessages(previous => [...previous, optimistic]); setDraft(''); setPending(true); setProgress([]); setPlan(null); setPlanHistory([]); setStreamingResponse(''); setCollapsed(false); setNotice('')
     try {
       const queued = await enqueueAgentRun(`/conversations/${current.id}/messages`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': clientId }, body: JSON.stringify({ content }) })
       setCurrentRunId(queued.runId)
-      await followAgentRun(queued.runId, { onProgress: item => setProgress(previous => [...previous, item]), onPlan: recordPlan })
+      await followAgentRun(queued.runId, { onProgress: item => setProgress(previous => [...previous, item]), onPlan: recordPlan, onResponseStarted: () => setStreamingResponse(''), onResponseDelta: (_delta, accumulated) => setStreamingResponse(accumulated) })
       await Promise.all([refreshMessages(), refreshMemory()]); const refreshed = await api<Conversation[]>('/conversations'); setConversations(refreshed); setCurrent(refreshed.find(item => item.id === current.id) ?? current)
-    } catch (error) { setMessages(previous => previous.filter(item => item.id !== clientId)); setDraft(content); setNotice(friendlyError(error)) } finally { setCurrentRunId(null); setPending(false); setCollapsed(true) }
+    } catch (error) { setMessages(previous => previous.filter(item => item.id !== clientId)); setDraft(content); setNotice(friendlyError(error)) } finally { setStreamingResponse(''); setCurrentRunId(null); setPending(false); setCollapsed(true) }
   }
   async function compressConversationMemory() {
     if (!current || runActive || compressingMemory || !memory?.manualCompressionAvailable) return
@@ -205,13 +222,13 @@ export function ConversationApp() {
   }
   async function requestExplorationReport() {
     if (!current || pending || candidateRun) return
-    setPending(true); setProgress([]); setPlan(null); setPlanHistory([]); setCollapsed(false); setNotice('')
+    setPending(true); setProgress([]); setPlan(null); setPlanHistory([]); setStreamingResponse(''); setCollapsed(false); setNotice('')
     try {
       const queued = await enqueueAgentRun(`/conversations/${current.id}/exploration-report`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() } })
       setCurrentRunId(queued.runId)
-      await followAgentRun(queued.runId, { onProgress: item => setProgress(previous => [...previous, item]), onPlan: recordPlan })
+      await followAgentRun(queued.runId, { onProgress: item => setProgress(previous => [...previous, item]), onPlan: recordPlan, onResponseStarted: () => setStreamingResponse(''), onResponseDelta: (_delta, accumulated) => setStreamingResponse(accumulated) })
       await refreshMessages(); const refreshed = await api<Conversation[]>('/conversations'); setConversations(refreshed); setCurrent(refreshed.find(item => item.id === current.id) ?? current)
-    } catch (error) { setNotice(friendlyError(error)) } finally { setCurrentRunId(null); setPending(false); setCollapsed(true) }
+    } catch (error) { setNotice(friendlyError(error)) } finally { setStreamingResponse(''); setCurrentRunId(null); setPending(false); setCollapsed(true) }
   }
   const displayMessages = useMemo(() => messages.filter(message => message.type !== 'AGENT_RUN'), [messages])
   const visibleConversations = useMemo(() => conversations.filter(item => (showArchived ? item.status === 'ARCHIVED' : item.status === 'ACTIVE') && item.title.toLocaleLowerCase().includes(conversationSearch.trim().toLocaleLowerCase())), [conversations, showArchived, conversationSearch])
@@ -245,6 +262,7 @@ export function ConversationApp() {
           else if (message.type === 'CLARIFICATION_CARD') content = <ClarificationCard payload={message.cardPayloadJson} agentRunId={findWaitingRunId(messages, messages.findIndex(item => item.id === message.id))} onCompleted={() => void refreshMessages()} onProgress={(item) => setProgress(previous => [...previous, item])} onPlan={recordPlan} />
           else if (message.type === 'RECOMMENDATION_CARD' && message.cardType === 'MUSIC_RECOMMENDATIONS') content = <MusicRecommendationsCard payload={message.cardPayloadJson} conversationId={current?.id} />
           else if (message.type === 'RECOMMENDATION_CARD' && message.cardType === 'PUBLIC_MUSIC_SOURCES') content = <PublicMusicSourcesCard payload={message.cardPayloadJson} />
+          else if (message.type === 'RECOMMENDATION_CARD' && message.cardType === 'MUSIC_ANALYSIS') content = <MusicAnalysisCard payload={message.cardPayloadJson} />
           else if (message.type === 'RECOMMENDATION_CARD') content = <RecommendationNoticeCard payload={message.cardPayloadJson} />
           else if (message.type === 'TOURNAMENT_CARD') content = <TournamentStatusCard payload={message.cardPayloadJson} onProgress={item => setProgress(previous => [...previous, item])} onPlan={recordPlan} onRunActive={active => { setPending(active); if (active) { setProgress([]); setPlan(null); setPlanHistory([]); setCollapsed(false) } else setCollapsed(true) }} onReportReady={(report, tournamentId, championTitle) => void persistCard('REPORT_CARD', 'PREFERENCE_REPORT', { tournamentId, reportId: report.reportId, version: report.version, status: report.status, championTitle })} />
           else if (message.type === 'REPORT_CARD' && message.cardType === 'EXPLORATION_REPORT') content = <ExplorationReportCard payload={message.cardPayloadJson} conversationId={current?.id} />
@@ -253,10 +271,11 @@ export function ConversationApp() {
           return <TimedMessage key={message.id} createdAt={message.createdAt}>{content}</TimedMessage>
         })}
         {candidateRun && <CandidateGenerationCard size={candidateRun.size} preferenceText={candidateRun.preferenceText} onProgress={(item) => setProgress(previous => [...previous, item])} onPlan={recordPlan} onRunId={setCurrentRunId} onCompleted={async payload => { await persistCard('CANDIDATE_POOL_CARD', 'CANDIDATE_POOL', payload); setCandidateRun(null); setCollapsed(true) }} onFailed={message => { setNotice(message); setCandidateRun(null); setCollapsed(true) }} />}
+        {streamingResponse && <article className="conversation-message agent streaming-response"><span className="message-agent-mark"><BrandMark /></span><MessageBody content={streamingResponse} /><i className="streaming-response-caret" aria-hidden="true" /></article>}
         {hasRunState && <AgentActivity progress={progress} collapsed={collapsed} active={runActive} elapsedMs={runElapsedMs} canStop={Boolean(currentRunId)} canRegenerate={messages.some(message => message.role === 'USER' && message.type === 'USER_TEXT')} onToggle={() => setCollapsed(value => !value)} onStop={() => void stopCurrentRun()} onRegenerate={() => setRegenerationOpen(value => !value)} />}
         {regenerationOpen && !runActive && <section className="regeneration-panel"><strong>重新生成这轮回答</strong><p>可直接重试，也可以附加一个调整方向。</p><div>{['更冷门一些', '减少相同艺人', '换一批歌曲'].map(item => <button type="button" key={item} onClick={() => setRegenerationInstruction(item)}>{item}</button>)}</div><textarea value={regenerationInstruction} onChange={event => setRegenerationInstruction(event.target.value)} placeholder="例如：更冷门一些，减少相同艺人" /><footer><button type="button" onClick={() => setRegenerationOpen(false)}>取消</button><button type="button" className="primary" onClick={() => regenerateLastAnswer(regenerationInstruction)}>重新生成</button></footer></section>}
       </section>
-      <form className="conversation-composer" onSubmit={event => void send(event)}><div className="composer-frame"><textarea value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="和 IndieSoundQuest 聊聊音乐……" maxLength={2000} disabled={!current || runActive} /><div className="composer-toolbar"><div className="composer-memory"><button className="memory-compress-button" type="button" aria-label="整理较早的对话" title={memory?.manualCompressionAvailable ? '整理较早的对话' : '目前无需整理'} disabled={!memory?.manualCompressionAvailable || runActive || compressingMemory} onClick={() => void compressConversationMemory()}>{compressingMemory ? <span className="memory-spinner" /> : <MemoryIcon />}</button>{memory && <div className="memory-meter" title="当前对话的记忆占用；较长时会自动整理较早内容" role="progressbar" aria-label="对话记忆占用" aria-valuemin={0} aria-valuemax={100} aria-valuenow={memory.percent}><span><i style={{ width: `${memory.percent}%` }} /></span></div>}</div><button className="composer-send" type="submit" aria-label="发送消息" title="发送" disabled={!draft.trim() || !current || runActive}>{pending ? <span className="composer-spinner" /> : <SendIcon />}</button></div></div><small>{memory?.autoCompressionReady ? '稍后会自动整理较早的对话。' : '请核对重要的音乐资料与链接。'}</small></form>
+      <form className="conversation-composer" onSubmit={event => void send(event)}><div className="composer-frame"><textarea value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder={pending && currentRunId ? '继续补充信息，或调整当前方向……' : '和 IndieSoundQuest 聊聊音乐……'} maxLength={2000} disabled={!current || Boolean(candidateRun) || (runActive && !currentRunId)} /><div className="composer-toolbar"><div className="composer-memory"><button className="memory-compress-button" type="button" aria-label="整理较早的对话" title={memory?.manualCompressionAvailable ? '整理较早的对话' : '目前无需整理'} disabled={!memory?.manualCompressionAvailable || runActive || compressingMemory} onClick={() => void compressConversationMemory()}>{compressingMemory ? <span className="memory-spinner" /> : <MemoryIcon />}</button>{memory && <div className="memory-meter" title="当前对话的记忆占用；较长时会自动整理较早内容" role="progressbar" aria-label="对话记忆占用" aria-valuemin={0} aria-valuemax={100} aria-valuenow={memory.percent}><span><i style={{ width: `${memory.percent}%` }} /></span></div>}</div><button className="composer-send" type="submit" aria-label="发送消息" title="发送" disabled={!draft.trim() || !current || Boolean(candidateRun) || (runActive && !currentRunId)}>{pending && !currentRunId ? <span className="composer-spinner" /> : <SendIcon />}</button></div></div><small>{pending && currentRunId ? '运行中可以继续补充或调整方向。' : memory?.autoCompressionReady ? '稍后会自动整理较早的对话。' : '请核对重要的音乐资料与链接。'}</small></form>
     </section>
     <aside className="conversation-agent-panel"><AgentPlanPanel plans={planHistory.length ? planHistory : (plan ? [plan] : [])} active={runActive} latest={progress[progress.length - 1]} /></aside>
   </main>
@@ -294,7 +313,7 @@ function formatElapsed(value: number) { const seconds = Math.max(0, Math.floor(v
 function formatMessageTime(value: string) { const date = new Date(value); return Number.isNaN(date.getTime()) ? '' : date.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) }
 function TimedMessage({ createdAt, children }: { createdAt: string; children: ReactNode }) { const label = formatMessageTime(createdAt); return <div className="conversation-message-shell">{label && <time dateTime={createdAt}>{label}</time>}{children}</div> }
 
-function MessageBody({ content }: { content: string }) { const blocks = content.split(/\n{2,}/).filter(Boolean); return <div className="message-body">{blocks.map((block, index) => <p key={index}>{block.split(/(\*\*[^*]+\*\*)/g).map((part, partIndex) => part.startsWith('**') && part.endsWith('**') ? <strong key={partIndex}>{part.slice(2, -2)}</strong> : <span key={partIndex}>{part}</span>)}</p>)}</div> }
+function MessageBody({ content }: { content: string }) { const blocks = content.split(/\n{2,}/).filter(Boolean); const inline = (block: string) => block.split(/(\*\*[^*]+\*\*)/g).map((part, partIndex) => part.startsWith('**') && part.endsWith('**') ? <strong key={partIndex}>{part.slice(2, -2)}</strong> : <span key={partIndex}>{part}</span>); return <div className="message-body">{blocks.map((block, index) => { const heading = block.match(/^#{1,3}\s+(.+)$/s); return heading ? <h3 key={index}>{inline(heading[1])}</h3> : <p key={index}>{inline(block)}</p> })}</div> }
 
 function BrandMark() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 9v6M9 6v12M13 4v16M17 7v10M21 10v4" /></svg> }
 function PlusIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg> }
@@ -338,6 +357,29 @@ function PublicMusicSourcesCard({ payload }: { payload?: string | null }) {
   let value: { title?: string; items?: { title?: string; url?: string; summary?: string; provider?: string }[] } = {}
   try { value = JSON.parse(payload || '{}') } catch { /* degraded card */ }
   return <section className="tournament-launch-card conversation-report-card"><p className="eyebrow">公开音乐资料</p><h2>{value.title || '沿着这些线索继续探索'}</h2><ol className="conversation-recommendations">{value.items?.map((item, index) => <li key={`${item.url}-${index}`}><strong>{item.title || '音乐资料'}</strong>{item.summary && <small>{item.summary}</small>}{item.url && <a href={item.url} target="_blank" rel="noreferrer">查看原始来源</a>}</li>)}</ol></section>
+}
+function MusicAnalysisCard({ payload }: { payload?: string | null }) {
+  type Claim = { statement?: string; claimType?: 'FACT' | 'OBSERVATION' | 'INTERPRETATION' | 'LISTENER_INFERENCE'; dimension?: string; evidenceRefs?: string[]; confidence?: string; boundary?: string; status?: string }
+  type Source = { ref?: string; title?: string; url?: string; summary?: string; provider?: string; quality?: { tier?: string; kind?: string; hasFullTextExcerpt?: boolean } }
+  let value: { title?: string; coreJudgment?: string; selectedDimensions?: string[]; claims?: Claim[]; uncertainties?: string[]; relatedWorks?: string[]; sources?: Source[]; evidenceCoverage?: { independent_domain_count?: number; full_text_source_count?: number; covered_dimensions?: string[]; missing_dimensions?: string[] }; claimReview?: { semanticReviewApplied?: boolean; reviewedClaimCount?: number; verdictCounts?: Record<string, number>; summary?: string }; sourceConflicts?: string[]; contextMode?: string; basedOnCardId?: string; appliedInstruction?: string } = {}
+  try { value = JSON.parse(payload || '{}') } catch { /* degraded card */ }
+  const labels: Record<string, string> = { FACT: '可核验事实', OBSERVATION: '作品观察', INTERPRETATION: '分析解释', LISTENER_INFERENCE: '听感推断' }
+  const statusLabels: Record<string, string> = { supported: '来源支持', partial: '部分支持', conflicting: '资料有分歧', unsupported: '暂无法核验' }
+  const sourceKinds: Record<string, string> = { structured_catalog: '结构化音乐目录', reference: '百科与参考资料', listener_signal: '听众相似关系', artist_or_release_platform: '作品发布平台', community: '社区讨论', editorial_or_interview: '访谈或编辑资料', readable_web_page: '已精读公开页面', search_snippet: '搜索摘要' }
+  const sourceMap = new Map((value.sources || []).map(item => [item.ref, item]))
+  return <section className="tournament-launch-card conversation-report-card music-analysis-card">
+    <p className="eyebrow">{value.contextMode === 'REFINED' ? '深度音乐分析 · 沿上一轮继续' : '深度音乐分析 · 依据与边界'}</p>
+    <h2>{value.title || '这次分析使用的证据线索'}</h2>
+    {value.appliedInstruction && <small className="recommendation-refinement">本轮继续研究：{value.appliedInstruction}</small>}
+    {value.coreJudgment && <p className="music-analysis-thesis">{value.coreJudgment}</p>}
+    {value.selectedDimensions?.length ? <div className="music-analysis-dimensions">{value.selectedDimensions.map(item => <span key={item}>{item}</span>)}</div> : null}
+    {value.claims?.length ? <ol className="music-analysis-claims">{value.claims.map((claim, index) => <li key={`${claim.statement}-${index}`}><div><small>{labels[claim.claimType || ''] || '分析线索'} · {claim.dimension}{claim.status ? ` · ${statusLabels[claim.status] || claim.status}` : ''}</small><strong>{claim.statement}</strong></div>{claim.boundary && <p>{claim.boundary}</p>}{claim.evidenceRefs?.length ? <div className="music-analysis-refs">{claim.evidenceRefs.map(ref => { const source = sourceMap.get(ref); return source?.url ? <a key={ref} href={source.url} target="_blank" rel="noreferrer">{ref}</a> : <span key={ref}>{ref}</span> })}</div> : null}</li>)}</ol> : null}
+    {value.uncertainties?.length ? <details className="music-analysis-details"><summary>查看不确定性与资料边界</summary><ul>{value.uncertainties.map((item, index) => <li key={index}>{item}</li>)}</ul></details> : null}
+    {value.evidenceCoverage && <details className="music-analysis-details"><summary>查看本轮研究覆盖</summary><p>参考 {value.evidenceCoverage.independent_domain_count || 0} 个独立站点，精读 {value.evidenceCoverage.full_text_source_count || 0} 个正文来源。</p>{value.evidenceCoverage.covered_dimensions?.length ? <p>已覆盖：{value.evidenceCoverage.covered_dimensions.join('、')}</p> : null}{value.evidenceCoverage.missing_dimensions?.length ? <p>仍缺少：{value.evidenceCoverage.missing_dimensions.join('、')}</p> : null}</details>}
+    {value.claimReview?.semanticReviewApplied && <details className="music-analysis-details"><summary>查看结论核对结果</summary><p>已逐条核对 {value.claimReview.reviewedClaimCount || 0} 个重要结论与引用正文是否对应。</p>{value.claimReview.summary && <p>{value.claimReview.summary}</p>}{value.sourceConflicts?.length ? <ul>{value.sourceConflicts.map((item, index) => <li key={index}>{item}</li>)}</ul> : null}</details>}
+    {value.relatedWorks?.length ? <div className="music-analysis-related"><small>适合继续比较</small><p>{value.relatedWorks.join(' · ')}</p></div> : null}
+    {value.sources?.length ? <details className="music-analysis-details"><summary>查看全部公开来源</summary><ol>{value.sources.map((item, index) => <li key={`${item.url}-${index}`}><a href={item.url} target="_blank" rel="noreferrer"><strong>{item.ref} · {item.title || '公开音乐资料'}</strong>{item.quality?.kind && <small>{sourceKinds[item.quality.kind] || '公开资料'}{item.quality.hasFullTextExcerpt ? ' · 已精读正文' : ''}</small>}{item.summary && <small>{item.summary}</small>}</a></li>)}</ol></details> : null}
+  </section>
 }
 function MusicRecommendationsCard({ payload, conversationId }: { payload?: string | null; conversationId?: string }) {
   type Song = { recordingId?: string; title?: string; artistName?: string; albumTitle?: string; coverUrl?: string; reason?: string; sourceUrl?: string; searchUrl?: string; verificationStatus?: string }

@@ -73,6 +73,30 @@ button.music-recommendation-main { width: 100%; padding: 0; border: 0; backgroun
 .music-recommendation-sources a { margin-top: 7px; color: #8f5045; text-decoration: none; display: block; }
 .recommendation-refinement { display: block; margin: 2px 0 13px; color: #8f655d; font-size: .72rem; line-height: 1.6; }
 
+.music-analysis-card { max-width: 760px; }
+.music-analysis-thesis { margin: 16px 0 0 !important; padding: 15px 17px; border-left: 2px solid #a65a4b; background: #f6f1eb; color: #49443e !important; font: 500 .86rem/1.75 "Songti SC", "STSong", serif; }
+.music-analysis-dimensions { margin: 14px 0 2px; display: flex; flex-wrap: wrap; gap: 6px; }
+.music-analysis-dimensions span { padding: 5px 9px; border: 1px solid #e1ddd5; border-radius: 999px; background: #faf8f4; color: #777169; font-size: .66rem; }
+.music-analysis-claims { margin: 19px 0 0; padding: 0; list-style: none; display: grid; gap: 0; }
+.music-analysis-claims > li { padding: 14px 0; border-top: 1px solid #ebe7df; }
+.music-analysis-claims > li > div:first-child { display: grid; gap: 5px; }
+.music-analysis-claims small { color: #9a5a4f; font-size: .64rem; letter-spacing: .035em; }
+.music-analysis-claims strong { color: #3b3833; font: 520 .84rem/1.65 system-ui, sans-serif; }
+.music-analysis-claims p { margin: 6px 0 0 !important; color: #807b73 !important; font-size: .7rem !important; line-height: 1.6 !important; }
+.music-analysis-refs { margin-top: 8px; display: flex; gap: 5px; }
+.music-analysis-refs a, .music-analysis-refs span { min-width: 24px; padding: 3px 6px; border-radius: 6px; background: #eeeae3; color: #89544a; font: 600 .62rem/1.2 system-ui; text-align: center; text-decoration: none; }
+.music-analysis-details { margin-top: 14px; padding-top: 12px; border-top: 1px solid #ebe7df; color: #777169; font-size: .72rem; }
+.music-analysis-details summary { width: max-content; cursor: pointer; color: #746e66; }
+.music-analysis-details > p { margin: 8px 0 0 !important; color: #827d75 !important; font-size: .69rem !important; line-height: 1.55 !important; }
+.music-analysis-details ul, .music-analysis-details ol { margin: 10px 0 0 !important; padding: 0 0 0 18px !important; display: grid !important; gap: 8px !important; }
+.music-analysis-details li { line-height: 1.55; }
+.music-analysis-details a { color: #4c4842; text-decoration: none; display: grid; gap: 3px; }
+.music-analysis-details a:hover strong { color: #97564a; }
+.music-analysis-details a small { color: #8a857d; font-weight: 400; }
+.music-analysis-related { margin-top: 15px; padding-top: 12px; border-top: 1px solid #ebe7df; }
+.music-analysis-related small { color: #9a5a4f; font-size: .64rem; letter-spacing: .04em; }
+.music-analysis-related p { margin: 5px 0 0 !important; color: #666159 !important; font-size: .74rem !important; }
+
 .conversation-report-card > small { display: block; margin-top: 8px; color: #969189; font-size: .66rem; line-height: 1.5; }
 .conversation-report-card > p strong { color: #45413c; }
 .conversation-report-easter-egg { margin-top: 17px !important; padding: 13px 15px; border-left: 2px solid #a65a4b; background: #f5f0eb; color: #625d56 !important; }

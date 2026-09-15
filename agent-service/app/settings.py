@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     deepseek_api_key: str | None = None
     tavily_api_key: str | None = None
     bocha_api_key: str | None = None
+    lastfm_api_key: str | None = None
+    wikimedia_research_enabled: bool = True
     spotify_discovery_enabled: bool = False
     spotify_client_id: str | None = None
     spotify_client_secret: str | None = None

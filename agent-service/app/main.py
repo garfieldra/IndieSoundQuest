@@ -17,7 +17,7 @@ from .report_schemas import TournamentReportRequest
 from .llm import DeepSeekCandidateSelector
 from .schemas import CandidatePoolRequest, ConversationAgentRequest, ConversationResumeRequest, MemoryCompressionRequest, MemoryCompressionResponse
 from .settings import settings
-from .tools import DomesticContentResearchTool, KnowledgeSearchTool, MusicCatalogTool, SpotifyCatalogTool, TournamentFactsTool, WebSearchTool
+from .tools import DomesticContentResearchTool, KnowledgeSearchTool, LastFmResearchTool, MusicCatalogTool, SpotifyCatalogTool, TournamentFactsTool, WebSearchTool, WikimediaResearchTool
 from .registry import skill_registry, tool_registry
 
 app = FastAPI(title="IndieSoundQuest Agent Service", version="0.1.0")
@@ -45,13 +45,28 @@ domestic_research = DomesticContentResearchTool(
 spotify_catalog = SpotifyCatalogTool(settings.spotify_client_id, settings.spotify_client_secret, settings.spotify_market)
 graph = build_candidate_pool_graph(music_catalog, web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), DeepSeekCandidateSelector(), domestic_research, spotify_catalog if settings.spotify_discovery_enabled else None)
 report_graph = build_report_graph(TournamentFactsTool(settings.java_internal_base_url, settings.agent_internal_service_token), ReportGenerator(), web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), domestic_research)
-conversation_runtime = ConversationReActRuntime(web_search, KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection), tool_registry, skill_registry, graph, music_catalog)
+conversation_runtime = ConversationReActRuntime(
+    web_search,
+    KnowledgeSearchTool(settings.milvus_uri, settings.embedding_model, settings.knowledge_collection),
+    tool_registry,
+    skill_registry,
+    graph,
+    music_catalog,
+    WikimediaResearchTool(settings.wikimedia_research_enabled),
+    LastFmResearchTool(settings.lastfm_api_key),
+)
 
 _ACTION_PROGRESS = {
+    "adjust_direction": ("direction_update", "正在根据你的补充调整计划"),
     "understand_preference": ("understand_preference", "正在理解你的音乐偏好"),
     "analyze_preference": ("analyze_preference", "正在整理声音、情绪与聆听场景"),
+    "load_analysis_skill": ("load_analysis_skill", "正在建立可随证据调整的分析视角"),
     "resolve_named_entities": ("resolve_artist", "正在核验你提到的艺人"),
     "search_web": ("discover_web", "正在从公开音乐资料中寻找线索"),
+    "read_source": ("read_source", "正在精读与核心问题最相关的公开资料"),
+    "research_musicbrainz": ("research_musicbrainz", "正在核对作品版本、署名与目录关系"),
+    "search_wikimedia": ("search_wikimedia", "正在补充艺人、作品与音乐史背景"),
+    "search_lastfm": ("search_lastfm", "正在查找听众相似关系与音乐标签"),
     "search_spotify": ("discover_spotify", "正在从 Spotify 目录补充国际音乐线索"),
     "search_domestic_content": ("discover_domestic", "正在补充中文社区音乐资料"),
     "resolve_musicbrainz": ("verify_musicbrainz", "正在通过 MusicBrainz 核验歌曲身份"),
@@ -66,6 +81,7 @@ _ACTION_PROGRESS = {
     "build_candidate_pool": ("build_candidate_pool", "正在自主构建并核验歌曲世界杯候选池"),
     "generate_exploration_report": ("generate_exploration_report", "正在根据当前对话生成探索报告"),
     "recommend_music": ("recommend_music", "正在提取并核验歌曲与艺人推荐"),
+    "analyze_music": ("analyze_music", "正在根据现有证据形成深入音乐分析"),
     "respond": ("draft_response", "正在整理这次音乐探索的回应"),
     "critique_report": ("review_report", "正在核验报告事实与推荐来源"),
     "rerank_candidates": ("organize_candidates", "正在并行重排候选，并生成入选理由"),
@@ -77,13 +93,19 @@ def _progress(request_id, action: str, elapsed_ms: int, metrics: dict | None = N
     return f"event: progress\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 _PLAN_ACTIONS = {
+    "adjust_direction": ("调整执行方向", "已把运行中的最新补充加入当前目标"),
     "understand_preference": ("理解音乐偏好", "结合本轮输入与已有上下文确定探索边界"),
     "analyze_preference": ("建立本轮偏好画像", "提取艺人、声音、情绪、场景与探索切面"),
+    "load_analysis_skill": ("建立动态分析工作台", "选择与问题直接相关、可随证据调整的分析角度"),
     "resolve_named_entities": ("核验艺人身份", "检查用户提到的艺人及可能歧义"),
     "request_clarification": ("等待用户确认", "存在会影响候选正确性的身份歧义"),
     "search_catalog": ("检查规范歌曲目录", "读取已核验曲目作为可用补充"),
     "expand_artist_catalog": ("扩展明确艺人的作品", "从公开音乐目录批量发现并核验作品"),
     "search_web": ("搜索公开音乐资料", "从网络寻找歌曲、艺人及相关音乐语境"),
+    "read_source": ("精读关键来源", "提取能够支持创作背景、制作信息或核心判断的正文证据"),
+    "research_musicbrainz": ("核对音乐目录关系", "读取作品版本、创作署名与关联实体"),
+    "search_wikimedia": ("补充百科语境", "检索艺人身份、作品背景与音乐史上下文"),
+    "search_lastfm": ("探索听众关系", "查找相似艺人、相似歌曲与标签线索"),
     "search_domestic_content": ("检索中文内容平台", "补充国内社区中的音乐资料"),
     "search_spotify": ("检索流媒体目录", "补充国际音乐目录线索"),
     "search_knowledge": ("检索歌曲主题卡", "以本地知识库补充主题与文化语境"),
@@ -101,6 +123,7 @@ _PLAN_ACTIONS = {
     "build_candidate_pool": ("构建世界杯候选池", "调用候选池能力完成在线发现与身份核验"),
     "generate_exploration_report": ("生成对话探索报告", "总结当前对话中的偏好和探索方向"),
     "recommend_music": ("生成音乐推荐", "从公开资料提取具体推荐并核验歌曲身份"),
+    "analyze_music": ("形成深入音乐分析", "区分事实、作品观察、解释与听者推断并组织论证"),
     "respond": ("整理音乐回应", "基于现有信息生成可继续追问的回答"),
 }
 
@@ -144,7 +167,7 @@ async def verify_caller(authorization: str = Header(default="")):
 async def live(): return {"status":"UP"}
 
 @app.get("/health/ready")
-async def ready(): return {"status":"UP", "catalog":"configured", "modelProvider": settings.llm_provider, "webSearch": bool(settings.tavily_api_key), "spotifyDiscovery": settings.spotify_discovery_enabled and spotify_catalog.enabled, "toolRegistry": tool_registry.summaries(), "skills": skill_registry.summaries(), "domesticResearch": {"zhihu": settings.zhihu_research_enabled, "bilibili": settings.bilibili_research_enabled, "douban": settings.douban_research_enabled}}
+async def ready(): return {"status":"UP", "catalog":"configured", "modelProvider": settings.llm_provider, "webSearch": bool(settings.tavily_api_key or settings.bocha_api_key), "wikimediaResearch": settings.wikimedia_research_enabled, "lastFmDiscovery": bool(settings.lastfm_api_key), "spotifyDiscovery": settings.spotify_discovery_enabled and spotify_catalog.enabled, "toolRegistry": tool_registry.summaries(), "skills": skill_registry.summaries(), "domesticResearch": {"zhihu": settings.zhihu_research_enabled, "bilibili": settings.bilibili_research_enabled, "douban": settings.douban_research_enabled}}
 
 @app.post("/internal/v1/memory:compress", response_model=MemoryCompressionResponse, dependencies=[Depends(verify_caller)])
 async def compress_memory(request: MemoryCompressionRequest):

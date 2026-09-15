@@ -16,6 +16,7 @@ import java.util.*;
 import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+import org.springframework.transaction.annotation.Transactional;
 import java.nio.charset.StandardCharsets;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,6 +55,15 @@ public class AgentRunController {
   StreamingResponseBody streamEvents(@PathVariable UUID id,@RequestParam(defaultValue="0")long afterSequence,@RequestHeader(value="Last-Event-ID",required=false)Long lastEventId,HttpServletRequest request,HttpServletResponse response){var guest=((GuestSession)request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();agentRuns.owned(id,guest);response.setContentType(MediaType.TEXT_EVENT_STREAM_VALUE);response.setCharacterEncoding(StandardCharsets.UTF_8.name());response.setHeader(HttpHeaders.CACHE_CONTROL,"no-cache, no-transform");response.setHeader("X-Accel-Buffering","no");return output->{long cursor=Math.max(afterSequence,lastEventId==null?0:lastEventId);for(int idle=0;idle<900;idle++){var batch=agentRuns.eventsAfter(id,guest,cursor);for(var event:batch){cursor=event.getSequenceNumber();var data=json.writeValueAsString(EventView.of(event));output.write(("id: "+cursor+"\nevent: run_event\ndata: "+data+"\n\n").getBytes(StandardCharsets.UTF_8));}var status=agentRuns.owned(id,guest).getStatus();if(isStreamTerminal(status)){output.write(("event: run_status\ndata: {\"status\":\""+status.name()+"\",\"lastSequence\":"+cursor+"}\n\n").getBytes(StandardCharsets.UTF_8));output.flush();return;}if(batch.isEmpty())output.write(": heartbeat\n\n".getBytes(StandardCharsets.UTF_8));output.flush();try{Thread.sleep(1000);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();return;}}};}
 
   private boolean isStreamTerminal(AgentRunStatus status){return status==AgentRunStatus.COMPLETED||status==AgentRunStatus.WAITING_FOR_USER||status==AgentRunStatus.FAILED||status==AgentRunStatus.CANCELLED||status==AgentRunStatus.EXPIRED;}
+
+  @PostMapping("/{id}/interventions")
+  @Transactional
+  ResponseEntity<InterventionView> intervene(@PathVariable UUID id,@RequestHeader("Idempotency-Key") UUID key,@Valid @RequestBody InterventionBody body,HttpServletRequest request){
+    var guest=((GuestSession)request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();rateLimit.assertAgentRunAnswerAllowed(guest);
+    var intervention=agentRuns.submitIntervention(id,guest,key,body.content().trim());
+    conversations.appendRunIntervention(intervention.getConversationId(),guest,key,intervention.getContent());
+    return ResponseEntity.accepted().body(InterventionView.of(intervention));
+  }
 
   @PostMapping("/{id}/cancel")
   ResponseEntity<Void> cancel(@PathVariable UUID id,HttpServletRequest request){var guest=((GuestSession)request.getAttribute(GuestIdentityFilter.ATTRIBUTE)).getId();var run=agentRuns.cancel(id,guest);if(run.getConversationId()!=null)conversations.cancelRun(run.getConversationId(),guest,id);return ResponseEntity.noContent().build();}
@@ -106,6 +116,8 @@ public class AgentRunController {
   }
 
   record Selection(@NotBlank @Size(max = 120) String mention, @NotNull UUID mbid, @NotBlank @Size(max = 160) String name) {}
+  record InterventionBody(@NotBlank @Size(max=2000) String content) {}
+  record InterventionView(UUID id,long sequenceNumber,String status,java.time.Instant createdAt){static InterventionView of(AgentRunIntervention value){return new InterventionView(value.getId(),value.getSequenceNumber(),value.getStatus().name(),value.getCreatedAt());}}
 
   record EventView(long sequenceNumber, String type, String payloadJson, java.time.Instant createdAt) {
     static EventView of(AgentRunEvent event) {

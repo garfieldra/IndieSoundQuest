@@ -50,6 +50,10 @@ class SkillRegistry:
 
 tool_registry = ToolRegistry([
     ToolDefinition("search_web", "atomic", "从公开资料发现音乐线索", "PUBLIC_SOURCE", 15, True),
+    ToolDefinition("read_source", "atomic", "安全精读已发现的公开页面并提取正文证据", "PUBLIC_SOURCE_EXCERPT", 10, True),
+    ToolDefinition("research_musicbrainz", "atomic", "读取作品版本、创作署名及规范实体关系", "CATALOG_RELATIONSHIP_FACT", 35, True),
+    ToolDefinition("search_wikimedia", "atomic", "检索艺人、作品与音乐史背景的百科实体资料", "ENCYCLOPEDIA_CONTEXT", 15, True),
+    ToolDefinition("search_lastfm", "atomic", "读取相似艺人、相似歌曲及听众标签信号", "LISTENER_SIMILARITY_SIGNAL", 15, True),
     ToolDefinition("search_knowledge", "atomic", "检索本地歌曲主题与文化语境", "KNOWLEDGE_CARD", 10, True),
     ToolDefinition("verify_musicbrainz", "atomic", "核验歌曲和艺人的规范身份", "CATALOG_IDENTITY", 12, True),
     ToolDefinition("recommend_music", "composite", "从公开资料提取并核验普通歌曲与艺人推荐", "RECOMMENDATION", 180),
@@ -64,4 +68,10 @@ skill_registry = SkillRegistry([
     SkillDefinition("song_world_cup", "1.0", "用户要求淘汰赛，或需要高密度偏好信号", ("build_candidate_pool", "verify_musicbrainz", "analyze_tournament", "generate_tournament_report"), "世界杯启动卡、候选池或赛后报告卡"),
     SkillDefinition("open_music_exploration", "1.2", "用户希望直接探索、推荐或理解自己的音乐偏好", ("search_web", "search_knowledge", "verify_musicbrainz", "recommend_music", "generate_exploration_report", "record_recommendation_feedback"), "对话回答、公开资料卡、已核验推荐卡与探索报告"),
     SkillDefinition("taste_profile_review", "1.0", "用户希望复盘长期偏好或修正推荐方向", ("generate_exploration_report", "record_recommendation_feedback"), "长期偏好解释与可执行探索方向"),
+    SkillDefinition(
+        "deep_music_analysis", "1.0",
+        "用户要求解释、拆解或比较歌曲、专辑、版本、创作阶段及其音乐表达",
+        ("search_web", "read_source", "search_knowledge", "verify_musicbrainz", "research_musicbrainz", "search_wikimedia", "search_lastfm"),
+        "区分事实、作品观察、解释与听者推断的证据化长回答和分析来源卡",
+    ),
 ], tool_registry)

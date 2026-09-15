@@ -35,6 +35,11 @@ public class MusicCatalogInternalController {
     return Map.of("items", musicBrainz.resolveArtistCandidates(Optional.ofNullable(request.names()).orElseGet(List::of)));
   }
   record ArtistResolveRequest(List<String> names){}
+  @PostMapping("/music-catalog/musicbrainz/research") Map<String,Object> researchMusicBrainz(@RequestHeader("Authorization") String authorization,@RequestBody MusicBrainzResearchRequest request){
+    authorize(authorization);
+    return Map.of("items", musicBrainz.researchEntity(request.entityType(), request.query(), request.mbid(), request.artistName(), request.title()));
+  }
+  record MusicBrainzResearchRequest(String query,String entityType,String mbid,String artistName,String title){}
   @GetMapping("/tournaments/{tournamentId}/report-facts") @org.springframework.transaction.annotation.Transactional(readOnly=true) Map<String,Object> reportFacts(@RequestHeader("Authorization") String authorization,@RequestHeader("X-Guest-Session-Id") UUID guestSessionId,@PathVariable UUID tournamentId){
     if(!authorization.equals("Bearer "+token)) throw new org.springframework.web.server.ResponseStatusException(HttpStatus.UNAUTHORIZED); var tournament=tournaments.findByIdAndGuestSessionIdAndDeletedAtIsNull(tournamentId,guestSessionId).orElseThrow(()->new org.springframework.web.server.ResponseStatusException(HttpStatus.NOT_FOUND)); if(tournament.getStatus()!=TournamentStatus.COMPLETED) throw new org.springframework.web.server.ResponseStatusException(HttpStatus.CONFLICT,"tournament is not completed");
     var entryById=new HashMap<UUID,TournamentEntry>(); entries.findByTournamentId(tournamentId).forEach(entry->entryById.put(entry.getId(),entry));

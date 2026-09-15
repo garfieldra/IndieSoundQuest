@@ -39,6 +39,7 @@ class ConversationAgentRequest(ApiModel):
     recent_cards: list[dict] = Field(default_factory=list, max_length=6)
     confirmed_memories: list[str] = Field(default_factory=list, max_length=20)
     recent_feedback: list[str] = Field(default_factory=list, max_length=12)
+    active_interventions: list[str] = Field(default_factory=list, max_length=12)
     forced_action: str | None = Field(default=None, max_length=40)
     pool_size: Literal[16, 32] | None = None
     confirmed_artists: list["ConfirmedArtist"] = Field(default_factory=list, max_length=8)
@@ -64,7 +65,10 @@ class ConversationCardIntent(ApiModel):
 
 
 class ConversationAgentResult(ApiModel):
-    text: str = Field(min_length=1, max_length=2000)
+    # Deep music analysis may need several evidence-backed paragraphs.  The
+    # ordinary response prompt remains concise; this is a wire-contract ceiling,
+    # not a requirement to make every answer long.
+    text: str = Field(min_length=1, max_length=6000)
     card_intent: ConversationCardIntent | None = None
     action: str = Field(min_length=1, max_length=40)
     trace_summary: dict = Field(default_factory=dict)

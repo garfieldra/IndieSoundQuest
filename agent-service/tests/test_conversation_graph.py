@@ -1,4 +1,5 @@
 from uuid import uuid4
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ from app.conversation_graph import (
     _draft_named_artist_coverage,
     _explicit_artist_mentions,
     _fallback_preference_profile,
+    _next_analysis_query,
     _recommendation_search_queries,
     _select_evidence_backed_recording,
     _unique_artist_drafts,
@@ -20,6 +22,7 @@ from app.conversation_graph import (
 )
 from app.schemas import CandidateItem, CandidatePoolResult, ConversationAgentRequest
 from app.schemas import ConversationResumeRequest
+from app.music_analysis import EvidenceClaim, EvidenceClaimReview, MusicAnalysisDraft, MusicAnalysisPlan, MusicAnalysisReview, apply_claim_reviews, assess_analysis_evidence, classify_source_quality, deep_analysis_intent, inherited_analysis_sources, initial_analysis_workspace, sanitize_claims
 
 
 class FakeWeb:
@@ -30,6 +33,24 @@ class FakeWeb:
 class FakeKnowledge:
     async def search_verified(self, query: str, recording_ids: list[str]):
         return []
+
+
+class _FailingStructuredCall:
+    async def ainvoke(self, _prompt):
+        raise ValueError("provider rejected function calling")
+
+
+class FakePlainJsonFallbackModel:
+    def with_structured_output(self, _schema, **_kwargs):
+        return _FailingStructuredCall()
+
+    async def ainvoke(self, _prompt):
+        return SimpleNamespace(content='''```json
+        {"core_judgment":"这是一个足够具体、边界清晰并且已经通过本地结构校验的核心判断。",
+         "answer":"这是经过本地结构校验的深度分析正文。它不会因为 Provider 的函数调用兼容问题而丢失。" ,
+         "claims":[{"statement":"公开资料只支持当前这项有限结论，不能外推更多幕后事实。","claim_type":"INTERPRETATION","dimension":"证据边界","evidence_refs":[],"confidence":"low","boundary":"仅用于验证 JSON 回退。","status":"partial"}],
+         "uncertainties":[],"related_works":[]}
+        ```'''.replace("深度分析正文。", "深度分析正文。" * 30))
 
 
 def test_multi_artist_recommendation_builds_one_parallel_search_per_explicit_artist():
@@ -179,6 +200,47 @@ class FakeTournamentRouter:
         return ConversationDecision(action="propose_tournament", public_summary="错误地建议世界杯")
 
 
+class FakeUnavailableLastFmRouter:
+    def with_structured_output(self, _schema, **_kwargs):
+        return self
+
+    async def ainvoke(self, _prompt):
+        return ConversationDecision(
+            action="search_lastfm", public_summary="查找相似艺人",
+            artist_name="安溥", lastfm_mode="similar_artists",
+        )
+
+
+class FakeRepeatedMusicBrainzRouter:
+    def with_structured_output(self, _schema, **_kwargs):
+        return self
+
+    async def ainvoke(self, _prompt):
+        return ConversationDecision(
+            action="research_musicbrainz", public_summary="再次核对相同目录实体",
+            artist_name="张悬", track_title="宝贝", entity_type="recording",
+        )
+
+
+class FakePrematureAnalysisRouter:
+    def with_structured_output(self, _schema, **_kwargs):
+        return self
+
+    async def ainvoke(self, _prompt):
+        return ConversationDecision(action="analyze_music", public_summary="过早形成分析")
+
+
+class FakeUnderSpecifiedAnalysisPlanner:
+    def with_structured_output(self, _schema, **_kwargs):
+        return self
+
+    async def ainvoke(self, _prompt):
+        return MusicAnalysisPlan(
+            subject="错误的新主题", resolved_question="继续分析上一首作品",
+            selected_dimensions=["演唱表达"], open_questions=["还需要哪些证据？"],
+        )
+
+
 class FakeRevisionModel:
     def with_structured_output(self, _schema, **_kwargs):
         return self
@@ -201,6 +263,39 @@ class FakeRevisionCatalog:
             "status": "RESOLVED", "recordingId": str(uuid4()), "artistId": str(uuid4()),
             "title": "新的歌曲", "artistName": "新的艺人", "albumTitle": "新专辑", "coverUrl": "",
         }]
+
+
+class FakeDeepAnalysisAndReviewModel:
+    def __init__(self):
+        self.schema = None
+
+    def with_structured_output(self, schema, **_kwargs):
+        self.schema = schema
+        return self
+
+    async def ainvoke(self, _prompt):
+        if self.schema is MusicAnalysisDraft:
+            return MusicAnalysisDraft(
+                core_judgment="这首作品的亲密感来自克制的人声距离与编曲留白共同作用。",
+                answer="初稿通过公开访谈和作品资料区分事实与解释。" * 20,
+                claims=[EvidenceClaim(
+                    statement="公开资料记录了作品所属专辑与发行语境",
+                    claim_type="FACT", dimension="创作与专辑语境",
+                    evidence_refs=["S1"], confidence="high", status="supported",
+                )],
+            )
+        if self.schema is MusicAnalysisReview:
+            return MusicAnalysisReview(
+                revised_answer="审校后仅保留来源能够支持的发行语境，并将声音效果明确标为分析解释。" * 16,
+                items=[EvidenceClaimReview(
+                    claim_index=0, verdict="partial", supported_refs=["S1"],
+                    rationale="来源支持专辑归属，但没有完整覆盖所有创作语境",
+                    revised_statement="公开资料能够支持作品的专辑归属，但更具体的创作语境仍需补充",
+                    boundary="目前只核对到专辑归属。",
+                )],
+                review_summary="事实表述已按来源覆盖范围收窄。",
+            )
+        raise AssertionError(f"unexpected schema: {self.schema}")
 
 
 async def run(text: str, candidate_graph=None):
@@ -403,6 +498,44 @@ async def test_recommendation_retries_empty_research_when_model_wobbles_to_tourn
 
 
 @pytest.mark.asyncio
+async def test_unconfigured_lastfm_is_replanned_to_public_web_search():
+    runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge())
+    runtime.model = FakeUnavailableLastFmRouter()
+    request_id = uuid4()
+    request = ConversationAgentRequest(
+        requestId=request_id, agentRunId=request_id, conversationId=uuid4(), guestId="guest",
+        userMessage="找一些和安溥相似的艺人",
+    )
+    decision = await runtime.decide({
+        "request": request, "action_history": [], "web_sources": [], "knowledge": [], "iteration": 0,
+    })
+    assert decision.action == "search_web"
+    assert "未启用" in decision.public_summary
+
+
+@pytest.mark.asyncio
+async def test_musicbrainz_no_gain_loop_is_replanned_instead_of_repeated():
+    runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge(), catalog=FakeRecommendationCatalog())
+    runtime.model = FakeRepeatedMusicBrainzRouter()
+    request = _analysis_request("请分析张悬《宝贝》的制作人和发行背景。")
+    workspace = initial_analysis_workspace(request)
+    decision = await runtime.decide({
+        "request": request,
+        "action_history": [{"action": "research_musicbrainz"}],
+        "observations": [{"action": "research_musicbrainz", "newOutputCount": 0}],
+        "web_sources": [{"sourceUrl": "https://musicbrainz.org/recording/1"}],
+        "knowledge": [], "iteration": 2, "search_attempts": 1,
+        "analysis_workspace": workspace.model_dump(),
+        "evidence_coverage": {
+            "blocking_gaps": ["仍缺少创作背景来源"],
+            "suggested_queries": ["宝贝 创作背景 采访"],
+        },
+    })
+    assert decision.action == "search_web"
+    assert decision.query == "宝贝 创作背景 采访"
+
+
+@pytest.mark.asyncio
 async def test_short_followup_uses_persisted_recommendation_context_and_researches_again():
     runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge())
     runtime.model = FakeRespondingRouter()
@@ -476,3 +609,281 @@ async def test_explicit_start_honors_16_song_request_size():
     assert result.action == "build_candidate_pool"
     assert result.card_intent is not None
     assert result.card_intent.payload["size"] == 16
+
+
+def _analysis_request(text: str, recent_cards: list[dict] | None = None) -> ConversationAgentRequest:
+    request_id = uuid4()
+    return ConversationAgentRequest(
+        requestId=request_id, agentRunId=request_id, conversationId=uuid4(), guestId="guest",
+        userMessage=text, recentCards=recent_cards or [],
+    )
+
+
+def test_deep_analysis_selects_only_question_relevant_dimensions():
+    request = _analysis_request("为什么张悬《宝贝》听起来很亲密？请从演唱和编曲留白具体分析。")
+    workspace = initial_analysis_workspace(request)
+    assert deep_analysis_intent(request) is True
+    assert workspace.subject == "宝贝"
+    assert "演唱表达" in workspace.selected_dimensions
+    assert "编曲与音色" in workspace.selected_dimensions
+    assert "节奏与律动" not in workspace.selected_dimensions
+
+
+def test_preference_report_request_does_not_load_deep_analysis_skill():
+    request = _analysis_request("请分析一下我的音乐偏好，并生成一份探索报告。")
+    assert deep_analysis_intent(request) is False
+
+
+def test_terse_followup_continues_persisted_music_analysis_context():
+    request = _analysis_request("具体体现在哪里？", [{
+        "messageId": str(uuid4()), "messageType": "RECOMMENDATION_CARD", "cardType": "MUSIC_ANALYSIS",
+        "payload": {"coreJudgment": "人声距离感是亲密感的重要来源", "selectedDimensions": ["演唱表达"]},
+    }])
+    assert deep_analysis_intent(request) is True
+
+
+def test_followup_inherits_subject_claims_sources_and_revision_from_analysis_card():
+    previous_id = str(uuid4())
+    request = _analysis_request("重点展开演唱距离感，依据是什么？", [{
+        "messageId": previous_id, "messageType": "RECOMMENDATION_CARD", "cardType": "MUSIC_ANALYSIS",
+        "payload": {
+            "subject": "张悬《宝贝》", "question": "为什么《宝贝》听起来亲密？",
+            "coreJudgment": "亲密感来自克制的人声距离与编曲留白。",
+            "selectedDimensions": ["编曲与音色"], "workspaceRevision": 4,
+            "claims": [{
+                "statement": "人声距离与留白共同构成较私密的听觉关系。",
+                "claimType": "INTERPRETATION", "dimension": "编曲与音色",
+                "evidenceRefs": ["S1"], "confidence": "medium", "status": "partial",
+            }],
+            "sources": [{
+                "ref": "S1", "title": "公开访谈", "url": "https://example.com/interview",
+                "summary": "访谈讨论了这首作品的录音与表达。", "provider": "bocha",
+            }],
+        },
+    }])
+    workspace = initial_analysis_workspace(request)
+    assert workspace.subject == "张悬《宝贝》"
+    assert workspace.revision == 5
+    assert workspace.working_thesis.startswith("亲密感")
+    assert workspace.claims[0].evidence_refs == ["S1"]
+    assert "本轮追问" in workspace.question
+    assert workspace.selected_dimensions == ["演唱表达"]
+    sources = inherited_analysis_sources(request)
+    assert sources[0]["sourceUrl"] == "https://example.com/interview"
+    assert sources[0]["inheritedFromAnalysisCard"] is True
+
+
+def test_analysis_gap_query_skips_queries_already_attempted():
+    request = _analysis_request("创作背景还有哪些可靠依据？")
+    state = {
+        "analysis_workspace": {"subject": "张悬《宝贝》", "open_questions": ["制作人如何描述录音过程？"]},
+        "evidence_coverage": {"suggested_queries": ["宝贝 创作背景 采访", "宝贝 制作人 credits"]},
+        "analysis_queries": ["宝贝 创作背景 采访"],
+    }
+    assert _next_analysis_query(state, request) == "宝贝 制作人 credits"
+
+
+@pytest.mark.asyncio
+async def test_model_workspace_revision_cannot_drop_explicit_followup_dimensions_or_subject():
+    request = _analysis_request("继续比较录音室版和现场版。", [{
+        "messageId": str(uuid4()), "messageType": "RECOMMENDATION_CARD", "cardType": "MUSIC_ANALYSIS",
+        "payload": {"subject": "张悬《宝贝》", "selectedDimensions": ["编曲与音色"], "workspaceRevision": 2},
+    }])
+    runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge())
+    runtime.model = FakeUnderSpecifiedAnalysisPlanner()
+    workspace = await runtime.plan_analysis_workspace(request)
+    assert workspace.subject == "张悬《宝贝》"
+    assert "横向比较" in workspace.selected_dimensions
+    assert "版本与身份" in workspace.selected_dimensions
+
+
+def test_fact_claim_without_known_source_is_demoted_instead_of_presented_as_fact():
+    claim = EvidenceClaim(
+        statement="这首歌在某年由某位制作人完成录音",
+        claim_type="FACT", dimension="创作与专辑语境", evidence_refs=["S99"], confidence="high",
+        status="supported",
+    )
+    sanitized = sanitize_claims([claim], {"S1"})[0]
+    assert sanitized.evidence_refs == []
+    assert sanitized.status == "unsupported"
+    assert sanitized.confidence == "low"
+    assert sanitized.boundary
+
+
+def test_source_quality_distinguishes_catalog_full_page_and_search_snippet():
+    catalog = classify_source_quality({"sourceUrl": "https://musicbrainz.org/recording/1"})
+    full_page = classify_source_quality({
+        "sourceUrl": "https://example.com/interview", "sourceTitle": "制作人专访",
+        "pageExcerpt": "这是一段足够长的制作与录音访谈正文。" * 12,
+    })
+    snippet = classify_source_quality({"sourceUrl": "https://example.net/result", "summary": "简短摘要"})
+    assert catalog["tier"] == "A"
+    assert full_page["tier"] == "B"
+    assert snippet["tier"] == "D"
+
+
+def test_semantic_claim_review_rejects_unknown_refs_and_caps_weak_source_confidence():
+    claims = [EvidenceClaim(
+        statement="公开采访明确说明了这首歌的录音安排",
+        claim_type="FACT", dimension="制作与空间", evidence_refs=["S1"], confidence="high", status="supported",
+    )]
+    unsupported, meta = apply_claim_reviews(
+        claims,
+        [EvidenceClaimReview(
+            claim_index=0, verdict="supported", supported_refs=["S99"],
+            rationale="给出的引用不存在，不能支持事实",
+        )],
+        {"S1"}, {"S1": {"score": 0.38}},
+    )
+    assert unsupported[0].status == "unsupported"
+    assert unsupported[0].confidence == "low"
+    assert unsupported[0].evidence_refs == []
+    assert meta["semanticReviewApplied"] is True
+
+    supported, _ = apply_claim_reviews(
+        claims,
+        [EvidenceClaimReview(
+            claim_index=0, verdict="supported", supported_refs=["S1"],
+            rationale="摘要可以部分核对录音安排",
+        )],
+        {"S1"}, {"S1": {"score": 0.38}},
+    )
+    assert supported[0].status == "supported"
+    assert supported[0].confidence == "medium"
+
+
+def test_creation_background_requires_full_text_and_independent_source_coverage():
+    request = _analysis_request("请深入分析张悬《宝贝》的创作背景、制作过程和编曲表达。")
+    workspace = initial_analysis_workspace(request)
+    shallow = assess_analysis_evidence(workspace, [{
+        "sourceUrl": "https://example.com/a", "sourceTitle": "宝贝创作背景",
+        "summary": "这是一篇关于专辑与创作背景的简短搜索摘要。",
+    }])
+    assert shallow.requires_full_text is True
+    assert shallow.ready_for_fact_heavy_answer is False
+    assert shallow.full_text_source_count == 0
+    deep = assess_analysis_evidence(workspace, [
+        {"sourceUrl": "https://example.com/a", "sourceTitle": "制作访谈", "summary": "创作与制作",
+         "pageExcerpt": "制作人和歌手在采访中讨论了歌曲的创作、录音、编曲与人声表达。" * 8},
+        {"sourceUrl": "https://artist.example.org/b", "sourceTitle": "专辑资料", "summary": "专辑发行与词曲资料"},
+    ])
+    assert deep.full_text_source_count == 1
+    assert deep.independent_domain_count == 2
+    assert deep.ready_for_fact_heavy_answer is True
+
+
+@pytest.mark.asyncio
+async def test_fact_heavy_analysis_cannot_skip_available_source_reading():
+    runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge())
+    runtime.model = FakePrematureAnalysisRouter()
+    request = _analysis_request("请深入分析张悬《宝贝》的创作背景和制作过程。")
+    decision = await runtime.decide({
+        "request": request,
+        "action_history": [{"action": "search_web"}],
+        "web_sources": [{"sourceUrl": "https://example.com/a", "sourceTitle": "创作背景", "summary": "简短摘要"}],
+        "knowledge": [], "iteration": 1, "search_attempts": 1,
+        "analysis_workspace": initial_analysis_workspace(request).model_dump(),
+        "evidence_coverage": {
+            "blocking_gaps": ["尚未精读能够支持创作或制作事实的原始页面"],
+            "suggested_queries": ["宝贝 创作背景 采访"],
+        },
+        "read_source_refs": [],
+    })
+    assert decision.action == "read_source"
+    assert decision.source_ref == "S1"
+
+
+@pytest.mark.asyncio
+async def test_deep_music_question_researches_then_returns_persistable_analysis_card():
+    result = await run("为什么张悬《宝贝》听起来很亲密？请具体分析演唱距离感和编曲留白。")
+    assert result is not None
+    assert result.action == "analyze_music"
+    assert result.card_intent is not None
+    assert result.card_intent.card_type == "MUSIC_ANALYSIS"
+    assert result.card_intent.payload["sources"][0]["url"] == "https://example.com/music"
+    assert "演唱表达" in result.card_intent.payload["selectedDimensions"]
+    assert result.trace_summary["skill"] == "deep_music_analysis"
+    assert result.trace_summary["webSourceCount"] == 1
+
+
+@pytest.mark.asyncio
+async def test_analysis_uses_same_model_for_conditional_semantic_claim_review():
+    runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge())
+    runtime.model = FakeDeepAnalysisAndReviewModel()
+    request = _analysis_request("请深入分析《测试歌曲》的创作背景和演唱表达。")
+    workspace = initial_analysis_workspace(request)
+    result = await runtime.analyze_music({
+        "request": request, "analysis_workspace": workspace.model_dump(),
+        "web_sources": [{
+            "sourceUrl": "https://musicbrainz.org/recording/test", "sourceTitle": "作品资料",
+            "summary": "作品所属专辑与发行资料",
+            "pageExcerpt": "公开资料记录了作品所属专辑与发行语境。" * 10,
+        }],
+        "knowledge": [], "action_history": [{"action": "search_web"}, {"action": "read_source"}],
+        "evidence_coverage": {"requires_full_text": True, "full_text_source_count": 1},
+    })
+    assert result.trace_summary["semanticReviewApplied"] is True
+    assert result.card_intent is not None
+    assert result.card_intent.payload["claimReview"]["reviewedClaimCount"] == 1
+    assert result.card_intent.payload["claims"][0]["status"] == "partial"
+    assert "审校后" in result.text
+
+
+@pytest.mark.asyncio
+async def test_validated_invocation_falls_back_to_plain_json_for_provider_compatibility():
+    runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge())
+    runtime.model = FakePlainJsonFallbackModel()
+    draft = await runtime._invoke_validated(MusicAnalysisDraft, "生成分析")
+    assert isinstance(draft, MusicAnalysisDraft)
+    assert draft.claims[0].claim_type == "INTERPRETATION"
+
+
+@pytest.mark.asyncio
+async def test_runtime_intervention_is_applied_before_next_supervisor_decision():
+    runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge())
+    runtime.model = None
+    request_id = uuid4()
+    request = ConversationAgentRequest(
+        requestId=request_id, agentRunId=request_id, conversationId=uuid4(), guestId="guest",
+        userMessage="请介绍一下安溥的音乐。",
+    )
+    calls = []
+
+    async def provider(after_sequence: int):
+        calls.append(after_sequence)
+        return [{"sequenceNumber": 1, "type": "ADJUST_DIRECTION", "content": "重点谈创作背景，不要推荐歌曲。"}] if after_sequence < 1 else []
+
+    final_state = {}
+    async for value in runtime.graph.astream(
+        {"request": request},
+        {"configurable": {"thread_id": str(request_id), "intervention_provider": provider}, "recursion_limit": 24},
+        stream_mode="values",
+    ):
+        final_state = value
+    assert final_state["request"].active_interventions == ["重点谈创作背景，不要推荐歌曲。"]
+    assert final_state["applied_intervention_sequence"] == 1
+    assert any(item["action"] == "adjust_direction" for item in final_state["action_history"])
+    assert final_state["result"].trace_summary["appliedInterventionSequence"] == 1
+    assert calls[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_intervention_mailbox_failure_is_not_silently_ignored():
+    runtime = ConversationReActRuntime(FakeWeb(), FakeKnowledge())
+    runtime.model = None
+    request_id = uuid4()
+    request = ConversationAgentRequest(
+        requestId=request_id, agentRunId=request_id, conversationId=uuid4(), guestId="guest",
+        userMessage="请介绍一下安溥的音乐。",
+    )
+
+    async def unavailable_provider(_after_sequence: int):
+        raise RuntimeError("mailbox unavailable")
+
+    with pytest.raises(RuntimeError, match="mailbox unavailable"):
+        async for _ in runtime.graph.astream(
+            {"request": request},
+            {"configurable": {"thread_id": str(request_id), "intervention_provider": unavailable_provider}},
+            stream_mode="values",
+        ):
+            pass

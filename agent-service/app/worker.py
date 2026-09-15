@@ -10,6 +10,7 @@ from .main import conversation_runtime, graph, report_graph, _plan_event, _ACTIO
 from .report_schemas import TournamentReportRequest
 from .schemas import ConversationAgentRequest, CandidatePoolRequest
 from .settings import settings
+from .public_stream import public_commentary as _public_commentary, response_chunks as _response_chunks
 
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 JAVA = settings.java_internal_base_url.rstrip("/")
@@ -21,6 +22,9 @@ _PUBLIC_TOOLS = {
     "search_catalog": ("规范歌曲目录", "tool"),
     "expand_artist_catalog": ("艺人作品扩展", "tool"),
     "search_web": ("网络音乐搜索", "tool"),
+    "research_musicbrainz": ("MusicBrainz 作品关系研究", "tool"),
+    "search_wikimedia": ("Wikimedia 百科研究", "tool"),
+    "search_lastfm": ("Last.fm 相似关系发现", "tool"),
     "search_domestic_content": ("中文内容检索", "tool"),
     "search_spotify": ("流媒体目录检索", "tool"),
     "search_knowledge": ("Milvus 主题知识库", "tool"),
@@ -64,6 +68,21 @@ async def callback(client, run_id, path, lease, payload=None):
     response = await client.post(f"{JAVA}/internal/v1/agent-runs/{run_id}/{path}", headers=headers, json=payload or {})
     response.raise_for_status()
 
+async def stream_public_response(client, run_id: str, lease: str, text: str) -> None:
+    chunks = _response_chunks(text)
+    if not chunks:
+        return
+    await callback(client, run_id, "events", lease, {
+        "type": "response_started",
+        "payloadJson": json.dumps({"phase": "response", "status": "started", "message": "正在组织最终回答"}, ensure_ascii=False),
+    })
+    for index, chunk in enumerate(chunks):
+        await callback(client, run_id, "events", lease, {
+            "type": "response_delta",
+            "payloadJson": json.dumps({"phase": "response", "index": index, "delta": chunk}, ensure_ascii=False),
+        })
+        await asyncio.sleep(0.025)
+
 async def execute(message: aio_pika.IncomingMessage):
     lease = None
     attempt_no = 0
@@ -101,6 +120,23 @@ async def execute(message: aio_pika.IncomingMessage):
                     await callback(client, run_id, "report-started", lease, {"reportId": str(request.report_id)})
                 else:
                     raise ValueError(f"unsupported runType: {run_type}")
+                if run_type in {"CONVERSATION", "EXPLORATION_REPORT"}:
+                    async def intervention_provider(after_sequence: int):
+                        response = await client.post(
+                            f"{JAVA}/internal/v1/agent-runs/{run_id}/interventions",
+                            headers={**HEADERS, "X-Lease-Token": lease},
+                            json={"afterSequence": int(after_sequence or 0)},
+                        )
+                        response.raise_for_status()
+                        items = list(response.json().get("items") or [])
+                        if items:
+                            through = max(int(item.get("sequenceNumber", 0)) for item in items)
+                            await callback(
+                                client, run_id, "interventions/applied", lease,
+                                {"throughSequence": through},
+                            )
+                        return items
+                    config["configurable"]["intervention_provider"] = intervention_provider
                 result = None; last_action = None; last_plan = None; state = {}; observation_count = 0; tool_record_count = 0
                 async for state in runtime_graph.astream({"request": request}, config, stream_mode="values"):
                     action = state.get("decision").action if state.get("decision") else None
@@ -121,6 +157,7 @@ async def execute(message: aio_pika.IncomingMessage):
                         observation = next((item for item in reversed(observations[observation_count:]) if item.get("action") == action), None)
                         tool = _tool_payload(run_id, action or str(_record_value(new_records[-1], "name", "tool")), tool_status, record={"duration_ms": duration_ms}, observation=observation)
                         await callback(client, run_id, "events", lease, {"type":f"tool_{tool_status}","payloadJson":json.dumps(tool,ensure_ascii=False)})
+                        await callback(client, run_id, "events", lease, {"type":"commentary","payloadJson":json.dumps(_public_commentary(run_id, action or str(_record_value(new_records[-1], "name", "tool")), observation),ensure_ascii=False)})
                         tool_record_count = len(records); completed_now = True
                     elif len(observations) > observation_count:
                         for observation in observations[observation_count:]:
@@ -129,6 +166,7 @@ async def execute(message: aio_pika.IncomingMessage):
                             tool_status = "completed" if observation.get("status") == "success" else "degraded"
                             tool = _tool_payload(run_id, observed_action, tool_status, observation=observation)
                             await callback(client, run_id, "events", lease, {"type":f"tool_{tool_status}","payloadJson":json.dumps(tool,ensure_ascii=False)})
+                            await callback(client, run_id, "events", lease, {"type":"commentary","payloadJson":json.dumps(_public_commentary(run_id, observed_action, observation),ensure_ascii=False)})
                         completed_now = True
                     observation_count = len(observations)
                     if state.get("result"): result = state["result"]
@@ -145,6 +183,7 @@ async def execute(message: aio_pika.IncomingMessage):
                 dumped=result.model_dump(by_alias=True, mode="json")
                 if run_type in {"CONVERSATION", "EXPLORATION_REPORT"}:
                     card=dumped.get("cardIntent")
+                    await stream_public_response(client, run_id, lease, dumped["text"])
                     if card and card.get("messageType") == "CLARIFICATION_CARD":
                         resume_kind = "ARTIST_IDENTITY" if card.get("cardType") == "ARTIST_IDENTITY" else "GENERAL_CLARIFICATION"
                         snapshot = {
@@ -157,7 +196,7 @@ async def execute(message: aio_pika.IncomingMessage):
                     else:
                         dumped["memorySummary"] = await conversation_runtime.build_memory_summary(request, result)
                         dumped["memorySummaryThroughSequence"] = result.memory_summary_through_sequence
-                        await callback(client,run_id,"complete",lease,{"conversationId":str(request.conversation_id),"text":dumped["text"],"card":card,"memorySummary":dumped["memorySummary"],"memorySummaryThroughSequence":dumped.get("memorySummaryThroughSequence")})
+                        await callback(client,run_id,"complete",lease,{"conversationId":str(request.conversation_id),"text":dumped["text"],"card":card,"traceSummary":dumped.get("traceSummary") or {},"memorySummary":dumped["memorySummary"],"memorySummaryThroughSequence":dumped.get("memorySummaryThroughSequence")})
                 elif run_type=="CANDIDATE_POOL":
                     await callback(client,run_id,"complete-candidate",lease,{"size":request.size,"seedArtistIds":[str(x) for x in request.seed_artist_ids],"resultJson":json.dumps(dumped,ensure_ascii=False)})
                 else:

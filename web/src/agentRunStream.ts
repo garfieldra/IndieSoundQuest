@@ -7,12 +7,14 @@ type Callbacks = {
   onProgress?: (value: AgentRunProgress) => void
   onPlan?: (value: AgentRunPlan) => void
   onEvent?: (event: AgentRunEvent) => void
+  onResponseStarted?: () => void
+  onResponseDelta?: (delta: string, accumulated: string) => void
 }
 
 const terminal = new Set(['COMPLETED', 'WAITING_FOR_USER', 'FAILED', 'CANCELLED', 'EXPIRED'])
 
 export function publicProgress(event: AgentRunEvent, data: Record<string, unknown>): AgentRunProgress | null {
-  if (!['PROGRESS', 'RETRY', 'TOOL_STARTED', 'TOOL_COMPLETED', 'TOOL_DEGRADED', 'CANCELLED'].includes(event.type)) return null
+  if (!['PROGRESS', 'COMMENTARY', 'RETRY', 'TOOL_STARTED', 'TOOL_COMPLETED', 'TOOL_DEGRADED', 'INTERVENTION_ACCEPTED', 'INTERVENTION_APPLIED', 'CANCELLED'].includes(event.type)) return null
   return {
     phase: String(data.phase || data.toolKey || event.type.toLowerCase()),
     status: String(data.status || '').trim() || undefined,
@@ -23,6 +25,12 @@ export function publicProgress(event: AgentRunEvent, data: Record<string, unknow
     kind: data.kind ? String(data.kind) : undefined,
     metrics: typeof data.metrics === 'object' && data.metrics ? data.metrics as Record<string, number> : undefined,
   }
+}
+
+export function projectResponseStream(current: string, event: AgentRunEvent, data: Record<string, unknown>): string | null {
+  if (event.type === 'RESPONSE_STARTED') return ''
+  if (event.type !== 'RESPONSE_DELTA') return null
+  return current + (typeof data.delta === 'string' ? data.delta : '')
 }
 
 export function progressMetricsText(value: AgentRunProgress): string {
@@ -44,6 +52,7 @@ export function followAgentRun<T>(runId: string, callbacks: Callbacks = {}, time
   let settled = false
   let reconnects = 0
   let result: T | undefined
+  let responseText = ''
   let timeout: number | undefined
 
   return new Promise((resolve, reject) => {
@@ -63,6 +72,12 @@ export function followAgentRun<T>(runId: string, callbacks: Callbacks = {}, time
       const progress = publicProgress(event, data)
       if (progress) callbacks.onProgress?.(progress)
       if (event.type === 'PLAN_UPDATED') callbacks.onPlan?.(data as unknown as AgentRunPlan)
+      if (event.type === 'RESPONSE_STARTED') { responseText = ''; callbacks.onResponseStarted?.() }
+      if (event.type === 'RESPONSE_DELTA') {
+        const delta = typeof data.delta === 'string' ? data.delta : ''
+        responseText += delta
+        callbacks.onResponseDelta?.(delta, responseText)
+      }
       if (event.type === 'RESULT') result = data as T
       if (event.type === 'FAILED') finish(undefined, new Error(String(data.message || 'Agent 任务失败')))
     }

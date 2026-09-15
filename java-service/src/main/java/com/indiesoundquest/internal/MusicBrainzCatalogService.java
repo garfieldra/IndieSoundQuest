@@ -128,6 +128,255 @@ public class MusicBrainzCatalogService {
   }
 
   /**
+   * Read-only research projection for the Agent evidence ledger. It deliberately
+   * returns a bounded, normalized subset instead of forwarding an unbounded
+   * MusicBrainz document or allowing arbitrary include parameters.
+   */
+  public List<Map<String, Object>> researchEntity(
+      String rawType, String rawQuery, String rawMbid, String rawArtistName, String rawTitle) {
+    var type = Optional.ofNullable(rawType).orElse("recording").trim().toLowerCase(Locale.ROOT);
+    if (!Set.of("artist", "recording", "release-group", "work").contains(type)) {
+      return List.of();
+    }
+    try {
+      String mbid = Optional.ofNullable(rawMbid).map(String::trim).filter(value -> !value.isBlank()).orElse(null);
+      if (mbid != null) {
+        UUID.fromString(mbid);
+      } else {
+        var query = Optional.ofNullable(rawQuery).map(String::trim).filter(value -> !value.isBlank()).orElse(null);
+        if (query == null) return List.of();
+        var artistName = Optional.ofNullable(rawArtistName).map(String::trim).filter(value -> !value.isBlank()).orElse(null);
+        var title = Optional.ofNullable(rawTitle).map(String::trim).filter(value -> !value.isBlank()).orElse(null);
+        var luceneQuery = researchLuceneQuery(type, query, artistName, title);
+        var searchUri = URI.create(baseUrl + "/" + type + "?fmt=json&limit=5&query="
+            + URLEncoder.encode(luceneQuery, StandardCharsets.UTF_8));
+        var searchResponse = send(searchUri);
+        if (searchResponse.statusCode() != 200) return List.of();
+        var candidates = objectMapper.readTree(searchResponse.body()).path(entityCollectionKey(type));
+        if (!candidates.isArray() || candidates.isEmpty()) return List.of();
+        var top = candidates.get(0);
+        var topScore = top.path("score").asInt(0);
+        var runnerScore = candidates.size() > 1 ? candidates.get(1).path("score").asInt(0) : 0;
+        if (topScore < 80 || (runnerScore >= topScore - 3
+            && !normalize(entityDisplayName(top)).equals(normalize(entityDisplayName(candidates.get(1)))))) {
+          return List.of(ambiguousResearchItem(type, query, candidates));
+        }
+        if (!matchesResearchContract(type, top, artistName, title)) return List.of();
+        mbid = text(top, "id");
+        if (mbid == null) return List.of();
+      }
+      var lookupUri = URI.create(baseUrl + "/" + type + "/" + mbid + "?fmt=json&inc=" + researchIncludes(type));
+      var lookupResponse = send(lookupUri);
+      if (lookupResponse.statusCode() != 200) return List.of();
+      return List.of(projectResearchEntity(type, objectMapper.readTree(lookupResponse.body())));
+    } catch (IllegalArgumentException exception) {
+      return List.of();
+    } catch (InterruptedException exception) {
+      Thread.currentThread().interrupt();
+      return List.of();
+    } catch (Exception exception) {
+      return List.of();
+    }
+  }
+
+  static String researchLuceneQuery(String type, String fallback, String artistName, String title) {
+    var clauses = new ArrayList<String>();
+    if (title != null) {
+      var titleField = switch (type) {
+        case "recording" -> "recording";
+        case "release-group" -> "releasegroup";
+        case "work" -> "work";
+        default -> "artist";
+      };
+      clauses.add(titleField + ":\"" + escapeLucene(title) + "\"");
+    }
+    if (artistName != null) {
+      clauses.add(type.equals("artist")
+          ? "(artist:\"" + escapeLucene(artistName) + "\" OR alias:\"" + escapeLucene(artistName) + "\")"
+          : "artist:\"" + escapeLucene(artistName) + "\"");
+    }
+    return clauses.isEmpty() ? fallback : String.join(" AND ", clauses);
+  }
+
+  static boolean matchesResearchContract(String type, JsonNode candidate, String artistName, String title) {
+    if (title != null && !normalize(title).equals(normalize(entityDisplayName(candidate)))) return false;
+    if (artistName == null) return true;
+    if (type.equals("artist")) {
+      if (normalize(artistName).equals(normalize(entityDisplayName(candidate)))) return true;
+      for (var alias : candidate.path("aliases")) {
+        if (normalize(artistName).equals(normalize(Optional.ofNullable(text(alias, "name")).orElse("")))) return true;
+      }
+      return false;
+    }
+    for (var credit : candidate.path("artist-credit")) {
+      var credited = Optional.ofNullable(text(credit, "name")).orElse(text(credit.path("artist"), "name"));
+      if (credited != null && normalize(artistName).equals(normalize(credited))) return true;
+    }
+    return false;
+  }
+
+  private Map<String, Object> projectResearchEntity(String type, JsonNode node) throws Exception {
+    var id = Optional.ofNullable(text(node, "id")).orElse("");
+    var name = entityDisplayName(node);
+    var facts = new LinkedHashMap<String, Object>();
+    facts.put("entityType", type);
+    facts.put("mbid", id);
+    facts.put("name", name);
+    putText(facts, "disambiguation", node, "disambiguation");
+    putText(facts, "firstReleaseDate", node, "first-release-date");
+    facts.put("aliases", compactTextValues(node.path("aliases"), "name", 12));
+    facts.put("genres", compactTextValues(node.path("genres"), "name", 12));
+    facts.put("tags", compactTextValues(node.path("tags"), "name", 12));
+    facts.put("isrcs", compactScalarValues(node.path("isrcs"), 12));
+    facts.put("artistCredits", compactArtistCredits(node.path("artist-credit")));
+    facts.put("releases", compactEntities(node.path("releases"), 10));
+    facts.put("relationships", compactRelations(node.path("relations"), 30));
+    var sourceUrl = "https://musicbrainz.org/" + type + "/" + id;
+    return Map.of(
+        "kind", "musicbrainz_relationship_source",
+        "sourceUrl", sourceUrl,
+        "sourceTitle", name + " · MusicBrainz " + type,
+        "summary", objectMapper.writeValueAsString(facts),
+        "queryPurpose", "music_identity_credits_versions",
+        "searchProvider", "musicbrainz",
+        "evidenceKind", "CATALOG_RELATIONSHIP_FACT",
+        "entityType", type,
+        "musicbrainzMbid", id,
+        "ambiguous", false);
+  }
+
+  private Map<String, Object> ambiguousResearchItem(String type, String query, JsonNode candidates) {
+    var options = new ArrayList<Map<String, Object>>();
+    for (var candidate : candidates) {
+      var id = text(candidate, "id");
+      if (id == null) continue;
+      options.add(Map.of(
+          "mbid", id,
+          "name", entityDisplayName(candidate),
+          "score", candidate.path("score").asInt(0),
+          "disambiguation", Optional.ofNullable(text(candidate, "disambiguation")).orElse("")));
+      if (options.size() >= 5) break;
+    }
+    return Map.of(
+        "kind", "musicbrainz_ambiguity_source",
+        "sourceUrl", "https://musicbrainz.org/search?query=" + URLEncoder.encode(query, StandardCharsets.UTF_8)
+            + "&type=" + URLEncoder.encode(type, StandardCharsets.UTF_8),
+        "sourceTitle", query + " · MusicBrainz 候选身份",
+        "summary", "存在多个接近的规范实体，需要结合艺人、版本或发行信息确认：" + options,
+        "queryPurpose", "entity_disambiguation",
+        "searchProvider", "musicbrainz",
+        "evidenceKind", "CATALOG_AMBIGUITY",
+        "entityType", type,
+        "ambiguous", true,
+        "candidates", options);
+  }
+
+  private static String researchIncludes(String type) {
+    return switch (type) {
+      case "artist" -> "aliases%2Bgenres%2Btags%2Bartist-rels%2Brecording-rels%2Brelease-group-rels%2Burl-rels";
+      case "recording" -> "artist-credits%2Breleases%2Bisrcs%2Bgenres%2Btags%2Bwork-rels%2Bartist-rels%2Brelease-rels%2Burl-rels%2Bwork-level-rels";
+      case "release-group" -> "artist-credits%2Breleases%2Bgenres%2Btags%2Bartist-rels%2Brelease-rels%2Burl-rels";
+      case "work" -> "aliases%2Bgenres%2Btags%2Bartist-rels%2Brecording-rels%2Bwork-rels%2Burl-rels";
+      default -> "aliases";
+    };
+  }
+
+  private static String entityCollectionKey(String type) {
+    return switch (type) {
+      case "artist" -> "artists";
+      case "recording" -> "recordings";
+      case "release-group" -> "release-groups";
+      case "work" -> "works";
+      default -> "recordings";
+    };
+  }
+
+  private static String entityDisplayName(JsonNode node) {
+    return Optional.ofNullable(text(node, "title"))
+        .orElse(Optional.ofNullable(text(node, "name")).orElse("未命名音乐实体"));
+  }
+
+  private static void putText(Map<String, Object> target, String key, JsonNode node, String field) {
+    var value = text(node, field);
+    if (value != null) target.put(key, value);
+  }
+
+  private static List<String> compactTextValues(JsonNode values, String field, int limit) {
+    var result = new ArrayList<String>();
+    if (!values.isArray()) return result;
+    for (var value : values) {
+      var item = text(value, field);
+      if (item != null && !result.contains(item)) result.add(item);
+      if (result.size() >= limit) break;
+    }
+    return result;
+  }
+
+  private static List<String> compactScalarValues(JsonNode values, int limit) {
+    var result = new ArrayList<String>();
+    if (!values.isArray()) return result;
+    for (var value : values) {
+      if (!value.asText().isBlank()) result.add(value.asText());
+      if (result.size() >= limit) break;
+    }
+    return result;
+  }
+
+  private static List<String> compactArtistCredits(JsonNode values) {
+    var result = new ArrayList<String>();
+    if (!values.isArray()) return result;
+    for (var value : values) {
+      var name = Optional.ofNullable(text(value, "name")).orElse(text(value.path("artist"), "name"));
+      if (name != null) result.add(name);
+      if (result.size() >= 12) break;
+    }
+    return result;
+  }
+
+  private static List<Map<String, String>> compactEntities(JsonNode values, int limit) {
+    var result = new ArrayList<Map<String, String>>();
+    if (!values.isArray()) return result;
+    for (var value : values) {
+      var entity = new LinkedHashMap<String, String>();
+      var id = text(value, "id");
+      var name = entityDisplayName(value);
+      if (id != null) entity.put("mbid", id);
+      entity.put("name", name);
+      var date = text(value, "date");
+      if (date != null) entity.put("date", date);
+      var country = text(value, "country");
+      if (country != null) entity.put("country", country);
+      result.add(entity);
+      if (result.size() >= limit) break;
+    }
+    return result;
+  }
+
+  private static List<Map<String, Object>> compactRelations(JsonNode values, int limit) {
+    var result = new ArrayList<Map<String, Object>>();
+    if (!values.isArray()) return result;
+    var targetFields = List.of("artist", "work", "recording", "release", "release-group", "url", "label", "place", "event");
+    for (var value : values) {
+      var relation = new LinkedHashMap<String, Object>();
+      putText(relation, "type", value, "type");
+      putText(relation, "direction", value, "direction");
+      relation.put("attributes", compactScalarValues(value.path("attributes"), 8));
+      for (var field : targetFields) {
+        var target = value.path(field);
+        if (target.isMissingNode() || target.isNull()) continue;
+        relation.put("targetType", field);
+        relation.put("targetId", Optional.ofNullable(text(target, "id")).orElse(""));
+        relation.put("targetName", "url".equals(field)
+            ? Optional.ofNullable(text(target, "resource")).orElse("") : entityDisplayName(target));
+        break;
+      }
+      if (!relation.isEmpty()) result.add(relation);
+      if (result.size() >= limit) break;
+    }
+    return result;
+  }
+
+  /**
    * Retrieves canonical recordings directly from MusicBrainz for already-resolved artists.
    * This avoids turning a 32-song pool into dozens of sequential title lookups while keeping
    * MusicBrainz as the sole identity authority.

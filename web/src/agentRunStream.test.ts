@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { progressMetricsText, publicProgress } from './agentRunStream'
+import { progressMetricsText, projectResponseStream, publicProgress } from './agentRunStream'
 
 describe('AgentRun public events', () => {
   it('projects structured tool completion into a visible progress item', () => {
@@ -20,5 +20,21 @@ describe('AgentRun public events', () => {
       { sequenceNumber: 6, type: 'CANCELLED', payloadJson: '{}' },
       { phase: 'cancelled', message: '已停止本轮任务' },
     )).toMatchObject({ phase: 'cancelled', message: '已停止本轮任务' })
+  })
+
+  it('projects a runtime direction adjustment without exposing hidden reasoning', () => {
+    expect(publicProgress(
+      { sequenceNumber: 7, type: 'INTERVENTION_APPLIED', payloadJson: '{}' },
+      { phase: 'direction_update', status: 'applied', message: '正在根据你的补充调整计划', interventionSequence: 2 },
+    )).toMatchObject({ phase: 'direction_update', status: 'applied', message: '正在根据你的补充调整计划' })
+  })
+
+  it('projects safe commentary and reconstructs durable response deltas', () => {
+    expect(publicProgress(
+      { sequenceNumber: 8, type: 'COMMENTARY', payloadJson: '{}' },
+      { phase: 'search_web', status: 'commentary', message: '我已经找到可用线索。' },
+    )).toMatchObject({ status: 'commentary', message: '我已经找到可用线索。' })
+    expect(projectResponseStream('旧内容', { sequenceNumber: 9, type: 'RESPONSE_STARTED', payloadJson: '{}' }, {})).toBe('')
+    expect(projectResponseStream('第一段', { sequenceNumber: 10, type: 'RESPONSE_DELTA', payloadJson: '{}' }, { delta: '，第二段' })).toBe('第一段，第二段')
   })
 })
